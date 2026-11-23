@@ -1,10 +1,12 @@
 //! Caelum CLI: Pure Rust ARMv9-first LLM Inference Engine for Celestia, Astraea & Lenout.
 
+mod json;
 mod lenout;
 mod server;
 
 use caelum_core::{
-    f32_to_f16, quantize_row_q4_0, quantize_row_q8_0, BlockQ4_0, BlockQ8_0, DType, Result, TensorBuf,
+    f32_to_f16, quantize_row_q4_0, quantize_row_q8_0, quantize_row_q8_k, BlockQ4_0, BlockQ8_0,
+    BlockQ8_K, DType, Result, TensorBuf, QK_K,
 };
 use caelum_gguf::GgufFile;
 use caelum_kernels::{Backend, CpuBackend, CpuCaps};
@@ -784,6 +786,13 @@ fn cmd_bench(args: &[String]) -> Result<()> {
             dt_f32 / dt_q4k
         );
 
+        let mut raw_q5k = vec![0x35u8; blocks_total * 176];
+        for blk in 0..blocks_total {
+            raw_q5k[blk * 176..blk * 176 + 2].copy_from_slice(&d_bytes);
+            raw_q5k[blk * 176 + 2..blk * 176 + 4].copy_from_slice(&dm_bytes);
+        }
+        let buf_q5k = TensorBuf::from_raw(raw_q5k, vec![dim, dim], DType::Q5_K)?;
+
         let mut raw_q6k = vec![0x24u8; blocks_total * 210];
         for blk in 0..blocks_total {
             raw_q6k[blk * 210 + 208..blk * 210 + 210].copy_from_slice(&d_bytes);
@@ -796,32 +805,65 @@ fn cmd_bench(args: &[String]) -> Result<()> {
         let dt_q6k = t4.elapsed().as_secs_f64();
         let bytes_q6k = buf_q6k.data.len() as f64 * iters as f64;
         println!(
-            "  Q6_K  (W6A8-K): {:7.2} ms/op | {:6.2} GB/s | {:6.2} GFLOP/s  ({:.2}x faster than F32)",
+            "  Q6_K  (Raw-32): {:7.2} ms/op | {:6.2} GB/s | {:6.2} GFLOP/s  ({:.2}x faster than F32)",
             dt_q6k * 1000.0 / iters as f64,
             bytes_q6k / dt_q6k / 1e9,
             flops / dt_q6k / 1e9,
             dt_f32 / dt_q6k
         );
 
-        // 5. Batched Prefill GEMM benchmark (batch=16 tokens reusing weight loads)
+        // 5. Repacked 8-row AVX-VNNI / AVX2+FMA+F16C K-Quant GEMV (B=1) & Prefill GEMM (B=16)
+        let nb = dim / QK_K;
+        let mut x_q8k = vec![BlockQ8_K::default(); nb];
+        quantize_row_q8_k(&x, &mut x_q8k);
         let batch = 16usize;
         let x_batch: Vec<f32> = (0..batch * dim)
             .map(|k| ((k % 19) as f32 - 9.0) * 0.02)
             .collect();
+        let mut x_batch_q8k = vec![BlockQ8_K::default(); batch * nb];
+        for t in 0..batch {
+            quantize_row_q8_k(
+                &x_batch[t * dim..(t + 1) * dim],
+                &mut x_batch_q8k[t * nb..(t + 1) * nb],
+            );
+        }
         let mut out_batch = vec![0.0f32; batch * dim];
         let b_iters = (iters / 4).max(10);
-        let t5 = Instant::now();
-        for _ in 0..b_iters {
-            backend.matmul(&buf_q4k.as_view(), &x_batch, batch, &mut out_batch)?;
-        }
-        let dt_gemm = t5.elapsed().as_secs_f64();
         let flops_gemm = (2 * dim * dim * batch) as f64 * b_iters as f64;
-        println!(
-            "  Q4_K GEMM B=16: {:7.2} ms/op | {:6.2} GFLOP/s  ({:.2}x prefill throughput vs B=1)",
-            dt_gemm * 1000.0 / b_iters as f64,
-            flops_gemm / dt_gemm / 1e9,
-            (flops_gemm / dt_gemm) / (flops / dt_q4k)
-        );
+
+        for (label, buf) in [
+            ("Q4_K", &buf_q4k),
+            ("Q5_K", &buf_q5k),
+            ("Q6_K", &buf_q6k),
+        ] {
+            if let Some(packed) = backend.pack_matrix(&buf.as_view()) {
+                let tp1 = Instant::now();
+                for _ in 0..iters {
+                    backend.matvec_packed_q8k(&packed, &x_q8k, &mut out)?;
+                }
+                let dt_p1 = tp1.elapsed().as_secs_f64();
+                let bytes_p = packed.byte_size() as f64 * iters as f64;
+                println!(
+                    "  {label}x8 VNNI B=1: {:7.2} ms/op | {:6.2} GB/s | {:6.2} GFLOP/s  ({:.2}x vs F32)",
+                    dt_p1 * 1000.0 / iters as f64,
+                    bytes_p / dt_p1 / 1e9,
+                    flops / dt_p1 / 1e9,
+                    dt_f32 / dt_p1
+                );
+
+                let tp16 = Instant::now();
+                for _ in 0..b_iters {
+                    backend.matmul_packed_q8k(&packed, &x_batch_q8k, batch, &mut out_batch)?;
+                }
+                let dt_p16 = tp16.elapsed().as_secs_f64();
+                println!(
+                    "  {label}x8 VNNI B=16:{:7.2} ms/op | {:6.2} GFLOP/s  ({:.2}x prefill vs B=1)",
+                    dt_p16 * 1000.0 / b_iters as f64,
+                    flops_gemm / dt_p16 / 1e9,
+                    (flops_gemm / dt_p16) / (flops / dt_p1)
+                );
+            }
+        }
     }
     println!("============================================================");
     Ok(())

@@ -1,16 +1,23 @@
-//! Zero-dependency HTTP/1.1 API Server for Caelum:
+//! Zero-dependency OpenAI & IDE-compatible HTTP/1.1 API Server for Caelum:
 //! - `GET  /health`
-//! - `POST /v1/chat/completions` (OpenAI-compatible, supports `"stream": true` SSE!)
-//! - `POST /v1/celestia/propose` (Lenout Action DSL with JSON Grammar + Automatic Prefix Caching)
+//! - `GET  /v1/models`             (OpenAI SDK / Continue.dev / Cline / OpenWebUI discovery)
+//! - `POST /v1/chat/completions`   (Full multi-turn `messages[]`, SSE `"stream": true`,
+//!                                  `response_format: json_object`, `stop`, Automatic Prefix Cache)
+//! - `POST /v1/completions`        (IDE Tab Autocomplete & Qwen2.5-Coder FIM `suffix`, SSE/JSON)
+//! - `POST /v1/celestia/propose`   (Lenout Action DSL with strict `SchemaGrammar` + Prefix Cache)
 
+use crate::json::JsonValue;
 use crate::lenout::build_lenout_system_prompt;
 use caelum_core::Result;
 use caelum_gguf::GgufFile;
 use caelum_kernels::{Backend, CpuBackend};
 use caelum_models::{CaelumModel, KvPrecision, SamplerConfig};
-use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, SchemaGrammar, Tokenizer};
+use caelum_tokenizer::{
+    ChatMessage, ChatRole, ChatTemplate, JsonGrammar, LogitGrammar, SchemaGrammar, Tokenizer,
+};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[allow(clippy::too_many_arguments)]
@@ -28,6 +35,11 @@ pub fn run_server(
     println!("[Caelum Server] Loading GGUF via zero-copy mmap: {model_path}");
     let gguf = GgufFile::open(model_path)?;
     let arch = gguf.architecture().unwrap_or("llama").to_string();
+    let model_id = Path::new(model_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("caelum-{arch}"));
     let tokenizer = if arch == "celestia" && gguf.get_meta("tokenizer.ggml.tokens").is_none() {
         let (v, _) = gguf.tensor("token_embd.weight")?.dims_2d()?;
         Tokenizer::celestia_default(v)
@@ -48,20 +60,30 @@ pub fn run_server(
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)?;
     println!("============================================================");
-    println!("  CAELUM v{} RUST INFERENCE SERVER READY", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  CAELUM v{} RUST INFERENCE SERVER READY",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  Listen:   http://{addr}");
     println!(
-        "  Model:    {arch} ({:.1}M params) | KV: {} ({:.1} MB)",
+        "  Model:    {model_id} ({arch}, {:.1}M params) | tmpl={} | packed={:.0}MB | KV: {} ({:.1} MB)",
         gguf.total_parameters() as f64 / 1e6,
+        template.name(),
+        model.packed_bytes() as f64 / (1024.0 * 1024.0),
         model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
     );
-    println!("  Hardware: {} ({} threads)", backend.caps(), backend.num_threads());
-    println!("  Features: Batched Prefill GEMM + Automatic Prefix Cache + SSE Stream");
+    println!(
+        "  Hardware: {} ({} threads)",
+        backend.caps(),
+        backend.num_threads()
+    );
     println!("  Endpoints:");
     println!("    GET  /health");
-    println!("    POST /v1/chat/completions  (stream: true/false)");
-    println!("    POST /v1/celestia/propose  (Lenout JSON Grammar + Prefix Cache)");
+    println!("    GET  /v1/models");
+    println!("    POST /v1/chat/completions  (multi-turn, SSE, json_object, stop, prefix-cache)");
+    println!("    POST /v1/completions       (IDE FIM tab autocomplete, SSE/JSON)");
+    println!("    POST /v1/celestia/propose  (Lenout strict SchemaGrammar + prefix-cache)");
     println!("============================================================");
 
     for stream in listener.incoming() {
@@ -74,6 +96,7 @@ pub fn run_server(
                     &tokenizer,
                     template,
                     &arch,
+                    &model_id,
                 ) {
                     eprintln!("[Caelum Server] Request error: {e}");
                 }
@@ -84,6 +107,7 @@ pub fn run_server(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: &mut TcpStream,
     backend: &CpuBackend,
@@ -91,6 +115,7 @@ fn handle_connection(
     tokenizer: &Tokenizer,
     template: ChatTemplate,
     arch: &str,
+    model_id: &str,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -102,7 +127,7 @@ fn handle_connection(
         return Ok(());
     }
     let method = parts[0];
-    let path = parts[1];
+    let path = parts[1].split('?').next().unwrap_or(parts[1]);
 
     let mut content_length = 0usize;
     loop {
@@ -133,9 +158,11 @@ fn handle_connection(
         ("GET", "/health") => {
             let now = unix_ts();
             let resp = format!(
-                r#"{{"status":"healthy","engine":"caelum-rs","version":"{}","architecture":"{}","kernel":"{}","kv_mode":"{}","threads":{},"timestamp":{}}}"#,
+                r#"{{"status":"healthy","engine":"caelum-rs","version":"{}","model":"{}","architecture":"{}","template":"{}","kernel":"{}","kv_mode":"{}","threads":{},"timestamp":{}}}"#,
                 env!("CARGO_PKG_VERSION"),
+                escape_json(model_id),
                 escape_json(arch),
+                template.name(),
                 escape_json(backend.name()),
                 model.kv_mode_label(),
                 backend.num_threads(),
@@ -143,19 +170,72 @@ fn handle_connection(
             );
             write_response(stream, "200 OK", &resp)
         }
+        ("GET", "/v1/models") => {
+            let now = unix_ts();
+            let resp = format!(
+                r#"{{"object":"list","data":[{{"id":"{}","object":"model","created":{},"owned_by":"caelum-rs","architecture":"{}","context_length":{}}}]}}"#,
+                escape_json(model_id),
+                now,
+                escape_json(arch),
+                model.max_seq_len()
+            );
+            write_response(stream, "200 OK", &resp)
+        }
         ("POST", "/v1/chat/completions") => {
-            let user_prompt = extract_last_json_string(&body_str, "content")
-                .unwrap_or_else(|| "Hello".to_string());
-            let max_tokens = extract_json_usize(&body_str, "max_tokens").unwrap_or(256);
-            let temp = extract_json_f32(&body_str, "temperature").unwrap_or(0.7);
-            let is_stream = extract_json_bool(&body_str, "stream").unwrap_or(false);
+            let req = match JsonValue::parse(&body_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    return write_response(
+                        stream,
+                        "400 Bad Request",
+                        &format!(r#"{{"error":{{"message":"invalid JSON: {}"}}}}"#, escape_json(&e)),
+                    );
+                }
+            };
 
-            let messages = vec![ChatMessage {
-                role: ChatRole::User,
-                content: user_prompt,
-            }];
+            let messages = parse_chat_messages(&req);
+            let max_tokens = req
+                .get("max_completion_tokens")
+                .or_else(|| req.get("max_tokens"))
+                .and_then(JsonValue::as_usize)
+                .unwrap_or(512);
+            let temp = req
+                .get("temperature")
+                .and_then(JsonValue::as_f64)
+                .map(|v| v as f32)
+                .unwrap_or(0.7);
+            let top_p = req
+                .get("top_p")
+                .and_then(JsonValue::as_f64)
+                .map(|v| v as f32)
+                .unwrap_or(0.9);
+            let is_stream = req
+                .get("stream")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let stop_seqs = parse_stop_sequences(&req);
+            let json_mode = req
+                .get("response_format")
+                .and_then(|rf| rf.get("type"))
+                .and_then(JsonValue::as_str)
+                .map(|t| t == "json_object" || t == "json_schema")
+                .unwrap_or(false);
+
             let formatted = template.format(&messages, true);
             let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
+            let sampler_cfg = SamplerConfig {
+                temperature: temp,
+                top_p,
+                ..Default::default()
+            };
+
+            let mut json_g = if json_mode {
+                Some(JsonGrammar::new())
+            } else {
+                None
+            };
+            let grammar_ref: Option<&mut dyn LogitGrammar> =
+                json_g.as_mut().map(|g| g as &mut dyn LogitGrammar);
 
             if is_stream {
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
@@ -164,19 +244,27 @@ fn handle_connection(
 
                 let cmpl_id = format!("chatcmpl-caelum-{}", unix_ts());
                 let created = unix_ts();
-                let model_name = format!("caelum-{arch}");
                 let mut write_err = false;
 
-                let _ = model.generate(
+                // Initial role delta per OpenAI SSE specification
+                let role_chunk = format!(
+                    "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
+                    cmpl_id,
+                    created,
+                    escape_json(model_id),
+                );
+                if stream.write_all(role_chunk.as_bytes()).is_err() || stream.flush().is_err() {
+                    write_err = true;
+                }
+
+                let (_, stats) = model.generate_with_stop(
                     backend,
                     tokenizer,
                     &prompt_tokens,
                     max_tokens,
-                    &SamplerConfig {
-                        temperature: temp,
-                        ..Default::default()
-                    },
-                    false,
+                    &sampler_cfg,
+                    grammar_ref,
+                    &stop_seqs,
                     |_, piece| {
                         if write_err || piece.is_empty() {
                             return;
@@ -185,7 +273,7 @@ fn handle_connection(
                             "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n",
                             cmpl_id,
                             created,
-                            escape_json(&model_name),
+                            escape_json(model_id),
                             escape_json(piece)
                         );
                         if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
@@ -196,10 +284,14 @@ fn handle_connection(
 
                 if !write_err {
                     let final_chunk = format!(
-                        "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                        "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{},\"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}}}\n\ndata: [DONE]\n\n",
                         cmpl_id,
                         created,
-                        escape_json(&model_name)
+                        escape_json(model_id),
+                        stats.prompt_tokens,
+                        stats.generated_tokens,
+                        stats.prompt_tokens + stats.generated_tokens,
+                        stats.cached_prompt_tokens
                     );
                     let _ = stream.write_all(final_chunk.as_bytes());
                     let _ = stream.flush();
@@ -207,44 +299,192 @@ fn handle_connection(
                 return Ok(());
             }
 
-            let (output, stats) = model.generate(
+            let (output, stats) = model.generate_with_stop(
                 backend,
                 tokenizer,
                 &prompt_tokens,
                 max_tokens,
-                &SamplerConfig {
-                    temperature: temp,
-                    ..Default::default()
-                },
-                false,
+                &sampler_cfg,
+                grammar_ref,
+                &stop_seqs,
                 |_, _| {},
             )?;
 
+            let now = unix_ts();
             let resp = format!(
-                r#"{{"id":"chatcmpl-caelum-{}","object":"chat.completion","created":{},"model":"caelum-{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{},"cached_prompt_tokens":{},"completion_tokens":{},"prefill_tps":{:.2},"decode_tps":{:.2}}}}}"#,
-                unix_ts(),
-                unix_ts(),
-                escape_json(arch),
+                r#"{{"id":"chatcmpl-caelum-{}","object":"chat.completion","created":{},"model":"{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{},"prompt_tokens_details":{{"cached_tokens":{}}},"prefill_tps":{:.2},"decode_tps":{:.2}}}}}"#,
+                now,
+                now,
+                escape_json(model_id),
                 escape_json(&output),
                 stats.prompt_tokens,
-                stats.cached_prompt_tokens,
                 stats.generated_tokens,
+                stats.prompt_tokens + stats.generated_tokens,
+                stats.cached_prompt_tokens,
+                stats.prefill_tps(),
+                stats.decode_tps()
+            );
+            write_response(stream, "200 OK", &resp)
+        }
+        ("POST", "/v1/completions") => {
+            // Raw completion & IDE Fill-In-The-Middle (FIM) autocomplete endpoint
+            let req = match JsonValue::parse(&body_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    return write_response(
+                        stream,
+                        "400 Bad Request",
+                        &format!(r#"{{"error":{{"message":"invalid JSON: {}"}}}}"#, escape_json(&e)),
+                    );
+                }
+            };
+
+            let prompt_raw = req
+                .get("prompt")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string();
+            let suffix = req.get("suffix").and_then(JsonValue::as_str);
+            let max_tokens = req
+                .get("max_tokens")
+                .and_then(JsonValue::as_usize)
+                .unwrap_or(128);
+            let temp = req
+                .get("temperature")
+                .and_then(JsonValue::as_f64)
+                .map(|v| v as f32)
+                .unwrap_or(0.2);
+            let top_p = req
+                .get("top_p")
+                .and_then(JsonValue::as_f64)
+                .map(|v| v as f32)
+                .unwrap_or(0.95);
+            let is_stream = req
+                .get("stream")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let stop_seqs = parse_stop_sequences(&req);
+
+            // Auto-format Qwen2.5-Coder / DeepSeek FIM when `suffix` is supplied
+            let effective_prompt = if let Some(suf) = suffix {
+                if tokenizer.token_id("<|fim_prefix|>").is_some() {
+                    format!("<|fim_prefix|>{prompt_raw}<|fim_suffix|>{suf}<|fim_middle|>")
+                } else if tokenizer.token_id("<｜fim▁begin｜>").is_some() {
+                    format!("<｜fim▁begin｜>{prompt_raw}<｜fim▁hole｜>{suf}<｜fim▁end｜>")
+                } else {
+                    prompt_raw
+                }
+            } else {
+                prompt_raw
+            };
+
+            let prompt_tokens = tokenizer.encode(&effective_prompt, tokenizer.add_bos);
+            let sampler_cfg = SamplerConfig {
+                temperature: temp,
+                top_p,
+                ..Default::default()
+            };
+
+            if is_stream {
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+                stream.write_all(header.as_bytes())?;
+                stream.flush()?;
+
+                let cmpl_id = format!("cmpl-caelum-{}", unix_ts());
+                let created = unix_ts();
+                let mut write_err = false;
+
+                let _ = model.generate_with_stop(
+                    backend,
+                    tokenizer,
+                    &prompt_tokens,
+                    max_tokens,
+                    &sampler_cfg,
+                    None,
+                    &stop_seqs,
+                    |_, piece| {
+                        if write_err || piece.is_empty() {
+                            return;
+                        }
+                        let chunk = format!(
+                            "data: {{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"text\":\"{}\",\"index\":0,\"finish_reason\":null}}]}}\n\n",
+                            cmpl_id,
+                            created,
+                            escape_json(model_id),
+                            escape_json(piece)
+                        );
+                        if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
+                            write_err = true;
+                        }
+                    },
+                )?;
+
+                if !write_err {
+                    let final_chunk = format!(
+                        "data: {{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"text\":\"\",\"index\":0,\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                        cmpl_id,
+                        created,
+                        escape_json(model_id)
+                    );
+                    let _ = stream.write_all(final_chunk.as_bytes());
+                    let _ = stream.flush();
+                }
+                return Ok(());
+            }
+
+            let (output, stats) = model.generate_with_stop(
+                backend,
+                tokenizer,
+                &prompt_tokens,
+                max_tokens,
+                &sampler_cfg,
+                None,
+                &stop_seqs,
+                |_, _| {},
+            )?;
+            let now = unix_ts();
+            let resp = format!(
+                r#"{{"id":"cmpl-caelum-{}","object":"text_completion","created":{},"model":"{}","choices":[{{"text":"{}","index":0,"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{},"prompt_tokens_details":{{"cached_tokens":{}}},"prefill_tps":{:.2},"decode_tps":{:.2}}}}}"#,
+                now,
+                now,
+                escape_json(model_id),
+                escape_json(&output),
+                stats.prompt_tokens,
+                stats.generated_tokens,
+                stats.prompt_tokens + stats.generated_tokens,
+                stats.cached_prompt_tokens,
                 stats.prefill_tps(),
                 stats.decode_tps()
             );
             write_response(stream, "200 OK", &resp)
         }
         ("POST", "/v1/celestia/propose") => {
-            let prompt = extract_last_json_string(&body_str, "prompt")
-                .unwrap_or_else(|| "Create a design card".to_string());
-            let mode = extract_last_json_string(&body_str, "workspace_mode")
-                .unwrap_or_else(|| "design".to_string());
-            let request_id = extract_last_json_string(&body_str, "request_id")
-                .unwrap_or_else(|| "req_caelum".to_string());
-            let fp = extract_last_json_string(&body_str, "context_fingerprint")
-                .unwrap_or_else(|| "fp_caelum".to_string());
+            let req = JsonValue::parse(&body_str).unwrap_or(JsonValue::Null);
+            let prompt = req
+                .get("prompt")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("Create a design card")
+                .to_string();
+            let mode = req
+                .get("workspace_mode")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("design")
+                .to_string();
+            let request_id = req
+                .get("request_id")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("req_caelum")
+                .to_string();
+            let fp = req
+                .get("context_fingerprint")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("fp_caelum")
+                .to_string();
+            let max_tokens = req
+                .get("max_tokens")
+                .and_then(JsonValue::as_usize)
+                .unwrap_or(768);
 
-            // Keep static system prompt stable so Automatic Prefix Cache achieves >80% hit rate!
             let sys = build_lenout_system_prompt(&mode, &request_id, &fp);
             let messages = vec![
                 ChatMessage {
@@ -264,7 +504,7 @@ fn handle_connection(
                 backend,
                 tokenizer,
                 &prompt_tokens,
-                512,
+                max_tokens,
                 &SamplerConfig {
                     temperature: 0.2,
                     ..Default::default()
@@ -291,6 +531,52 @@ fn handle_connection(
             write_response(stream, "200 OK", &resp)
         }
         _ => write_response(stream, "404 Not Found", r#"{"error":"route not found"}"#),
+    }
+}
+
+fn parse_chat_messages(req: &JsonValue) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    if let Some(arr) = req.get("messages").and_then(JsonValue::as_array) {
+        for item in arr {
+            let role = match item.get("role").and_then(JsonValue::as_str).unwrap_or("user") {
+                "system" | "developer" => ChatRole::System,
+                "assistant" => ChatRole::Assistant,
+                _ => ChatRole::User,
+            };
+            let content = match item.get("content") {
+                Some(JsonValue::Str(s)) => s.clone(),
+                Some(JsonValue::Array(parts)) => {
+                    let mut combined = String::new();
+                    for p in parts {
+                        if let Some(txt) = p.get("text").and_then(JsonValue::as_str) {
+                            combined.push_str(txt);
+                        }
+                    }
+                    combined
+                }
+                _ => String::new(),
+            };
+            out.push(ChatMessage { role, content });
+        }
+    }
+    if out.is_empty() {
+        out.push(ChatMessage {
+            role: ChatRole::User,
+            content: "Hello".to_string(),
+        });
+    }
+    out
+}
+
+fn parse_stop_sequences(req: &JsonValue) -> Vec<String> {
+    match req.get("stop") {
+        Some(JsonValue::Str(s)) => vec![s.clone()],
+        Some(JsonValue::Array(arr)) => arr
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(ToString::to_string)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -326,77 +612,4 @@ fn escape_json(s: &str) -> String {
         }
     }
     out
-}
-
-fn extract_last_json_string(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let pos = json.rfind(&needle)?;
-    let rest = &json[pos + needle.len()..];
-    let colon = rest.find(':')?;
-    let after_colon = rest[colon + 1..].trim_start();
-    if !after_colon.starts_with('"') {
-        return None;
-    }
-    let mut chars = after_colon[1..].chars();
-    let mut out = String::new();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(esc) = chars.next() {
-                match esc {
-                    'n' => out.push('\n'),
-                    'r' => out.push('\r'),
-                    't' => out.push('\t'),
-                    '"' => out.push('"'),
-                    '\\' => out.push('\\'),
-                    other => out.push(other),
-                }
-            }
-        } else if c == '"' {
-            return Some(out);
-        } else {
-            out.push(c);
-        }
-    }
-    None
-}
-
-fn extract_json_usize(json: &str, key: &str) -> Option<usize> {
-    let needle = format!("\"{key}\"");
-    let pos = json.find(&needle)?;
-    let rest = &json[pos + needle.len()..];
-    let colon = rest.find(':')?;
-    let num_str: String = rest[colon + 1..]
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    num_str.parse().ok()
-}
-
-fn extract_json_f32(json: &str, key: &str) -> Option<f32> {
-    let needle = format!("\"{key}\"");
-    let pos = json.find(&needle)?;
-    let rest = &json[pos + needle.len()..];
-    let colon = rest.find(':')?;
-    let num_str: String = rest[colon + 1..]
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-    num_str.parse().ok()
-}
-
-fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
-    let needle = format!("\"{key}\"");
-    let pos = json.find(&needle)?;
-    let rest = &json[pos + needle.len()..];
-    let colon = rest.find(':')?;
-    let tail = rest[colon + 1..].trim_start();
-    if tail.starts_with("true") {
-        Some(true)
-    } else if tail.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
 }

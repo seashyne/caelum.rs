@@ -44,6 +44,39 @@ impl Default for TileQ4Kx8 {
     }
 }
 
+/// 8-row × 256-element interleaved `Q5_K` tile (`1,440` bytes, 32-byte aligned, +2.2% vs raw).
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+pub struct TileQ5Kx8 {
+    /// Super-block `d` (IEEE-754 f16 bits) for the 8 rows.
+    pub d_f16: [u16; 8],
+    /// Super-block `dmin` (IEEE-754 f16 bits) for the 8 rows.
+    pub dmin_f16: [u16; 8],
+    /// Unpacked 6-bit sub-block scales `sc[sub][row]` (`sub ∈ 0..8`, `row ∈ 0..8`).
+    pub sc: [[u8; 8]; 8],
+    /// Unpacked 6-bit sub-block mins `m[sub][row]` (`sub ∈ 0..8`, `row ∈ 0..8`).
+    pub m: [[u8; 8]; 8],
+    /// Interleaved 5th-bit masks: `8 k-steps × 32 bytes`.
+    /// Byte `k_step * 32 + row * 4 + i` = `orig_row[row].qh[k_step * 4 + i]`.
+    pub qh: [u8; 256],
+    /// Interleaved 4-bit low nibbles: `4 chunks × 8 k-steps × 32 bytes`.
+    /// Byte `(chunk * 8 + k_step) * 32 + row * 4 + i` = `orig_row[row].qs[chunk * 32 + k_step * 4 + i]`.
+    pub qs: [u8; 1024],
+}
+
+impl Default for TileQ5Kx8 {
+    fn default() -> Self {
+        Self {
+            d_f16: [0; 8],
+            dmin_f16: [0; 8],
+            sc: [[0; 8]; 8],
+            m: [[0; 8]; 8],
+            qh: [0; 256],
+            qs: [0; 1024],
+        }
+    }
+}
+
 /// 8-row × 256-element interleaved `Q6_K` tile with pre-unpacked unsigned 6-bit quants (`0..63`).
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
@@ -74,6 +107,7 @@ impl Default for TileQ6Kx8 {
 /// Repacked weight matrix stored in cache-aligned 8-row SIMD tiles.
 pub enum PackedTiles {
     Q4Kx8(Vec<TileQ4Kx8>),
+    Q5Kx8(Vec<TileQ5Kx8>),
     Q6Kx8(Vec<TileQ6Kx8>),
 }
 
@@ -86,7 +120,7 @@ pub struct PackedMatrix {
 }
 
 impl PackedMatrix {
-    /// Attempts to repack a 2D `Q4_K` or `Q6_K` weight matrix for AVX2+FMA / AVX-VNNI execution.
+    /// Attempts to repack a 2D `Q4_K`, `Q5_K`, or `Q6_K` weight matrix for AVX2+FMA / AVX-VNNI execution.
     /// Returns `None` on non-AVX2 platforms or incompatible shapes/dtypes.
     pub fn try_pack(view: &TensorView<'_>, caps: &CpuCaps, pool: &ThreadPool) -> Option<Self> {
         #[cfg(not(target_arch = "x86_64"))]
@@ -106,6 +140,7 @@ impl PackedMatrix {
             }
             match view.dtype {
                 DType::Q4_K => Some(Self::pack_q4_k(view, rows, cols, pool)),
+                DType::Q5_K => Some(Self::pack_q5_k(view, rows, cols, pool)),
                 DType::Q6_K => Some(Self::pack_q6_k(view, rows, cols, pool)),
                 _ => None,
             }
@@ -115,6 +150,7 @@ impl PackedMatrix {
     pub fn dtype(&self) -> DType {
         match self.tiles {
             PackedTiles::Q4Kx8(_) => DType::Q4_K,
+            PackedTiles::Q5Kx8(_) => DType::Q5_K,
             PackedTiles::Q6Kx8(_) => DType::Q6_K,
         }
     }
@@ -126,6 +162,7 @@ impl PackedMatrix {
     pub fn byte_size(&self) -> usize {
         match &self.tiles {
             PackedTiles::Q4Kx8(v) => v.len() * std::mem::size_of::<TileQ4Kx8>(),
+            PackedTiles::Q5Kx8(v) => v.len() * std::mem::size_of::<TileQ5Kx8>(),
             PackedTiles::Q6Kx8(v) => v.len() * std::mem::size_of::<TileQ6Kx8>(),
         }
     }
@@ -180,6 +217,66 @@ impl PackedMatrix {
             cols,
             nb,
             tiles: PackedTiles::Q4Kx8(tiles),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn pack_q5_k(view: &TensorView<'_>, rows: usize, cols: usize, pool: &ThreadPool) -> Self {
+        let nb = cols / QK_K;
+        let groups = rows / 8;
+        let row_stride = nb * 176;
+        let data = view.data;
+        let mut tiles = vec![TileQ5Kx8::default(); groups * nb];
+        let tiles_addr = tiles.as_mut_ptr() as usize;
+
+        let work = |g_start: usize, g_end: usize| {
+            let tiles_ptr = tiles_addr as *mut TileQ5Kx8;
+            for g in g_start..g_end {
+                let r_base = g * 8;
+                for b in 0..nb {
+                    let tile = unsafe { &mut *tiles_ptr.add(g * nb + b) };
+                    for r in 0..8 {
+                        let off = (r_base + r) * row_stride + b * 176;
+                        tile.d_f16[r] = u16::from_le_bytes([data[off], data[off + 1]]);
+                        tile.dmin_f16[r] = u16::from_le_bytes([data[off + 2], data[off + 3]]);
+                        let scales = &data[off + 4..off + 16];
+                        for sub in 0..8 {
+                            let (sc, m) = get_scale_min_k4(sub, scales);
+                            tile.sc[sub][r] = sc;
+                            tile.m[sub][r] = m;
+                        }
+                        let qh = &data[off + 16..off + 48];
+                        for k_step in 0..8 {
+                            let dst_off = k_step * 32 + r * 4;
+                            let src_off = k_step * 4;
+                            tile.qh[dst_off..dst_off + 4]
+                                .copy_from_slice(&qh[src_off..src_off + 4]);
+                        }
+                        let qs = &data[off + 48..off + 176];
+                        for chunk in 0..4 {
+                            for k_step in 0..8 {
+                                let dst_off = (chunk * 8 + k_step) * 32 + r * 4;
+                                let src_off = chunk * 32 + k_step * 4;
+                                tile.qs[dst_off..dst_off + 4]
+                                    .copy_from_slice(&qs[src_off..src_off + 4]);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        if groups >= 16 && pool.num_threads() > 1 {
+            pool.parallel_for_range(groups, work);
+        } else {
+            work(0, groups);
+        }
+
+        Self {
+            rows,
+            cols,
+            nb,
+            tiles: PackedTiles::Q5Kx8(tiles),
         }
     }
 
@@ -267,6 +364,18 @@ impl PackedMatrix {
                         }
                     }
                 }
+                PackedTiles::Q5Kx8(tiles) => {
+                    let slice = &tiles[g * self.nb..(g + 1) * self.nb];
+                    unsafe {
+                        if caps.avxvnni && caps.f16c {
+                            x86_packed::gemv_q5k_8x_vnni_f16c(slice, x, out8);
+                        } else if caps.f16c {
+                            x86_packed::gemv_q5k_8x_avx2_f16c(slice, x, out8);
+                        } else {
+                            x86_packed::gemv_q5k_8x_avx2(slice, x, out8);
+                        }
+                    }
+                }
                 PackedTiles::Q6Kx8(tiles) => {
                     let slice = &tiles[g * self.nb..(g + 1) * self.nb];
                     unsafe {
@@ -309,6 +418,18 @@ impl PackedMatrix {
                             x86_packed::gemm_q4k_8x4_avx2_f16c(slice, xs, out);
                         } else {
                             x86_packed::gemm_q4k_8x4_avx2(slice, xs, out);
+                        }
+                    }
+                }
+                PackedTiles::Q5Kx8(tiles) => {
+                    let slice = &tiles[g * self.nb..(g + 1) * self.nb];
+                    unsafe {
+                        if caps.avxvnni && caps.f16c {
+                            x86_packed::gemm_q5k_8x4_vnni_f16c(slice, xs, out);
+                        } else if caps.f16c {
+                            x86_packed::gemm_q5k_8x4_avx2_f16c(slice, xs, out);
+                        } else {
+                            x86_packed::gemm_q5k_8x4_avx2(slice, xs, out);
                         }
                     }
                 }
@@ -375,7 +496,7 @@ impl PackedMatrix {
 
 #[cfg(target_arch = "x86_64")]
 mod x86_packed {
-    use super::{TileQ4Kx8, TileQ6Kx8};
+    use super::{TileQ4Kx8, TileQ5Kx8, TileQ6Kx8};
     use caelum_core::{f16_to_f32, BlockQ8_K};
     use std::arch::x86_64::*;
 
@@ -890,4 +1011,251 @@ mod x86_packed {
 
     impl_gemm_q6k_8x8!(gemm_q6k_8x8_vnni_f16c, "avx2,fma,f16c", true);
     impl_gemm_q6k_8x8!(gemm_q6k_8x8_avx2_f16c, "avx2,fma,f16c", false);
+
+    // ==================== Q5_K 8-row GEMV (1 token decode, AVX-VNNI) ====================
+
+    macro_rules! impl_gemv_q5k_8x {
+        ($fn_name:ident, $features:literal, $use_vnni:expr, $use_f16c:expr) => {
+            #[target_feature(enable = $features)]
+            pub unsafe fn $fn_name(tiles: &[TileQ5Kx8], x: &[BlockQ8_K], out8: &mut [f32; 8]) {
+                let nb = tiles.len();
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let zero = _mm256_setzero_si256();
+                let sixteen = _mm256_set1_epi8(16);
+                let ones_i16 = _mm256_set1_epi16(1);
+                let mut fsum = _mm256_setzero_ps();
+
+                for b in 0..nb {
+                    let tile = tiles.get_unchecked(b);
+                    let xb = x.get_unchecked(b);
+
+                    if b + 1 < nb {
+                        let next_ptr = (tiles.as_ptr().add(b + 1)) as *const i8;
+                        _mm_prefetch(next_ptr, _MM_HINT_T0);
+                        _mm_prefetch(next_ptr.add(256), _MM_HINT_T0);
+                        _mm_prefetch(next_ptr.add(640), _MM_HINT_T0);
+                    }
+
+                    let vd = if $use_f16c {
+                        load_f16x8_hw(&tile.d_f16)
+                    } else {
+                        load_f16x8_sw(&tile.d_f16)
+                    };
+                    let vdmin = if $use_f16c {
+                        load_f16x8_hw(&tile.dmin_f16)
+                    } else {
+                        load_f16x8_sw(&tile.dmin_f16)
+                    };
+
+                    let mut blk_sum = _mm256_setzero_ps();
+                    let qh_ptr = tile.qh.as_ptr();
+                    let qs_ptr = tile.qs.as_ptr();
+                    let x_ptr = xb.qs.as_ptr();
+
+                    for chunk in 0..4 {
+                        let mut acc_lo = _mm256_setzero_si256();
+                        let mut acc_hi = _mm256_setzero_si256();
+                        let m1_mask = _mm256_set1_epi8((1u8 << (chunk * 2)) as i8);
+                        let m2_mask = _mm256_set1_epi8((2u8 << (chunk * 2)) as i8);
+                        let c_qbase = chunk * 8 * 32;
+                        let c_xlo = chunk * 64;
+                        let c_xhi = chunk * 64 + 32;
+
+                        for k in 0..8 {
+                            let qhb = _mm256_load_si256(qh_ptr.add(k * 32) as *const __m256i);
+                            let qb = _mm256_load_si256(qs_ptr.add(c_qbase + k * 32) as *const __m256i);
+                            let h_lo = _mm256_andnot_si256(
+                                _mm256_cmpeq_epi8(_mm256_and_si256(qhb, m1_mask), zero),
+                                sixteen,
+                            );
+                            let h_hi = _mm256_andnot_si256(
+                                _mm256_cmpeq_epi8(_mm256_and_si256(qhb, m2_mask), zero),
+                                sixteen,
+                            );
+                            let q_lo = _mm256_or_si256(_mm256_and_si256(qb, mask_0f), h_lo);
+                            let q_hi = _mm256_or_si256(
+                                _mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_0f),
+                                h_hi,
+                            );
+                            let x_lo = bcast_i32(x_ptr.add(c_xlo + k * 4));
+                            let x_hi = bcast_i32(x_ptr.add(c_xhi + k * 4));
+                            if $use_vnni {
+                                acc_lo = vpdpbusd(acc_lo, q_lo, x_lo);
+                                acc_hi = vpdpbusd(acc_hi, q_hi, x_hi);
+                            } else {
+                                acc_lo = dot4_avx2(acc_lo, q_lo, x_lo, ones_i16);
+                                acc_hi = dot4_avx2(acc_hi, q_hi, x_hi, ones_i16);
+                            }
+                        }
+
+                        let sub_lo = chunk * 2;
+                        let sub_hi = chunk * 2 + 1;
+                        let dsc_lo = _mm256_mul_ps(vd, load_u8x8_as_f32(&tile.sc[sub_lo]));
+                        let dsc_hi = _mm256_mul_ps(vd, load_u8x8_as_f32(&tile.sc[sub_hi]));
+                        let dmm_lo = _mm256_mul_ps(vdmin, load_u8x8_as_f32(&tile.m[sub_lo]));
+                        let dmm_hi = _mm256_mul_ps(vdmin, load_u8x8_as_f32(&tile.m[sub_hi]));
+
+                        let bs_lo = (*xb.bsums.get_unchecked(sub_lo * 2) as i32
+                            + *xb.bsums.get_unchecked(sub_lo * 2 + 1) as i32) as f32;
+                        let bs_hi = (*xb.bsums.get_unchecked(sub_hi * 2) as i32
+                            + *xb.bsums.get_unchecked(sub_hi * 2 + 1) as i32) as f32;
+
+                        blk_sum = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc_lo), dsc_lo, blk_sum);
+                        blk_sum = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc_hi), dsc_hi, blk_sum);
+                        blk_sum = _mm256_fnmadd_ps(_mm256_set1_ps(bs_lo), dmm_lo, blk_sum);
+                        blk_sum = _mm256_fnmadd_ps(_mm256_set1_ps(bs_hi), dmm_hi, blk_sum);
+                    }
+
+                    fsum = _mm256_fmadd_ps(blk_sum, _mm256_set1_ps(xb.d), fsum);
+                }
+
+                _mm256_storeu_ps(out8.as_mut_ptr(), fsum);
+            }
+        };
+    }
+
+    impl_gemv_q5k_8x!(gemv_q5k_8x_vnni_f16c, "avx2,fma,f16c", true, true);
+    impl_gemv_q5k_8x!(gemv_q5k_8x_avx2_f16c, "avx2,fma,f16c", false, true);
+    impl_gemv_q5k_8x!(gemv_q5k_8x_avx2, "avx2,fma", false, false);
+
+    // ==================== Q5_K 8×4 GEMM (4 tokens prefill, AVX-VNNI) ====================
+
+    macro_rules! impl_gemm_q5k_8x4 {
+        ($fn_name:ident, $features:literal, $use_vnni:expr, $use_f16c:expr) => {
+            #[target_feature(enable = $features)]
+            pub unsafe fn $fn_name(
+                tiles: &[TileQ5Kx8],
+                xs: [&[BlockQ8_K]; 4],
+                out: &mut [[f32; 8]; 4],
+            ) {
+                let nb = tiles.len();
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let zero = _mm256_setzero_si256();
+                let sixteen = _mm256_set1_epi8(16);
+                let ones_i16 = _mm256_set1_epi16(1);
+                let mut fsum = [_mm256_setzero_ps(); 4];
+
+                for b in 0..nb {
+                    let tile = tiles.get_unchecked(b);
+                    let xbs = [
+                        xs[0].get_unchecked(b),
+                        xs[1].get_unchecked(b),
+                        xs[2].get_unchecked(b),
+                        xs[3].get_unchecked(b),
+                    ];
+                    let vd = if $use_f16c {
+                        load_f16x8_hw(&tile.d_f16)
+                    } else {
+                        load_f16x8_sw(&tile.d_f16)
+                    };
+                    let vdmin = if $use_f16c {
+                        load_f16x8_hw(&tile.dmin_f16)
+                    } else {
+                        load_f16x8_sw(&tile.dmin_f16)
+                    };
+
+                    let mut blk_sum = [_mm256_setzero_ps(); 4];
+                    let qh_ptr = tile.qh.as_ptr();
+                    let qs_ptr = tile.qs.as_ptr();
+                    let xp0 = xbs[0].qs.as_ptr();
+                    let xp1 = xbs[1].qs.as_ptr();
+                    let xp2 = xbs[2].qs.as_ptr();
+                    let xp3 = xbs[3].qs.as_ptr();
+
+                    for chunk in 0..4 {
+                        let mut acc_lo0 = _mm256_setzero_si256();
+                        let mut acc_lo1 = _mm256_setzero_si256();
+                        let mut acc_lo2 = _mm256_setzero_si256();
+                        let mut acc_lo3 = _mm256_setzero_si256();
+                        let mut acc_hi0 = _mm256_setzero_si256();
+                        let mut acc_hi1 = _mm256_setzero_si256();
+                        let mut acc_hi2 = _mm256_setzero_si256();
+                        let mut acc_hi3 = _mm256_setzero_si256();
+
+                        let m1_mask = _mm256_set1_epi8((1u8 << (chunk * 2)) as i8);
+                        let m2_mask = _mm256_set1_epi8((2u8 << (chunk * 2)) as i8);
+                        let c_qbase = chunk * 8 * 32;
+                        let c_xlo = chunk * 64;
+                        let c_xhi = chunk * 64 + 32;
+
+                        for k in 0..8 {
+                            let qhb = _mm256_load_si256(qh_ptr.add(k * 32) as *const __m256i);
+                            let qb = _mm256_load_si256(qs_ptr.add(c_qbase + k * 32) as *const __m256i);
+                            let h_lo = _mm256_andnot_si256(
+                                _mm256_cmpeq_epi8(_mm256_and_si256(qhb, m1_mask), zero),
+                                sixteen,
+                            );
+                            let h_hi = _mm256_andnot_si256(
+                                _mm256_cmpeq_epi8(_mm256_and_si256(qhb, m2_mask), zero),
+                                sixteen,
+                            );
+                            let q_lo = _mm256_or_si256(_mm256_and_si256(qb, mask_0f), h_lo);
+                            let q_hi = _mm256_or_si256(
+                                _mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_0f),
+                                h_hi,
+                            );
+                            let olo = c_xlo + k * 4;
+                            let ohi = c_xhi + k * 4;
+
+                            if $use_vnni {
+                                acc_lo0 = vpdpbusd(acc_lo0, q_lo, bcast_i32(xp0.add(olo)));
+                                acc_hi0 = vpdpbusd(acc_hi0, q_hi, bcast_i32(xp0.add(ohi)));
+                                acc_lo1 = vpdpbusd(acc_lo1, q_lo, bcast_i32(xp1.add(olo)));
+                                acc_hi1 = vpdpbusd(acc_hi1, q_hi, bcast_i32(xp1.add(ohi)));
+                                acc_lo2 = vpdpbusd(acc_lo2, q_lo, bcast_i32(xp2.add(olo)));
+                                acc_hi2 = vpdpbusd(acc_hi2, q_hi, bcast_i32(xp2.add(ohi)));
+                                acc_lo3 = vpdpbusd(acc_lo3, q_lo, bcast_i32(xp3.add(olo)));
+                                acc_hi3 = vpdpbusd(acc_hi3, q_hi, bcast_i32(xp3.add(ohi)));
+                            } else {
+                                acc_lo0 = dot4_avx2(acc_lo0, q_lo, bcast_i32(xp0.add(olo)), ones_i16);
+                                acc_hi0 = dot4_avx2(acc_hi0, q_hi, bcast_i32(xp0.add(ohi)), ones_i16);
+                                acc_lo1 = dot4_avx2(acc_lo1, q_lo, bcast_i32(xp1.add(olo)), ones_i16);
+                                acc_hi1 = dot4_avx2(acc_hi1, q_hi, bcast_i32(xp1.add(ohi)), ones_i16);
+                                acc_lo2 = dot4_avx2(acc_lo2, q_lo, bcast_i32(xp2.add(olo)), ones_i16);
+                                acc_hi2 = dot4_avx2(acc_hi2, q_hi, bcast_i32(xp2.add(ohi)), ones_i16);
+                                acc_lo3 = dot4_avx2(acc_lo3, q_lo, bcast_i32(xp3.add(olo)), ones_i16);
+                                acc_hi3 = dot4_avx2(acc_hi3, q_hi, bcast_i32(xp3.add(ohi)), ones_i16);
+                            }
+                        }
+
+                        let sub_lo = chunk * 2;
+                        let sub_hi = chunk * 2 + 1;
+                        let dsc_lo = _mm256_mul_ps(vd, load_u8x8_as_f32(&tile.sc[sub_lo]));
+                        let dsc_hi = _mm256_mul_ps(vd, load_u8x8_as_f32(&tile.sc[sub_hi]));
+                        let dmm_lo = _mm256_mul_ps(vdmin, load_u8x8_as_f32(&tile.m[sub_lo]));
+                        let dmm_hi = _mm256_mul_ps(vdmin, load_u8x8_as_f32(&tile.m[sub_hi]));
+
+                        let accs_lo = [acc_lo0, acc_lo1, acc_lo2, acc_lo3];
+                        let accs_hi = [acc_hi0, acc_hi1, acc_hi2, acc_hi3];
+
+                        for t in 0..4 {
+                            let xb = xbs[t];
+                            let bs_lo = (*xb.bsums.get_unchecked(sub_lo * 2) as i32
+                                + *xb.bsums.get_unchecked(sub_lo * 2 + 1) as i32) as f32;
+                            let bs_hi = (*xb.bsums.get_unchecked(sub_hi * 2) as i32
+                                + *xb.bsums.get_unchecked(sub_hi * 2 + 1) as i32) as f32;
+                            let mut s = blk_sum[t];
+                            s = _mm256_fmadd_ps(_mm256_cvtepi32_ps(accs_lo[t]), dsc_lo, s);
+                            s = _mm256_fmadd_ps(_mm256_cvtepi32_ps(accs_hi[t]), dsc_hi, s);
+                            s = _mm256_fnmadd_ps(_mm256_set1_ps(bs_lo), dmm_lo, s);
+                            s = _mm256_fnmadd_ps(_mm256_set1_ps(bs_hi), dmm_hi, s);
+                            blk_sum[t] = s;
+                        }
+                    }
+
+                    for t in 0..4 {
+                        fsum[t] = _mm256_fmadd_ps(blk_sum[t], _mm256_set1_ps(xbs[t].d), fsum[t]);
+                    }
+                }
+
+                for t in 0..4 {
+                    _mm256_storeu_ps(out[t].as_mut_ptr(), fsum[t]);
+                }
+            }
+        };
+    }
+
+    impl_gemm_q5k_8x4!(gemm_q5k_8x4_vnni_f16c, "avx2,fma,f16c", true, true);
+    impl_gemm_q5k_8x4!(gemm_q5k_8x4_avx2_f16c, "avx2,fma,f16c", false, true);
+    impl_gemm_q5k_8x4!(gemm_q5k_8x4_avx2, "avx2,fma", false, false);
 }

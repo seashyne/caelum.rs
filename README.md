@@ -9,28 +9,28 @@ No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a s
 
 ---
 
-## Key Features (v0.5.0)
+## Key Features (v0.6.0)
 
 - **Zero External Dependencies:** Pure Rust standard library (`std`) — builds in seconds and compiles cleanly for `x86_64`, **ARMv9 (`aarch64`)**, and **`wasm32`**.
 - **Beats `llama.cpp` on CPU (`x86_64` AVX-VNNI + Online Weight Repacking):**
-  - **Cache-Aligned 8-Row Repacked Tiles (`TileQ4Kx8`, `TileQ6Kx8`):** Interleaves 8 weight rows in 4-byte SIMD lanes with pre-unpacked scales/quants and hardware `F16C` (`vcvtph2ps`), executing single-instruction **`{vex} vpdpbusd` (AVX-VNNI)** with **zero horizontal reductions** (`hsum256`) and **zero register spills** across `8×4` (`Q4_K`) and `8×8` (`Q6_K`) Prefill GEMM micro-tiles.
+  - **Cache-Aligned 8-Row Repacked Tiles (`TileQ4Kx8`, `TileQ5Kx8`, `TileQ6Kx8`):** Interleaves 8 weight rows in 4-byte SIMD lanes with pre-unpacked scales/quants and hardware `F16C` (`vcvtph2ps`), executing single-instruction **`{vex} vpdpbusd` (AVX-VNNI)** with **zero horizontal reductions** (`hsum256`) and **zero register spills** — hitting **`1.465 TFLOP/s`** (`Q4_Kx8`), **`1.112 TFLOP/s`** (`Q5_Kx8`), and **`1.401 TFLOP/s`** (`Q6_Kx8`) on a 6-core CPU!
   - **Single-Barrier Fused Decode Ops:** Fused QKV projection + Fused Gate+Up+SwiGLU + zero-allocation 32-wide 2-row `Q6_K` `lm_head` cut thread barriers by ~43% and saturate **~96% of physical DRAM bandwidth**.
   - **P-Core Pinning + Lock-Free Dynamic Work-Stealing `ThreadPool`:** Pins workers to physical P-cores first on Linux hybrid CPUs (eliminating E-core stragglers) and balances heterogeneous cores via an atomic cursor, parking on `Condvar` at 0% CPU when idle.
 - **ARMv9-First Hardware Kernels (`aarch64`):**
   - `aarch64` **NEON FMA + ARMv9 `dotprod` (`vdotq_s32`) + ARMv9 `i8mm` (`SMMLA` 2×2 tiled matrix multiply)** fused W4A8/W5A8/W6A8/W8A8 (`Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`) SIMD kernels.
   - Pluggable `Backend` trait designed for drop-in **Arm KleidiAI (`SME2`)** or `wgpu` GPU backends.
 - **Broad Modern Model & Coding Architecture Support:**
-  - **Dense & MoE GGUF:** `qwen2` (`Qwen2.5-Coder`), **`qwen3`** (per-head **QK-Norm**), **`qwen3moe`** (`Qwen3-Coder-30B-A3B`), **`qwen2moe`**, **`deepseek2`** (`DeepSeek-Coder-V2-Lite` / `DeepSeek-V2/V3/R1` with **True Compressed Absorbed MLA** + **YaRN RoPE** + **DeepSeekMoE**), `llama` (`Llama 3.x`, `DeepSeek-Coder v1`, `Yi-Coder`, `OpenCoder`, `CodeLlama`), `mistral` (`Codestral`), and native **`celestia`**.
+  - **Dense & MoE GGUF:** `qwen2` (`Qwen2.5-Coder`), **`qwen3`** (per-head **QK-Norm**), **`qwen3moe`** (`Qwen3-Coder-30B-A3B`), **`qwen2moe`**, **`deepseek2`** (`DeepSeek-Coder-V2-Lite` / `DeepSeek-V2/V3/R1` with **True Compressed Absorbed MLA** + **Batched Prefill** + **YaRN RoPE** + **DeepSeekMoE**), `llama` (`Llama 3.x`, `DeepSeek-Coder v1`, `Yi-Coder`, `OpenCoder`, `CodeLlama`), `mistral` (`Codestral`), and native **`celestia`**.
   - **Zero-Copy GGUF v2/v3 Quantizations:** `F32`, `F16`, `BF16`, `Q8_0`, `Q4_0`, `Q4_1`, `Q4_K`, **`Q5_K`**, `Q6_K`.
 - **High-Efficiency Memory & Prefix Caching:**
   - **Quantized `Q8_0` KV Cache (`--kv-q8`):** Cuts GQA KV cache RAM & bandwidth by **3.76×** (`112 MB` → `29.8 MB` at 2048 ctx).
   - **True Compressed MLA Latent Cache (`deepseek2` / `celestia`):** Cuts KV cache by **75–89%** by caching only compressed latents.
-  - **Automatic KV Prefix Caching:** Reuses the longest matching token prefix across multi-turn `caelum chat` and repeated `/v1/celestia/propose` API calls.
-- **Multilingual BPE, Auto Chat Templates & Strict JSON Schema Decoding:**
-  - Exact Qwen2.5/Qwen3/GPT-2 byte-level BPE & SentencePiece BPE with Thai-safe incremental UTF-8 `StreamDecoder`.
-  - Auto-detects `tokenizer.chat_template` from GGUF metadata + `--template` override (`chatml`, `qwen3-nothink`, `llama3`, `deepseek2`, `deepseek-v1`, `mistral`, `celestia`, `raw`).
-  - **Full `SchemaGrammar` Engine** (`caelum-tokenizer::SchemaGrammar`): enforces required fields, enums, discriminated `OneOf` unions, `HexColor`, `Identifier`, `UnitFloat [0,1]`, and 3D tuples at sampling time (`O(1)` 256-byte prefilter).
-- **Built-In HTTP/1.1 Server:** OpenAI-compatible `/v1/chat/completions` (real **SSE `"stream": true`**), Lenout-native `/v1/celestia/propose` (Prefix Caching + `SchemaGrammar`), and `/health`.
+  - **Automatic KV Prefix Caching:** Reuses the longest matching token prefix across multi-turn `caelum chat`, OpenAI `/v1/chat/completions`, and `/v1/celestia/propose`.
+- **Full OpenAI & IDE Coding Server (Zero-Dep RFC-8259 JSON):**
+  - `GET /v1/models` (auto-discovery for OpenAI SDK, **Continue.dev**, **Cline**, **OpenWebUI**)
+  - `POST /v1/chat/completions` (full multi-turn `messages[]`, **SSE `"stream": true`**, `response_format: {"type":"json_object"}`, `stop` sequences, `prompt_tokens_details.cached_tokens`)
+  - `POST /v1/completions` (**IDE Tab Autocomplete / Fill-In-The-Middle FIM** auto-wrapping `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>`)
+  - `POST /v1/celestia/propose` (Lenout strict `SchemaGrammar` + Prefix Caching) & `GET /health`
 
 ---
 

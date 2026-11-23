@@ -836,6 +836,458 @@ impl<'a> DeepSeek2Model<'a> {
 
         Ok(&self.scratch.logits)
     }
+
+    /// Batched Prefill GEMM for DeepSeek2 (Absorbed MLA + Leading Dense + DeepSeekMoE).
+    /// Batches `wq`/`wq_a`/`wq_b`, `wkv_a_mqa`, `wo`, and leading dense FFN across chunks of
+    /// up to 128 tokens, and parallelizes causal absorbed MLA across `batch * num_heads`.
+    pub fn forward_batch(
+        &mut self,
+        backend: &dyn Backend,
+        tokens: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+    ) -> Result<&[f32]> {
+        if tokens.is_empty() {
+            return Ok(&self.scratch.logits);
+        }
+        if tokens.len() == 1 {
+            return self.forward_token(backend, tokens[0], start_pos, compute_last_logits);
+        }
+
+        const PREFILL_CHUNK: usize = 128;
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let n_head = cfg.num_heads;
+        let kv_rank = cfg.kv_lora_rank;
+        let qk_nope = cfg.qk_nope_head_dim;
+        let qk_rope = cfg.qk_rope_head_dim;
+        let qk_dim = cfg.qk_head_dim();
+        let q_dim = n_head * qk_dim;
+        let v_dim = cfg.v_head_dim;
+        let o_dim = n_head * v_dim;
+        let kv_a_dim = kv_rank + qk_rope;
+        let d_ffn = cfg.dense_ffn_size;
+        let can_q8k_h = h % QK_K == 0;
+        let can_q8_h = h % QK8_0 == 0;
+        let can_q8k_o = o_dim % QK_K == 0;
+        let can_q8k_ffn = d_ffn % QK_K == 0;
+        let has_dense = self
+            .layers
+            .iter()
+            .any(|l| matches!(l.ffn, Ds2Ffn::Dense { .. }));
+
+        let max_b = tokens.len().min(PREFILL_CHUNK);
+        let mut x_buf = vec![0.0f32; max_b * h];
+        let mut xb_buf = vec![0.0f32; max_b * h];
+        let mut q_buf = vec![0.0f32; max_b * q_dim];
+        let mut q_lat_buf = vec![0.0f32; max_b * cfg.q_lora_rank.max(1)];
+        let mut q_lat_norm_buf = vec![0.0f32; max_b * cfg.q_lora_rank.max(1)];
+        let mut kv_a_buf = vec![0.0f32; max_b * kv_a_dim];
+        let mut attn_out_buf = vec![0.0f32; max_b * o_dim];
+        let mut hb_buf = if has_dense { vec![0.0f32; max_b * d_ffn] } else { Vec::new() };
+        let mut hb2_buf = if has_dense { vec![0.0f32; max_b * d_ffn] } else { Vec::new() };
+        let mut xq8k_buf = vec![BlockQ8_K::default(); max_b * (h / QK_K).max(1)];
+        let mut xq8_buf = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; max_b * (h / QK8_0).max(1)];
+        let mut woq8k_buf = vec![BlockQ8_K::default(); max_b * (o_dim / QK_K).max(1)];
+        let mut hbq8k_buf = if has_dense {
+            vec![BlockQ8_K::default(); max_b * (d_ffn / QK_K).max(1)]
+        } else {
+            Vec::new()
+        };
+        let mut kv_cmpr_tmp = vec![0.0f32; kv_rank];
+
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let chunk = &tokens[offset..(offset + PREFILL_CHUNK).min(tokens.len())];
+            let b = chunk.len();
+            let chunk_pos = start_pos + offset;
+            let is_last_chunk = offset + b == tokens.len();
+
+            let x = &mut x_buf[..b * h];
+            for (t, &tok) in chunk.iter().enumerate() {
+                self.token_embd
+                    .dequantize_row(tok as usize, &mut x[t * h..(t + 1) * h])?;
+            }
+
+            let xb = &mut xb_buf[..b * h];
+            let q = &mut q_buf[..b * q_dim];
+            let kv_a = &mut kv_a_buf[..b * kv_a_dim];
+            let attn_out = &mut attn_out_buf[..b * o_dim];
+
+            for l in 0..cfg.num_layers {
+                let layer = &self.layers[l];
+
+                for t in 0..b {
+                    backend.rms_norm(
+                        &x[t * h..(t + 1) * h],
+                        &layer.attn_norm,
+                        cfg.rms_norm_eps,
+                        &mut xb[t * h..(t + 1) * h],
+                    );
+                }
+
+                let nb_h = h / QK_K;
+                let xq_ready = if can_q8k_h {
+                    let xq = &mut xq8k_buf[..b * nb_h];
+                    for t in 0..b {
+                        quantize_row_q8_k(&xb[t * h..(t + 1) * h], &mut xq[t * nb_h..(t + 1) * nb_h]);
+                    }
+                    true
+                } else {
+                    false
+                };
+
+                // Batched Q projection
+                match &layer.q_proj {
+                    QueryProj::Direct { wq, p_wq } => {
+                        if let (Some(p), true) = (p_wq, xq_ready) {
+                            backend.matmul_packed_q8k(p, &xq8k_buf[..b * nb_h], b, q)?;
+                        } else if xq_ready && is_k_quant(wq.dtype) {
+                            backend.matmul_q8k_act(wq, xb, &xq8k_buf[..b * nb_h], b, q)?;
+                        } else {
+                            backend.matmul(wq, xb, b, q)?;
+                        }
+                    }
+                    QueryProj::LowRank {
+                        wq_a,
+                        q_a_norm,
+                        wq_b,
+                        p_wq_a,
+                        p_wq_b,
+                    } => {
+                        let qr = cfg.q_lora_rank;
+                        let ql = &mut q_lat_buf[..b * qr];
+                        let qln = &mut q_lat_norm_buf[..b * qr];
+                        if let (Some(p), true) = (p_wq_a, xq_ready) {
+                            backend.matmul_packed_q8k(p, &xq8k_buf[..b * nb_h], b, ql)?;
+                        } else {
+                            backend.matmul(wq_a, xb, b, ql)?;
+                        }
+                        for t in 0..b {
+                            backend.rms_norm(
+                                &ql[t * qr..(t + 1) * qr],
+                                q_a_norm,
+                                cfg.rms_norm_eps,
+                                &mut qln[t * qr..(t + 1) * qr],
+                            );
+                        }
+                        if let (Some(p), true) = (p_wq_b, qr % QK_K == 0) {
+                            let nb_q = qr / QK_K;
+                            let mut q_q8k = vec![BlockQ8_K::default(); b * nb_q];
+                            for t in 0..b {
+                                quantize_row_q8_k(
+                                    &qln[t * qr..(t + 1) * qr],
+                                    &mut q_q8k[t * nb_q..(t + 1) * nb_q],
+                                );
+                            }
+                            backend.matmul_packed_q8k(p, &q_q8k, b, q)?;
+                        } else {
+                            backend.matmul(wq_b, qln, b, q)?;
+                        }
+                    }
+                }
+
+                // Batched compressed KV projection
+                if let (Some(p), true) = (&layer.p_wkv_a_mqa, xq_ready) {
+                    backend.matmul_packed_q8k(p, &xq8k_buf[..b * nb_h], b, kv_a)?;
+                } else if xq_ready && is_k_quant(layer.wkv_a_mqa.dtype) {
+                    backend.matmul_q8k_act(&layer.wkv_a_mqa, xb, &xq8k_buf[..b * nb_h], b, kv_a)?;
+                } else {
+                    backend.matmul(&layer.wkv_a_mqa, xb, b, kv_a)?;
+                }
+
+                // Norm kv_cmpr, apply RoPE to k_pe & q_pe, store compressed latent into cache
+                for t in 0..b {
+                    let pos = chunk_pos + t;
+                    let kva_t = &mut kv_a[t * kv_a_dim..(t + 1) * kv_a_dim];
+                    backend.rms_norm(
+                        &kva_t[..kv_rank],
+                        &layer.kv_a_norm,
+                        cfg.rms_norm_eps,
+                        &mut kv_cmpr_tmp,
+                    );
+                    let k_pe = &mut kva_t[kv_rank..kv_rank + qk_rope];
+                    self.rope.apply(k_pe, pos);
+                    self.cache.store(l, pos, &kv_cmpr_tmp, k_pe);
+
+                    let qt = &mut q[t * q_dim..(t + 1) * q_dim];
+                    for head in 0..n_head {
+                        let pe_off = head * qk_dim + qk_nope;
+                        self.rope.apply(&mut qt[pe_off..pe_off + qk_rope], pos);
+                    }
+                }
+
+                // Causal Multi-head Latent Attention across all `b * n_head` query heads
+                let kq_scale = cfg.kq_scale;
+                let max_t_len = chunk_pos + b;
+                match &layer.kv_b {
+                    MlaKvB::Absorbed { wk_b, wv_b } => {
+                        let total_jobs = b * n_head;
+                        let q_ref: &[f32] = q;
+                        let cache_ref = &self.cache;
+                        let attn_addr = attn_out.as_mut_ptr() as usize;
+
+                        backend.parallel_for(total_jobs, &|j_start, j_end| {
+                            let attn_ptr = attn_addr as *mut f32;
+                            let mut q_abs = vec![0.0f32; kv_rank];
+                            let mut att = vec![0.0f32; max_t_len];
+                            let mut ctx_lat = vec![0.0f32; kv_rank];
+
+                            for job in j_start..j_end {
+                                let t = job / n_head;
+                                let head = job % n_head;
+                                let pos = chunk_pos + t;
+                                let seq_len = pos + 1;
+                                let q_off = t * q_dim + head * qk_dim;
+                                let q_nope = &q_ref[q_off..q_off + qk_nope];
+                                let q_pe = &q_ref[q_off + qk_nope..q_off + qk_dim];
+
+                                let wk_h = wk_b.slice_outer(head).expect("valid wk_b head slice");
+                                let wv_h = wv_b.slice_outer(head).expect("valid wv_b head slice");
+                                matvec_small_local(backend, &wk_h, q_nope, &mut q_abs);
+
+                                let att_s = &mut att[..seq_len];
+                                for s_pos in 0..seq_len {
+                                    let sc = backend.dot_f32(&q_abs, cache_ref.cmpr_at(l, s_pos))
+                                        + backend.dot_f32(q_pe, cache_ref.pe_at(l, s_pos));
+                                    att_s[s_pos] = sc * kq_scale;
+                                }
+                                backend.softmax(att_s);
+
+                                ctx_lat.fill(0.0);
+                                for s_pos in 0..seq_len {
+                                    let w = att_s[s_pos];
+                                    let cmpr = cache_ref.cmpr_at(l, s_pos);
+                                    for j in 0..kv_rank {
+                                        ctx_lat[j] += w * cmpr[j];
+                                    }
+                                }
+
+                                let out_h = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        attn_ptr.add(t * o_dim + head * v_dim),
+                                        v_dim,
+                                    )
+                                };
+                                matvec_small_local(backend, &wv_h, &ctx_lat, out_h);
+                            }
+                        });
+                    }
+                    MlaKvB::LegacyUnsplit { wkv_b } => {
+                        let kv_head_stride = qk_nope + v_dim;
+                        let mut all_k = vec![0.0f32; max_t_len * n_head * qk_nope];
+                        let mut all_v = vec![0.0f32; max_t_len * n_head * v_dim];
+                        let mut kv_tmp = vec![0.0f32; n_head * kv_head_stride];
+                        for s_pos in 0..max_t_len {
+                            backend.matvec(wkv_b, self.cache.cmpr_at(l, s_pos), &mut kv_tmp)?;
+                            for head in 0..n_head {
+                                let src =
+                                    &kv_tmp[head * kv_head_stride..(head + 1) * kv_head_stride];
+                                let k_off = (s_pos * n_head + head) * qk_nope;
+                                let v_off = (s_pos * n_head + head) * v_dim;
+                                all_k[k_off..k_off + qk_nope].copy_from_slice(&src[..qk_nope]);
+                                all_v[v_off..v_off + v_dim].copy_from_slice(&src[qk_nope..]);
+                            }
+                        }
+                        let mut att = vec![0.0f32; max_t_len];
+                        for t in 0..b {
+                            let pos = chunk_pos + t;
+                            let seq_len = pos + 1;
+                            for head in 0..n_head {
+                                let q_off = t * q_dim + head * qk_dim;
+                                let q_nope = &q[q_off..q_off + qk_nope];
+                                let q_pe = &q[q_off + qk_nope..q_off + qk_dim];
+                                let att_s = &mut att[..seq_len];
+                                for s_pos in 0..seq_len {
+                                    let k_off = (s_pos * n_head + head) * qk_nope;
+                                    let sc = backend.dot_f32(q_nope, &all_k[k_off..k_off + qk_nope])
+                                        + backend.dot_f32(q_pe, self.cache.pe_at(l, s_pos));
+                                    att_s[s_pos] = sc * kq_scale;
+                                }
+                                backend.softmax(att_s);
+                                let out_h = &mut attn_out
+                                    [t * o_dim + head * v_dim..t * o_dim + (head + 1) * v_dim];
+                                out_h.fill(0.0);
+                                for s_pos in 0..seq_len {
+                                    let w = att_s[s_pos];
+                                    let v_off = (s_pos * n_head + head) * v_dim;
+                                    let vh = &all_v[v_off..v_off + v_dim];
+                                    for j in 0..v_dim {
+                                        out_h[j] += w * vh[j];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Batched Output projection + Residual
+                if let (Some(p), true) = (&layer.p_wo, can_q8k_o) {
+                    let nb_o = o_dim / QK_K;
+                    let wq = &mut woq8k_buf[..b * nb_o];
+                    for t in 0..b {
+                        quantize_row_q8_k(
+                            &attn_out[t * o_dim..(t + 1) * o_dim],
+                            &mut wq[t * nb_o..(t + 1) * nb_o],
+                        );
+                    }
+                    backend.matmul_packed_q8k(p, wq, b, xb)?;
+                } else if can_q8k_o && is_k_quant(layer.wo.dtype) {
+                    let nb_o = o_dim / QK_K;
+                    let wq = &mut woq8k_buf[..b * nb_o];
+                    for t in 0..b {
+                        quantize_row_q8_k(
+                            &attn_out[t * o_dim..(t + 1) * o_dim],
+                            &mut wq[t * nb_o..(t + 1) * nb_o],
+                        );
+                    }
+                    backend.matmul_q8k_act(&layer.wo, attn_out, wq, b, xb)?;
+                } else {
+                    backend.matmul(&layer.wo, attn_out, b, xb)?;
+                }
+                for (xv, &dx) in x.iter_mut().zip(xb.iter()) {
+                    *xv += dx;
+                }
+
+                // Pre-FFN RMSNorm
+                for t in 0..b {
+                    backend.rms_norm(
+                        &x[t * h..(t + 1) * h],
+                        &layer.ffn_norm,
+                        cfg.rms_norm_eps,
+                        &mut xb[t * h..(t + 1) * h],
+                    );
+                }
+
+                match &layer.ffn {
+                    Ds2Ffn::Dense {
+                        w_gate,
+                        w_up,
+                        w_down,
+                        p_gate,
+                        p_up,
+                        p_down,
+                    } => {
+                        let hb = &mut hb_buf[..b * d_ffn];
+                        let hb2 = &mut hb2_buf[..b * d_ffn];
+                        if can_q8k_h
+                            && (p_gate.is_some()
+                                || (is_k_quant(w_gate.dtype) && is_k_quant(w_up.dtype)))
+                        {
+                            let xq = &mut xq8k_buf[..b * nb_h];
+                            for t in 0..b {
+                                quantize_row_q8_k(
+                                    &xb[t * h..(t + 1) * h],
+                                    &mut xq[t * nb_h..(t + 1) * nb_h],
+                                );
+                            }
+                            if let Some(pg) = p_gate {
+                                backend.matmul_packed_q8k(pg, xq, b, hb)?;
+                            } else {
+                                backend.matmul_q8k_act(w_gate, xb, xq, b, hb)?;
+                            }
+                            if let Some(pu) = p_up {
+                                backend.matmul_packed_q8k(pu, xq, b, hb2)?;
+                            } else {
+                                backend.matmul_q8k_act(w_up, xb, xq, b, hb2)?;
+                            }
+                        } else {
+                            backend.matmul(w_gate, xb, b, hb)?;
+                            backend.matmul(w_up, xb, b, hb2)?;
+                        }
+                        backend.swiglu_inplace(hb, hb2);
+
+                        if let (Some(pd), true) = (p_down, can_q8k_ffn) {
+                            let nb_f = d_ffn / QK_K;
+                            let hq = &mut hbq8k_buf[..b * nb_f];
+                            for t in 0..b {
+                                quantize_row_q8_k(
+                                    &hb[t * d_ffn..(t + 1) * d_ffn],
+                                    &mut hq[t * nb_f..(t + 1) * nb_f],
+                                );
+                            }
+                            backend.matmul_packed_q8k(pd, hq, b, xb)?;
+                        } else if can_q8k_ffn && is_k_quant(w_down.dtype) {
+                            let nb_f = d_ffn / QK_K;
+                            let hq = &mut hbq8k_buf[..b * nb_f];
+                            for t in 0..b {
+                                quantize_row_q8_k(
+                                    &hb[t * d_ffn..(t + 1) * d_ffn],
+                                    &mut hq[t * nb_f..(t + 1) * nb_f],
+                                );
+                            }
+                            backend.matmul_q8k_act(w_down, hb, hq, b, xb)?;
+                        } else {
+                            backend.matmul(w_down, hb, b, xb)?;
+                        }
+                    }
+                    Ds2Ffn::Moe(moe_layer) => {
+                        let nb_8 = h / QK8_0;
+                        let mut tok_out = vec![0.0f32; h];
+                        for t in 0..b {
+                            let x_tok = &xb[t * h..(t + 1) * h];
+                            let xq8k_opt = if can_q8k_h {
+                                quantize_row_q8_k(x_tok, &mut xq8k_buf[..nb_h]);
+                                Some(&xq8k_buf[..nb_h])
+                            } else {
+                                None
+                            };
+                            let xq8_opt = if can_q8_h && xq8k_opt.is_none() {
+                                quantize_row_q8_0(x_tok, &mut xq8_buf[..nb_8]);
+                                Some(&xq8_buf[..nb_8])
+                            } else {
+                                None
+                            };
+                            forward_moe_token(
+                                backend,
+                                moe_layer,
+                                &cfg.moe,
+                                x_tok,
+                                xq8k_opt,
+                                xq8_opt,
+                                &mut self.scratch.moe,
+                                &mut tok_out,
+                            )?;
+                            xb[t * h..(t + 1) * h].copy_from_slice(&tok_out);
+                        }
+                    }
+                }
+
+                for (xv, &dx) in x.iter_mut().zip(xb.iter()) {
+                    *xv += dx;
+                }
+            }
+
+            if is_last_chunk && compute_last_logits {
+                let last_x = &x[(b - 1) * h..b * h];
+                backend.rms_norm(
+                    last_x,
+                    &self.output_norm,
+                    cfg.rms_norm_eps,
+                    &mut self.scratch.xb,
+                );
+                if can_q8k_h && is_k_quant(self.output_weight.dtype) {
+                    quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
+                    backend.matvec_q8k_act(
+                        &self.output_weight,
+                        &self.scratch.xb,
+                        &self.scratch.xq8k,
+                        &mut self.scratch.logits,
+                    )?;
+                } else {
+                    backend.matvec(
+                        &self.output_weight,
+                        &self.scratch.xb,
+                        &mut self.scratch.logits,
+                    )?;
+                }
+            }
+
+            offset += b;
+        }
+
+        Ok(&self.scratch.logits)
+    }
 }
 
 /// Computes a small per-head matvec `[rows, cols] × [cols]` purely on the current worker thread
@@ -981,5 +1433,28 @@ mod tests {
             .unwrap();
         assert_eq!(stats.generated_tokens, 6);
         assert_eq!(model.kv_mode_label(), "MLA-Absorbed");
+
+        // Verify DeepSeek2 batched prefill matches sequential token-by-token prefill
+        let mut m_seq = DeepSeek2Model::from_gguf(&gguf, Some(64)).unwrap();
+        let mut seq_logits = Vec::new();
+        for (pos, &tok) in ids.iter().enumerate() {
+            let l = m_seq
+                .forward_token(&backend, tok, pos, pos + 1 == ids.len())
+                .unwrap();
+            if pos + 1 == ids.len() {
+                seq_logits = l.to_vec();
+            }
+        }
+        let mut m_batch = DeepSeek2Model::from_gguf(&gguf, Some(64)).unwrap();
+        let batch_logits = m_batch
+            .forward_batch(&backend, &ids, 0, true)
+            .unwrap()
+            .to_vec();
+        for (a, b) in seq_logits.iter().zip(batch_logits.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "DeepSeek2 batched prefill mismatch vs sequential: seq={a}, batch={b}"
+            );
+        }
     }
 }

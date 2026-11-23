@@ -1264,6 +1264,31 @@ mod tests {
             }
         }
 
+        if let Some(packed5) = backend.pack_matrix(&buf_q5k.as_view()) {
+            let mut p_out = vec![0.0f32; rows];
+            backend.matvec_packed_q8k(&packed5, &x_q8k, &mut p_out).unwrap();
+            for r in 0..rows {
+                assert!(
+                    (p_out[r] - out_q5k[r]).abs() < 2e-3,
+                    "Packed Q5_K matvec mismatch at r={r}: packed={}, raw={}",
+                    p_out[r],
+                    out_q5k[r]
+                );
+            }
+            let mut pb_out = vec![0.0f32; batch * rows];
+            backend
+                .matmul_packed_q8k(&packed5, &x_batch_q8k, batch, &mut pb_out)
+                .unwrap();
+            for idx in 0..batch * rows {
+                assert!(
+                    (pb_out[idx] - out_batch_q5k[idx]).abs() < 2e-3,
+                    "Packed Q5_K matmul mismatch at idx={idx}: packed={}, raw={}",
+                    pb_out[idx],
+                    out_batch_q5k[idx]
+                );
+            }
+        }
+
         if let Some(packed6) = backend.pack_matrix(&buf_q6k.as_view()) {
             let mut p_out = vec![0.0f32; rows];
             backend.matvec_packed_q8k(&packed6, &x_q8k, &mut p_out).unwrap();

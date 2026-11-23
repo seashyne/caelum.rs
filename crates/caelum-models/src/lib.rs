@@ -199,16 +199,7 @@ impl<'a> CaelumModel<'a> {
                 m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
             ModelInner::DeepSeek2(m) => {
-                let n = tokens.len();
-                for (i, &tok) in tokens.iter().enumerate() {
-                    let is_last = i + 1 == n && compute_last_logits;
-                    m.forward_token(backend, tok, start_pos + i, is_last)?;
-                }
-                if n > 0 && compute_last_logits {
-                    m.forward_token(backend, tokens[n - 1], start_pos + n - 1, true)
-                } else {
-                    Ok(&[])
-                }
+                m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
             ModelInner::Celestia(m) => {
                 let n = tokens.len();
@@ -270,7 +261,36 @@ impl<'a> CaelumModel<'a> {
         prompt_tokens: &[u32],
         max_new_tokens: usize,
         sampler_cfg: &SamplerConfig,
+        grammar: Option<&mut dyn LogitGrammar>,
+        on_token: F,
+    ) -> Result<(String, GenerationStats)>
+    where
+        F: FnMut(u32, &str),
+    {
+        self.generate_with_stop(
+            backend,
+            tokenizer,
+            prompt_tokens,
+            max_new_tokens,
+            sampler_cfg,
+            grammar,
+            &[],
+            on_token,
+        )
+    }
+
+    /// Runs prefix-cached batched prefill + autoregressive decode with optional `LogitGrammar`
+    /// and string `stop_sequences` (used by OpenAI `/v1/chat/completions` & FIM `/v1/completions`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_stop<F>(
+        &mut self,
+        backend: &dyn Backend,
+        tokenizer: &Tokenizer,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampler_cfg: &SamplerConfig,
         mut grammar: Option<&mut dyn LogitGrammar>,
+        stop_sequences: &[String],
         mut on_token: F,
     ) -> Result<(String, GenerationStats)>
     where
@@ -304,15 +324,7 @@ impl<'a> CaelumModel<'a> {
                 m.forward_batch(backend, uncached, common, true)?.to_vec()
             }
             ModelInner::DeepSeek2(m) => {
-                let mut out = Vec::new();
-                for (i, &tok) in uncached.iter().enumerate() {
-                    let is_last = i + 1 == uncached.len();
-                    let logits = m.forward_token(backend, tok, common + i, is_last)?;
-                    if is_last {
-                        out = logits.to_vec();
-                    }
-                }
-                out
+                m.forward_batch(backend, uncached, common, true)?.to_vec()
             }
             ModelInner::Celestia(m) => {
                 let mut out = Vec::new();
@@ -356,10 +368,28 @@ impl<'a> CaelumModel<'a> {
 
             let piece = decoder.push(tokenizer, next_tok);
             full_text.push_str(&piece);
-            on_token(next_tok, &piece);
+
+            let mut hit_stop = false;
+            if !stop_sequences.is_empty() {
+                for stop in stop_sequences {
+                    if !stop.is_empty() && full_text.ends_with(stop.as_str()) {
+                        let new_len = full_text.len() - stop.len();
+                        full_text.truncate(new_len);
+                        hit_stop = true;
+                        break;
+                    }
+                }
+            }
+            if !hit_stop {
+                on_token(next_tok, &piece);
+            }
 
             history.push(next_tok);
             generated += 1;
+
+            if hit_stop {
+                break;
+            }
 
             if let Some(ref g) = grammar {
                 if g.is_complete() {
