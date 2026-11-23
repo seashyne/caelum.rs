@@ -91,6 +91,9 @@ pub trait Backend: Send + Sync {
     /// Dot product of two `Q8_0` block slices (used for quantized KV-cache attention).
     fn dot_q8_0(&self, a: &[BlockQ8_0], b: &[BlockQ8_0]) -> f32;
 
+    /// Parallelizes an index range `0..total` across the backend's lock-free spin-barrier thread pool.
+    fn parallel_for(&self, total: usize, f: &(dyn Fn(usize, usize) + Sync));
+
     /// RMSNorm: `out[i] = x[i] * rsqrt(mean(x^2) + eps) * weight[i]`.
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]);
 
@@ -126,9 +129,12 @@ impl CpuBackend {
         let default_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        // On hybrid CPUs (ARMv9 big.LITTLE or Intel P+E), default to a balanced thread count
-        // that avoids oversubscribing slower efficiency cores on memory-bound decode.
-        let threads = num_threads.unwrap_or_else(|| default_threads.min(8).max(1));
+        // On hybrid CPUs, balance performance-core throughput without oversubscribing slow cores
+        #[cfg(target_arch = "x86_64")]
+        let auto_threads = default_threads.min(10).max(1);
+        #[cfg(not(target_arch = "x86_64"))]
+        let auto_threads = default_threads.min(8).max(1);
+        let threads = num_threads.unwrap_or(auto_threads);
         Self {
             caps,
             pool: ThreadPool::new(threads),
@@ -170,6 +176,10 @@ impl CpuBackend {
                 #[cfg(target_arch = "aarch64")]
                 if self.caps.dotprod {
                     return unsafe { armv9::dot_q4_0_q8_0_dotprod(row, x_q8) };
+                }
+                #[cfg(target_arch = "x86_64")]
+                if self.caps.avx2 && self.caps.avxvnni {
+                    return unsafe { x86::dot_q4_0_q8_0_vnni(row, x_q8) };
                 }
                 #[cfg(target_arch = "x86_64")]
                 if self.caps.avx2 {
@@ -326,19 +336,32 @@ impl Backend for CpuBackend {
         let data = w.data;
         let dtype = w.dtype;
 
-        if rows >= 64 && self.pool.num_threads() > 1 {
-            self.pool.parallel_for_rows(out, |row_start, chunk| {
-                for (i, dst) in chunk.iter_mut().enumerate() {
+        let compute_chunk = |row_start: usize, chunk: &mut [f32]| {
+            let mut i = 0usize;
+            #[cfg(target_arch = "x86_64")]
+            if dtype == DType::Q4_K && self.caps.avx2 {
+                while i + 2 <= chunk.len() {
                     let r = row_start + i;
-                    let row = &data[r * row_stride..(r + 1) * row_stride];
-                    *dst = self.row_dot_q8k(row, x_f32, x_q8k, dtype);
+                    let row0 = &data[r * row_stride..(r + 1) * row_stride];
+                    let row1 = &data[(r + 1) * row_stride..(r + 2) * row_stride];
+                    let pair = unsafe { x86::dot_q4_k_q8_k_2row_avx2(row0, row1, x_q8k) };
+                    chunk[i] = pair[0];
+                    chunk[i + 1] = pair[1];
+                    i += 2;
                 }
-            });
-        } else {
-            for (r, dst) in out.iter_mut().enumerate() {
-                let row = &data[r * row_stride..(r + 1) * row_stride];
-                *dst = self.row_dot_q8k(row, x_f32, x_q8k, dtype);
             }
+            while i < chunk.len() {
+                let r = row_start + i;
+                let row = &data[r * row_stride..(r + 1) * row_stride];
+                chunk[i] = self.row_dot_q8k(row, x_f32, x_q8k, dtype);
+                i += 1;
+            }
+        };
+
+        if rows >= 64 && self.pool.num_threads() > 1 {
+            self.pool.parallel_for_rows(out, compute_chunk);
+        } else {
+            compute_chunk(0, out);
         }
         Ok(())
     }
@@ -485,6 +508,30 @@ impl Backend for CpuBackend {
                 let row = &data[r * row_stride..(r + 1) * row_stride];
                 let mut t = 0usize;
 
+                // 8-token-at-once AVX2 weight-reuse fast path for Q4_K prefill
+                #[cfg(target_arch = "x86_64")]
+                if dtype == DType::Q4_K && self.caps.avx2 {
+                    while t + 8 <= batch {
+                        let xs = [
+                            &x_batch_q8k[t * nb..(t + 1) * nb],
+                            &x_batch_q8k[(t + 1) * nb..(t + 2) * nb],
+                            &x_batch_q8k[(t + 2) * nb..(t + 3) * nb],
+                            &x_batch_q8k[(t + 3) * nb..(t + 4) * nb],
+                            &x_batch_q8k[(t + 4) * nb..(t + 5) * nb],
+                            &x_batch_q8k[(t + 5) * nb..(t + 6) * nb],
+                            &x_batch_q8k[(t + 6) * nb..(t + 7) * nb],
+                            &x_batch_q8k[(t + 7) * nb..(t + 8) * nb],
+                        ];
+                        let v = unsafe { x86::dot_q4_k_q8_k_batch8_avx2(row, xs) };
+                        unsafe {
+                            for k in 0..8 {
+                                *out_ptr.add((t + k) * rows + r) = v[k];
+                            }
+                        }
+                        t += 8;
+                    }
+                }
+
                 // 4-token-at-once weight-reuse micro-kernels (AVX2 / ARMv9 DotProd)
                 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 while t + 4 <= batch {
@@ -625,6 +672,14 @@ impl Backend for CpuBackend {
             return unsafe { x86::dot_q8_0_q8_0_avx2(raw_a, b) };
         }
         scalar::dot_q8_0_q8_0(raw_a, b)
+    }
+
+    fn parallel_for(&self, total: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+        if total > 1 && self.pool.num_threads() > 1 {
+            self.pool.parallel_for_range(total, |s, e| f(s, e));
+        } else {
+            f(0, total);
+        }
     }
 
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
@@ -779,8 +834,8 @@ mod tests {
             );
         }
 
-        // Batched Prefill GEMM check (batch=7 covers 4-token AVX2/ARMv9 path + tail)
-        let batch = 7usize;
+        // Batched Prefill GEMM check (batch=11 covers 8-token + 4-token + tail fast paths)
+        let batch = 11usize;
         let x_batch: Vec<f32> = (0..batch * cols)
             .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
             .collect();

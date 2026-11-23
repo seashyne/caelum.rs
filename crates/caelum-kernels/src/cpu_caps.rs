@@ -9,6 +9,7 @@ pub struct CpuCaps {
     pub avx2: bool,
     pub fma: bool,
     pub f16c: bool,
+    pub avxvnni: bool,
     pub avx512f: bool,
     // aarch64 / ARMv9 extensions
     pub neon: bool,
@@ -32,6 +33,7 @@ impl CpuCaps {
             caps.avx2 = std::arch::is_x86_feature_detected!("avx2");
             caps.fma = std::arch::is_x86_feature_detected!("fma");
             caps.f16c = std::arch::is_x86_feature_detected!("f16c");
+            caps.avxvnni = std::arch::is_x86_feature_detected!("avxvnni");
             caps.avx512f = std::arch::is_x86_feature_detected!("avx512f");
         }
 
@@ -67,6 +69,9 @@ impl CpuCaps {
 
         #[cfg(target_arch = "x86_64")]
         {
+            if self.avx2 && self.fma && self.avxvnni {
+                return "x86_64 (AVX2 + FMA + AVX-VNNI)";
+            }
             if self.avx2 && self.fma {
                 return "x86_64 (AVX2 + FMA)";
             }
@@ -86,6 +91,7 @@ impl fmt::Display for CpuCaps {
         if self.avx2 { flags.push("avx2"); }
         if self.fma { flags.push("fma"); }
         if self.f16c { flags.push("f16c"); }
+        if self.avxvnni { flags.push("avx_vnni"); }
         if self.avx512f { flags.push("avx512f"); }
         if self.neon { flags.push("neon"); }
         if self.dotprod { flags.push("dotprod"); }

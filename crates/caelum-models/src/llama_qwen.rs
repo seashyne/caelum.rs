@@ -150,12 +150,77 @@ impl ScratchBuf {
     }
 }
 
+struct RopeTable {
+    half_dim: usize,
+    style: RopeStyle,
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+}
+
+impl RopeTable {
+    fn new(max_seq_len: usize, rope_dim: usize, theta: f32, style: RopeStyle) -> Self {
+        let half_dim = rope_dim / 2;
+        let mut freqs = Vec::with_capacity(half_dim);
+        for i in 0..half_dim {
+            freqs.push(1.0 / theta.powf((2 * i) as f32 / rope_dim as f32));
+        }
+        let mut cos = vec![0.0f32; max_seq_len * half_dim];
+        let mut sin = vec![0.0f32; max_seq_len * half_dim];
+        for pos in 0..max_seq_len {
+            let p = pos as f32;
+            let row = pos * half_dim;
+            for i in 0..half_dim {
+                let (s, c) = (p * freqs[i]).sin_cos();
+                cos[row + i] = c;
+                sin[row + i] = s;
+            }
+        }
+        Self {
+            half_dim,
+            style,
+            cos,
+            sin,
+        }
+    }
+
+    #[inline]
+    fn apply(&self, vec: &mut [f32], pos: usize) {
+        let half = self.half_dim;
+        let row = pos * half;
+        let cs = &self.cos[row..row + half];
+        let sn = &self.sin[row..row + half];
+        match self.style {
+            RopeStyle::Normal => {
+                for i in 0..half {
+                    let c = cs[i];
+                    let s = sn[i];
+                    let x0 = vec[2 * i];
+                    let x1 = vec[2 * i + 1];
+                    vec[2 * i] = x0 * c - x1 * s;
+                    vec[2 * i + 1] = x0 * s + x1 * c;
+                }
+            }
+            RopeStyle::NeoX => {
+                for i in 0..half {
+                    let c = cs[i];
+                    let s = sn[i];
+                    let x0 = vec[i];
+                    let x1 = vec[i + half];
+                    vec[i] = x0 * c - x1 * s;
+                    vec[i + half] = x0 * s + x1 * c;
+                }
+            }
+        }
+    }
+}
+
 pub struct LlamaQwenModel<'a> {
     pub config: LlamaQwenConfig,
     token_embd: TensorView<'a>,
     layers: Vec<LayerWeights<'a>>,
     output_norm: Vec<f32>,
     output_weight: TensorView<'a>,
+    rope: RopeTable,
     cache: KvCache,
     scratch: ScratchBuf,
 }
@@ -221,6 +286,12 @@ impl<'a> LlamaQwenModel<'a> {
             config.head_dim,
             kv_precision,
         );
+        let rope = RopeTable::new(
+            config.max_seq_len,
+            config.rope_dim,
+            config.rope_theta,
+            config.rope_style,
+        );
         let scratch = ScratchBuf::new(&config);
 
         Ok(Self {
@@ -229,6 +300,7 @@ impl<'a> LlamaQwenModel<'a> {
             layers,
             output_norm,
             output_weight,
+            rope,
             cache,
             scratch,
         })
@@ -326,34 +398,62 @@ impl<'a> LlamaQwenModel<'a> {
                 }
             }
 
-            // Apply RoPE at exact sequence position `pos`
+            // Apply precomputed RoPE at exact sequence position `pos` (zero powf/sin_cos overhead!)
             for h in 0..cfg.num_heads {
-                let qh = &mut self.scratch.q[h * head_dim..(h + 1) * head_dim];
-                backend.apply_rope(qh, pos, cfg.rope_dim, cfg.rope_theta, cfg.rope_style);
+                self.rope
+                    .apply(&mut self.scratch.q[h * head_dim..(h + 1) * head_dim], pos);
             }
             for kh in 0..cfg.num_kv_heads {
-                let kh_slice = &mut self.scratch.k[kh * head_dim..(kh + 1) * head_dim];
-                backend.apply_rope(kh_slice, pos, cfg.rope_dim, cfg.rope_theta, cfg.rope_style);
+                self.rope
+                    .apply(&mut self.scratch.k[kh * head_dim..(kh + 1) * head_dim], pos);
             }
 
             // Store K, V into cache slot `pos` (F32 or Q8_0)
             self.cache.store(l, pos, &self.scratch.k, &self.scratch.v);
 
-            // Grouped Query Attention over `0..=pos`
-            for h in 0..cfg.num_heads {
-                let qh = &self.scratch.q[h * head_dim..(h + 1) * head_dim];
-                let kv_h = h / kv_mul;
-                let out_h = &mut self.scratch.xb2[h * head_dim..(h + 1) * head_dim];
-                self.cache.attend_head(
-                    backend,
-                    l,
-                    kv_h,
-                    qh,
-                    pos,
-                    inv_sqrt_hd,
-                    &mut self.scratch.att,
-                    out_h,
-                );
+            // Grouped Query Attention over `0..=pos` (parallelized across heads on longer contexts)
+            if pos >= 128 && backend.num_threads() > 1 {
+                let q_ref: &[f32] = &self.scratch.q;
+                let cache_ref = &self.cache;
+                let xb2_addr = self.scratch.xb2.as_mut_ptr() as usize;
+                let seq_len = pos + 1;
+                backend.parallel_for(cfg.num_heads, &|h_start, h_end| {
+                    let mut local_att = vec![0.0f32; seq_len];
+                    let xb2_ptr = xb2_addr as *mut f32;
+                    for h in h_start..h_end {
+                        let qh = &q_ref[h * head_dim..(h + 1) * head_dim];
+                        let kv_h = h / kv_mul;
+                        let out_h = unsafe {
+                            std::slice::from_raw_parts_mut(xb2_ptr.add(h * head_dim), head_dim)
+                        };
+                        cache_ref.attend_head(
+                            backend,
+                            l,
+                            kv_h,
+                            qh,
+                            pos,
+                            inv_sqrt_hd,
+                            &mut local_att,
+                            out_h,
+                        );
+                    }
+                });
+            } else {
+                for h in 0..cfg.num_heads {
+                    let qh = &self.scratch.q[h * head_dim..(h + 1) * head_dim];
+                    let kv_h = h / kv_mul;
+                    let out_h = &mut self.scratch.xb2[h * head_dim..(h + 1) * head_dim];
+                    self.cache.attend_head(
+                        backend,
+                        l,
+                        kv_h,
+                        qh,
+                        pos,
+                        inv_sqrt_hd,
+                        &mut self.scratch.att,
+                        out_h,
+                    );
+                }
             }
 
             // Output projection + Residual
@@ -558,43 +658,50 @@ impl<'a> LlamaQwenModel<'a> {
                     }
 
                     for head in 0..cfg.num_heads {
-                        backend.apply_rope(
-                            &mut qt[head * head_dim..(head + 1) * head_dim],
-                            pos,
-                            cfg.rope_dim,
-                            cfg.rope_theta,
-                            cfg.rope_style,
-                        );
+                        self.rope
+                            .apply(&mut qt[head * head_dim..(head + 1) * head_dim], pos);
                     }
                     for kh in 0..cfg.num_kv_heads {
-                        backend.apply_rope(
-                            &mut kt[kh * head_dim..(kh + 1) * head_dim],
-                            pos,
-                            cfg.rope_dim,
-                            cfg.rope_theta,
-                            cfg.rope_style,
-                        );
+                        self.rope
+                            .apply(&mut kt[kh * head_dim..(kh + 1) * head_dim], pos);
                     }
 
                     self.cache.store(l, pos, kt, vt);
+                }
 
-                    let out_t = &mut attn_out[t * q_dim..(t + 1) * q_dim];
-                    for head in 0..cfg.num_heads {
-                        let qh = &qt[head * head_dim..(head + 1) * head_dim];
+                // Multi-threaded Causal GQA Attention across all `b * num_heads` query heads
+                let total_jobs = b * cfg.num_heads;
+                let max_t_len = chunk_pos + b;
+                let q_ref: &[f32] = q;
+                let cache_ref = &self.cache;
+                let attn_addr = attn_out.as_mut_ptr() as usize;
+                let num_heads = cfg.num_heads;
+
+                backend.parallel_for(total_jobs, &|j_start, j_end| {
+                    let mut local_att = vec![0.0f32; max_t_len];
+                    let attn_ptr = attn_addr as *mut f32;
+                    for job in j_start..j_end {
+                        let t = job / num_heads;
+                        let head = job % num_heads;
+                        let pos = chunk_pos + t;
+                        let q_off = t * q_dim + head * head_dim;
+                        let qh = &q_ref[q_off..q_off + head_dim];
                         let kv_h = head / kv_mul;
-                        let out_h = &mut out_t[head * head_dim..(head + 1) * head_dim];
-                        self.cache.attend_head(
+                        let out_h = unsafe {
+                            std::slice::from_raw_parts_mut(attn_ptr.add(q_off), head_dim)
+                        };
+                        cache_ref.attend_head(
                             backend,
                             l,
                             kv_h,
                             qh,
                             pos,
                             inv_sqrt_hd,
-                            &mut self.scratch.att,
+                            &mut local_att,
                             out_h,
                         );
                     }
-                }
+                });
 
                 // Batched Output projection + Residual
                 backend.matmul(&layer.wo, attn_out, b, xb)?;

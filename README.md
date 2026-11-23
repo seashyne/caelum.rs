@@ -5,7 +5,7 @@
 
 **Caelum** (*Latin: "The Chisel / The Sky"*) is a **zero-dependency, pure-Rust, ARMv9-first LLM inference engine** built from scratch to power **Celestia** (MLA + DeepSeekMoE), **Astraea** (Qwen2.5 / Llama / Mistral GGUF), and **Lenout Creative Workspace**.
 
-No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a single **~936 KB** native binary.
+No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a single **~942 KB** native binary.
 
 ---
 
@@ -14,11 +14,11 @@ No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a s
 - **Zero External Dependencies:** Pure Rust standard library (`std`) — builds in seconds and compiles cleanly for `x86_64`, **ARMv9 (`aarch64`)**, and **`wasm32`**.
 - **ARMv9-First Hardware Kernels:**
   - `aarch64` **NEON FMA + ARMv9 `dotprod` (`vdotq_s32`) + ARMv9 `i8mm` (`SMMLA` 2×2 tiled matrix multiply)** fused W4A8 (`Q4_0 × Q8_0`, `Q4_K × Q8_K`) and W6A8/W8A8 (`Q6_K × Q8_K`, `Q8_0 × Q8_0`) SIMD kernels.
-  - `x86_64` **AVX2 + FMA** fused-scale vector-accumulator kernels (`~119 GFLOP/s` decode matvec, **`~199 GFLOP/s`** batched prefill GEMM).
+  - `x86_64` **AVX2 + FMA + AVX-VNNI (`vpdpbusd`)** 2-row decode & 8-token batched prefill GEMM kernels (`~130 GFLOP/s` L3 / `226.6 GFLOP/s` DRAM prefill GEMM).
   - Pluggable `Backend` trait designed for drop-in **Arm KleidiAI (`SME2`)** or `wgpu` GPU backends.
-  - Zero-dependency persistent worker thread pool avoiding per-layer thread spawn overhead.
-- **High-Efficiency Memory & Prefill Engine (v0.2.0):**
-  - **Batched Prefill GEMM:** Reads each layer's quantized weight matrix once across multi-token chunks and skips intermediate `lm_head` projections.
+  - **Lock-Free Atomic Spin-Barrier Thread Pool:** Zero mutex locks and zero futex syscalls during active inference (< 0.5 µs barrier latency), automatically parking on `Condvar` at 0% CPU when idle.
+- **High-Efficiency Memory & Prefill Engine (v0.4.0):**
+  - **Batched Prefill GEMM + Precomputed RoPE LUT + Parallel Multi-Head Attention:** Eliminates per-token trigonometry overhead and achieves **~79% of measured physical DRAM bandwidth** during decode (`24.18 tok/s` on `1.06 GB` Qwen2.5-Coder-1.5B).
   - **Quantized `Q8_0` KV Cache (`--kv-q8`):** Cuts GQA KV cache RAM & bandwidth by **3.76×** (e.g., `112 MB` → `29.8 MB` at 2048 context) with SIMD integer attention scoring.
   - **Automatic KV Prefix Caching:** Reuses the longest matching token prefix across multi-turn `caelum chat` and repeated `/v1/celestia/propose` API calls with zero recomputation.
 - **Zero-Copy GGUF v2/v3 Engine:** POSIX `mmap` loader + GGUF v3 writer supporting exact GGML binary block layouts (`F32`, `F16`, `BF16`, `Q8_0`, `Q4_0`, `Q4_1`, `Q4_K`, `Q6_K`).
@@ -93,16 +93,18 @@ cargo build --release
 
 ---
 
-## Verified Benchmarks (v0.3.0, CPU-Only, Intel i5-13400F, 8 Threads)
+## Verified Benchmarks (v0.4.0, CPU-Only, Intel i5-13400F, 32.8 GB/s Measured DRAM)
 
-| Benchmark | v0.1.0 | v0.3.0 |
+| Benchmark | v0.1.0 | v0.4.0 |
 |---|---|---|
-| Release binary size (`caelum`) | 760 KB | **937 KB** (0 external crates) |
+| Release binary size (`caelum`) | 760 KB | **942 KB** (0 external crates) |
 | `Qwen2.5-Coder-1.5B-Instruct-Q4_K_M` (`1.06 GB`) `mmap` load | 32.2 ms | **32.2 ms** |
-| `2048×2048` `Q4_K` matvec (`B=1`, decode) | 80.98 GFLOP/s | **118.82 GFLOP/s** (`0.07 ms/op`) |
-| `2048×2048` `Q4_K` batched GEMM (`B=16`, prefill) | — | **198.52 GFLOP/s** (`0.68 ms/op`) |
+| `4096×4096` (DRAM) `Q4_K` matvec (`B=1`, decode) | — | **90.27 GFLOP/s** (**5.50× faster than F32**) |
+| `4096×4096` (DRAM) `Q6_K` matvec (`B=1`, decode) | — | **33.33 GB/s** (**100% DRAM saturation**) |
+| `4096×4096` (DRAM) `Q4_K` batched GEMM (`B=16`, prefill) | — | **226.56 GFLOP/s** (**2.51× vs B=1**) |
 | `Qwen2.5-Coder-1.5B` KV Cache RAM (2048 ctx) | 112.0 MB (`F32`) | **29.8 MB** (`--kv-q8`, **3.76× smaller**) |
-| `Qwen2.5-Coder-1.5B` Prefill speed (`341 tok`) | 21.76 tok/s | **53.5–60.4 tok/s** (**~2.7× faster**) |
+| `Qwen2.5-Coder-1.5B` Prefill speed (`--kv-q8`) | 21.76 tok/s | **66.35 tok/s** (**3.05× faster**) |
+| `Qwen2.5-Coder-1.5B` Decode speed (`--kv-q8`, 6 P-cores) | 20.15 tok/s | **24.18 tok/s** (**~79% of physical DRAM limit**) |
 | `Qwen2.5-Coder-1.5B` Strict `SchemaGrammar` Decode (151k vocab) | 13.47 tok/s *(JSON only)* | **15.34 tok/s** (**100% Zod-valid 5/5 modes**) |
 | Repeated `/v1/celestia/propose` Prefix Cache Hit | 0 tok | **311 tok cached** (`<0.4s` TTFT) |
 
