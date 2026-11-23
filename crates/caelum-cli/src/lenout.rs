@@ -11,9 +11,9 @@ pub fn build_lenout_system_prompt(mode: &str, request_id: &str, fingerprint: &st
 2. {"type":"layout.apply","nodeIds":["id_1","id_2"],"direction":"horizontal"|"vertical"|"grid","gap":24,"align":"center"}"##
         }
         "flow" => {
-            r##"Allowed action objects in "actions":
+            r##"Allowed action objects in "actions" (every field shown below is REQUIRED, including numeric offsetX and offsetY):
 1. {"type":"flow.createNode","ref":"n1","nodeType":"start"|"process"|"decision"|"end","label":"...","offsetX":100,"offsetY":100}
-2. {"type":"flow.connect","sourceId":"n1","targetId":"n2","style":"orthogonal","arrow":"end"}"##
+2. {"type":"flow.connect","sourceId":"n1","targetId":"n2","style":"orthogonal"|"straight"|"curved","arrow":"end"|"both"|"none"}"##
         }
         "draw" => {
             r##"Allowed action objects in "actions":

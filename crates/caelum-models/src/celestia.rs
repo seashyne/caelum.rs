@@ -301,6 +301,7 @@ impl<'a> CelestiaModel<'a> {
         backend: &dyn Backend,
         token_id: u32,
         pos: usize,
+        compute_logits: bool,
     ) -> Result<&[f32]> {
         let cfg = &self.config;
         let head_dim = cfg.head_dim;
@@ -437,14 +438,16 @@ impl<'a> CelestiaModel<'a> {
             }
         }
 
-        // 3. Final RMSNorm & LM Head
-        backend.rms_norm(
-            &self.scratch.x,
-            &self.output_norm,
-            cfg.rms_norm_eps,
-            &mut self.scratch.xb,
-        );
-        backend.matvec(&self.output_weight, &self.scratch.xb, &mut self.scratch.logits)?;
+        // 3. Final RMSNorm & LM Head (skipped on intermediate prefill tokens)
+        if compute_logits {
+            backend.rms_norm(
+                &self.scratch.x,
+                &self.output_norm,
+                cfg.rms_norm_eps,
+                &mut self.scratch.xb,
+            );
+            backend.matvec(&self.output_weight, &self.scratch.xb, &mut self.scratch.logits)?;
+        }
 
         Ok(&self.scratch.logits)
     }

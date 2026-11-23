@@ -56,6 +56,41 @@ pub trait Backend: Send + Sync {
         out: &mut [f32],
     ) -> Result<()>;
 
+    /// Batched Prefill GEMM: computes `out_batch[t, r] = dot(W[r], x_batch[t])` for `batch` tokens.
+    ///
+    /// Both `x_batch` (`[batch, cols]`) and `out_batch` (`[batch, rows]`) are token-major contiguous.
+    /// Loads each weight row ONCE from DRAM and reuses it across all `batch` tokens.
+    fn matmul(
+        &self,
+        w: &TensorView<'_>,
+        x_batch: &[f32],
+        batch: usize,
+        out_batch: &mut [f32],
+    ) -> Result<()>;
+
+    /// Batched Prefill GEMM reusing pre-quantized `Q8_K` token activations (`[batch * (cols/256)]`).
+    fn matmul_q8k_act(
+        &self,
+        w: &TensorView<'_>,
+        x_batch_f32: &[f32],
+        x_batch_q8k: &[BlockQ8_K],
+        batch: usize,
+        out_batch: &mut [f32],
+    ) -> Result<()>;
+
+    /// Batched Prefill GEMM reusing pre-quantized `Q8_0` token activations (`[batch * (cols/32)]`).
+    fn matmul_q8_act(
+        &self,
+        w: &TensorView<'_>,
+        x_batch_f32: &[f32],
+        x_batch_q8: &[BlockQ8_0],
+        batch: usize,
+        out_batch: &mut [f32],
+    ) -> Result<()>;
+
+    /// Dot product of two `Q8_0` block slices (used for quantized KV-cache attention).
+    fn dot_q8_0(&self, a: &[BlockQ8_0], b: &[BlockQ8_0]) -> f32;
+
     /// RMSNorm: `out[i] = x[i] * rsqrt(mean(x^2) + eps) * weight[i]`.
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]);
 
@@ -308,6 +343,284 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn matmul(
+        &self,
+        w: &TensorView<'_>,
+        x_batch: &[f32],
+        batch: usize,
+        out_batch: &mut [f32],
+    ) -> Result<()> {
+        if batch == 1 {
+            return self.matvec(w, x_batch, out_batch);
+        }
+        let (rows, cols) = w.dims_2d()?;
+        if x_batch.len() != batch * cols || out_batch.len() != batch * rows {
+            return Err(CaelumError::ShapeMismatch {
+                expected: format!("W=[{rows},{cols}], x=[{batch},{cols}], out=[{batch},{rows}]"),
+                actual: format!("x.len={}, out.len={}", x_batch.len(), out_batch.len()),
+            });
+        }
+
+        if matches!(w.dtype, DType::Q4_K | DType::Q6_K) && cols % QK_K == 0 {
+            let nb = cols / QK_K;
+            let mut x_q8k = vec![BlockQ8_K::default(); batch * nb];
+            for t in 0..batch {
+                quantize_row_q8_k(
+                    &x_batch[t * cols..(t + 1) * cols],
+                    &mut x_q8k[t * nb..(t + 1) * nb],
+                );
+            }
+            return self.matmul_q8k_act(w, x_batch, &x_q8k, batch, out_batch);
+        }
+
+        if matches!(w.dtype, DType::Q4_0 | DType::Q8_0) && cols % QK8_0 == 0 {
+            let nb = cols / QK8_0;
+            let mut x_q8 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; batch * nb];
+            for t in 0..batch {
+                quantize_row_q8_0(
+                    &x_batch[t * cols..(t + 1) * cols],
+                    &mut x_q8[t * nb..(t + 1) * nb],
+                );
+            }
+            return self.matmul_q8_act(w, x_batch, &x_q8, batch, out_batch);
+        }
+
+        let row_stride = (cols / w.dtype.block_size()) * w.dtype.type_size();
+        let data = w.data;
+        let dtype = w.dtype;
+        let out_addr = out_batch.as_mut_ptr() as usize;
+
+        let compute_rows = |r_start: usize, r_end: usize| {
+            let out_ptr = out_addr as *mut f32;
+            for r in r_start..r_end {
+                let row = &data[r * row_stride..(r + 1) * row_stride];
+                for t in 0..batch {
+                    let xt = &x_batch[t * cols..(t + 1) * cols];
+                    let val = self.row_dot_f32(row, xt, dtype);
+                    unsafe {
+                        *out_ptr.add(t * rows + r) = val;
+                    }
+                }
+            }
+        };
+
+        if rows >= 64 && self.pool.num_threads() > 1 {
+            self.pool.parallel_for_range(rows, compute_rows);
+        } else {
+            compute_rows(0, rows);
+        }
+        Ok(())
+    }
+
+    fn matmul_q8k_act(
+        &self,
+        w: &TensorView<'_>,
+        x_batch_f32: &[f32],
+        x_batch_q8k: &[BlockQ8_K],
+        batch: usize,
+        out_batch: &mut [f32],
+    ) -> Result<()> {
+        if batch == 1 {
+            return self.matvec_q8k_act(w, x_batch_f32, x_batch_q8k, out_batch);
+        }
+        let (rows, cols) = w.dims_2d()?;
+        let nb = cols / QK_K;
+        if x_batch_f32.len() != batch * cols
+            || x_batch_q8k.len() != batch * nb
+            || out_batch.len() != batch * rows
+        {
+            return Err(CaelumError::ShapeMismatch {
+                expected: format!("W=[{rows},{cols}], batch={batch}"),
+                actual: format!(
+                    "x_f32={}, x_q8k={}, out={}",
+                    x_batch_f32.len(),
+                    x_batch_q8k.len(),
+                    out_batch.len()
+                ),
+            });
+        }
+
+        let row_stride = (cols / w.dtype.block_size()) * w.dtype.type_size();
+        let data = w.data;
+        let dtype = w.dtype;
+        let out_addr = out_batch.as_mut_ptr() as usize;
+
+        let compute_rows = |r_start: usize, r_end: usize| {
+            let out_ptr = out_addr as *mut f32;
+            let mut r = r_start;
+
+            // ARMv9 I8MM (SMMLA) 2-row x 2-token hardware matrix tile fast path for Q4_K
+            #[cfg(target_arch = "aarch64")]
+            if dtype == DType::Q4_K && self.caps.i8mm {
+                while r + 2 <= r_end {
+                    let row0 = &data[r * row_stride..(r + 1) * row_stride];
+                    let row1 = &data[(r + 1) * row_stride..(r + 2) * row_stride];
+                    let mut t = 0usize;
+                    while t + 2 <= batch {
+                        let x0 = &x_batch_q8k[t * nb..(t + 1) * nb];
+                        let x1 = &x_batch_q8k[(t + 1) * nb..(t + 2) * nb];
+                        let tile = unsafe { armv9::dot_q4_k_q8_k_2x2_i8mm(row0, row1, x0, x1) };
+                        unsafe {
+                            *out_ptr.add(t * rows + r) = tile[0][0];
+                            *out_ptr.add((t + 1) * rows + r) = tile[0][1];
+                            *out_ptr.add(t * rows + (r + 1)) = tile[1][0];
+                            *out_ptr.add((t + 1) * rows + (r + 1)) = tile[1][1];
+                        }
+                        t += 2;
+                    }
+                    if t < batch {
+                        let xt_f = &x_batch_f32[t * cols..(t + 1) * cols];
+                        let xt_q = &x_batch_q8k[t * nb..(t + 1) * nb];
+                        unsafe {
+                            *out_ptr.add(t * rows + r) = self.row_dot_q8k(row0, xt_f, xt_q, dtype);
+                            *out_ptr.add(t * rows + (r + 1)) =
+                                self.row_dot_q8k(row1, xt_f, xt_q, dtype);
+                        }
+                    }
+                    r += 2;
+                }
+            }
+
+            while r < r_end {
+                let row = &data[r * row_stride..(r + 1) * row_stride];
+                let mut t = 0usize;
+
+                // 4-token-at-once weight-reuse micro-kernels (AVX2 / ARMv9 DotProd)
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                while t + 4 <= batch {
+                    let x0 = &x_batch_q8k[t * nb..(t + 1) * nb];
+                    let x1 = &x_batch_q8k[(t + 1) * nb..(t + 2) * nb];
+                    let x2 = &x_batch_q8k[(t + 2) * nb..(t + 3) * nb];
+                    let x3 = &x_batch_q8k[(t + 3) * nb..(t + 4) * nb];
+
+                    let vals: Option<[f32; 4]> = match dtype {
+                        DType::Q4_K => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                if self.caps.avx2 {
+                                    Some(unsafe { x86::dot_q4_k_q8_k_batch4_avx2(row, x0, x1, x2, x3) })
+                                } else {
+                                    None
+                                }
+                            }
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                if self.caps.dotprod {
+                                    Some(unsafe {
+                                        armv9::dot_q4_k_q8_k_batch4_dotprod(row, x0, x1, x2, x3)
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                        DType::Q6_K => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                if self.caps.avx2 {
+                                    Some(unsafe { x86::dot_q6_k_q8_k_batch4_avx2(row, x0, x1, x2, x3) })
+                                } else {
+                                    None
+                                }
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(v) = vals {
+                        unsafe {
+                            *out_ptr.add(t * rows + r) = v[0];
+                            *out_ptr.add((t + 1) * rows + r) = v[1];
+                            *out_ptr.add((t + 2) * rows + r) = v[2];
+                            *out_ptr.add((t + 3) * rows + r) = v[3];
+                        }
+                        t += 4;
+                    } else {
+                        break;
+                    }
+                }
+
+                while t < batch {
+                    let xt_f = &x_batch_f32[t * cols..(t + 1) * cols];
+                    let xt_q = &x_batch_q8k[t * nb..(t + 1) * nb];
+                    let val = self.row_dot_q8k(row, xt_f, xt_q, dtype);
+                    unsafe {
+                        *out_ptr.add(t * rows + r) = val;
+                    }
+                    t += 1;
+                }
+                r += 1;
+            }
+        };
+
+        if rows >= 64 && self.pool.num_threads() > 1 {
+            self.pool.parallel_for_range(rows, compute_rows);
+        } else {
+            compute_rows(0, rows);
+        }
+        Ok(())
+    }
+
+    fn matmul_q8_act(
+        &self,
+        w: &TensorView<'_>,
+        x_batch_f32: &[f32],
+        x_batch_q8: &[BlockQ8_0],
+        batch: usize,
+        out_batch: &mut [f32],
+    ) -> Result<()> {
+        if batch == 1 {
+            return self.matvec_q8_act(w, x_batch_f32, x_batch_q8, out_batch);
+        }
+        let (rows, cols) = w.dims_2d()?;
+        let nb = cols / QK8_0;
+        let row_stride = (cols / w.dtype.block_size()) * w.dtype.type_size();
+        let data = w.data;
+        let dtype = w.dtype;
+        let out_addr = out_batch.as_mut_ptr() as usize;
+
+        let compute_rows = |r_start: usize, r_end: usize| {
+            let out_ptr = out_addr as *mut f32;
+            for r in r_start..r_end {
+                let row = &data[r * row_stride..(r + 1) * row_stride];
+                for t in 0..batch {
+                    let xt_f = &x_batch_f32[t * cols..(t + 1) * cols];
+                    let xt_q = &x_batch_q8[t * nb..(t + 1) * nb];
+                    let val = self.row_dot_q8(row, xt_f, xt_q, dtype);
+                    unsafe {
+                        *out_ptr.add(t * rows + r) = val;
+                    }
+                }
+            }
+        };
+
+        if rows >= 64 && self.pool.num_threads() > 1 {
+            self.pool.parallel_for_range(rows, compute_rows);
+        } else {
+            compute_rows(0, rows);
+        }
+        Ok(())
+    }
+
+    fn dot_q8_0(&self, a: &[BlockQ8_0], b: &[BlockQ8_0]) -> f32 {
+        let raw_a = unsafe {
+            std::slice::from_raw_parts(a.as_ptr() as *const u8, a.len() * std::mem::size_of::<BlockQ8_0>())
+        };
+        #[cfg(target_arch = "aarch64")]
+        if self.caps.dotprod {
+            return unsafe { armv9::dot_q8_0_q8_0_dotprod(raw_a, b) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.caps.avx2 {
+            return unsafe { x86::dot_q8_0_q8_0_avx2(raw_a, b) };
+        }
+        scalar::dot_q8_0_q8_0(raw_a, b)
+    }
+
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
         scalar::rms_norm(x, weight, eps, out);
     }
@@ -458,6 +771,37 @@ mod tests {
                 "Q6_K SIMD mismatch at row {r}: simd={}, scalar={expected}",
                 out_q6k[r]
             );
+        }
+
+        // Batched Prefill GEMM check (batch=7 covers 4-token AVX2/ARMv9 path + tail)
+        let batch = 7usize;
+        let x_batch: Vec<f32> = (0..batch * cols)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.03)
+            .collect();
+        let mut out_batch_q4k = vec![0.0f32; batch * rows];
+        backend
+            .matmul(&buf_q4k.as_view(), &x_batch, batch, &mut out_batch_q4k)
+            .unwrap();
+        let mut out_batch_q6k = vec![0.0f32; batch * rows];
+        backend
+            .matmul(&buf_q6k.as_view(), &x_batch, batch, &mut out_batch_q6k)
+            .unwrap();
+        for t in 0..batch {
+            let xt = &x_batch[t * cols..(t + 1) * cols];
+            let mut ref4 = vec![0.0f32; rows];
+            let mut ref6 = vec![0.0f32; rows];
+            backend.matvec(&buf_q4k.as_view(), xt, &mut ref4).unwrap();
+            backend.matvec(&buf_q6k.as_view(), xt, &mut ref6).unwrap();
+            for r in 0..rows {
+                assert!(
+                    (out_batch_q4k[t * rows + r] - ref4[r]).abs() < 1e-3,
+                    "Q4_K matmul mismatch at t={t}, r={r}"
+                );
+                assert!(
+                    (out_batch_q6k[t * rows + r] - ref6[r]).abs() < 1e-3,
+                    "Q6_K matmul mismatch at t={t}, r={r}"
+                );
+            }
         }
     }
 }

@@ -133,51 +133,38 @@ impl ThreadPool {
         self.num_threads
     }
 
-    /// Splits `out` into disjoint row slices and executes `f(row_start, chunk)` across all threads.
-    pub fn parallel_for_rows<F>(&self, out: &mut [f32], f: F)
+    /// Splits `0..total` into disjoint index ranges and executes `f(start, end)` across all threads.
+    pub fn parallel_for_range<F>(&self, total: usize, f: F)
     where
-        F: Fn(usize, &mut [f32]) + Sync,
+        F: Fn(usize, usize) + Sync,
     {
-        let total = out.len();
         if total == 0 {
             return;
         }
 
         #[cfg(target_arch = "wasm32")]
         {
-            f(0, out);
+            f(0, total);
             return;
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
             let Some(state) = &self.state else {
-                f(0, out);
+                f(0, total);
                 return;
             };
 
             let _serial = self.dispatch_lock.lock().unwrap();
 
-            struct Context<'a, F> {
-                base_ptr: *mut f32,
-                f: &'a F,
-            }
-            unsafe impl<F: Sync> Sync for Context<'_, F> {}
-
-            unsafe fn trampoline<F: Fn(usize, &mut [f32]) + Sync>(
-                ctx_ptr: *const (),
+            unsafe fn trampoline<F: Fn(usize, usize) + Sync>(
+                fn_ptr: *const (),
                 start: usize,
                 end: usize,
             ) {
-                let ctx = &*(ctx_ptr as *const Context<'_, F>);
-                let slice = std::slice::from_raw_parts_mut(ctx.base_ptr.add(start), end - start);
-                (ctx.f)(start, slice);
+                let func = &*(fn_ptr as *const F);
+                func(start, end);
             }
-
-            let ctx = Context {
-                base_ptr: out.as_mut_ptr(),
-                f: &f,
-            };
 
             let num_workers = self.num_threads - 1;
             state.remaining.store(num_workers, Ordering::Release);
@@ -185,7 +172,7 @@ impl ThreadPool {
             {
                 let mut guard = state.mutex.lock().unwrap();
                 guard.job = Some(Job {
-                    func: (&ctx as *const Context<'_, F>) as *const (),
+                    func: (&f as *const F) as *const (),
                     call: trampoline::<F>,
                     total_items: total,
                 });
@@ -193,13 +180,11 @@ impl ThreadPool {
                 state.wake_workers.notify_all();
             }
 
-            // Main thread executes shard 0 directly
             let (start0, end0) = partition_range(total, self.num_threads, 0);
             if start0 < end0 {
-                unsafe { trampoline::<F>((&ctx as *const Context<'_, F>) as *const (), start0, end0) };
+                f(start0, end0);
             }
 
-            // Wait for workers to finish before returning (preserving `&mut [f32]` lifetime soundness)
             if state.remaining.load(Ordering::Acquire) > 0 {
                 let mut guard = state.mutex.lock().unwrap();
                 while state.remaining.load(Ordering::Acquire) > 0 {
@@ -211,6 +196,23 @@ impl ThreadPool {
                 guard.job = None;
             }
         }
+    }
+
+    /// Splits `out` into disjoint row slices and executes `f(row_start, chunk)` across all threads.
+    pub fn parallel_for_rows<F>(&self, out: &mut [f32], f: F)
+    where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        let total = out.len();
+        if total == 0 {
+            return;
+        }
+        let base_addr = out.as_mut_ptr() as usize;
+        self.parallel_for_range(total, |start, end| {
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut((base_addr as *mut f32).add(start), end - start) };
+            f(start, slice);
+        });
     }
 }
 

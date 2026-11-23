@@ -9,27 +9,28 @@ use caelum_core::{
 use caelum_gguf::GgufFile;
 use caelum_kernels::{Backend, CpuBackend, CpuCaps};
 use caelum_models::{
-    write_synthetic_celestia_gguf, CaelumModel, CelestiaConfig, SamplerConfig,
+    write_synthetic_celestia_gguf, CaelumModel, CelestiaConfig, KvPrecision, SamplerConfig,
 };
 use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, Tokenizer};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
 fn print_usage() {
     println!(
-        r#"Caelum v0.1.0 — Pure Rust ARMv9-first LLM Inference Engine (Celestia / Astraea / Lenout)
+        r#"Caelum v{} — Zero-Dependency Pure Rust ARMv9-first LLM Inference Engine
 
 USAGE:
   caelum info
   caelum inspect <model.gguf>
   caelum run <model.gguf> -p "<prompt>" [OPTIONS]
-  caelum propose <model.gguf> --mode <mode> -p "<prompt>" [--threads N] [--max-tokens 512]
-  caelum serve <model.gguf> [--host 0.0.0.0] [--port 8000] [--threads N] [--ctx 2048]
+  caelum chat <model.gguf> [--system "..."] [--kv-q8] [--ctx 4096] [--threads N]
+  caelum propose <model.gguf> --mode <mode> -p "<prompt>" [--kv-q8] [--threads N] [--max-tokens 512]
+  caelum serve <model.gguf> [--host 127.0.0.1] [--port 8000] [--kv-q8] [--threads N] [--ctx 2048]
   caelum bench [--dim 2048] [--iters 200] [--threads N]
   caelum demo-celestia [--save <path.gguf>] [--threads N]
 
-RUN OPTIONS:
+OPTIONS:
   -p, --prompt <TEXT>     User prompt text
   --system <TEXT>         Optional system prompt
   --max-tokens <N>        Maximum tokens to generate (default: 256)
@@ -37,10 +38,12 @@ RUN OPTIONS:
   --top-k <N>             Top-K sampling cutoff (default: 40)
   --top-p <FLOAT>         Top-P nucleus sampling cutoff (default: 0.9)
   --ctx <N>               Max KV context length (default: model min 4096)
+  --kv-q8                 Use 8-bit Q8_0 quantized KV cache (3.76× less RAM)
   --threads <N>           Worker thread count (default: auto P-core heuristic)
   --json                  Enable strict JSON Grammar Constrained Decoding
   --raw                   Disable chat template wrapping
-"#
+"#,
+        env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -67,6 +70,7 @@ fn run_cli() -> Result<()> {
             cmd_inspect(path)
         }
         "run" => cmd_run(&args[2..]),
+        "chat" => cmd_chat(&args[2..]),
         "propose" => cmd_propose(&args[2..]),
         "serve" => cmd_serve(&args[2..]),
         "bench" => cmd_bench(&args[2..]),
@@ -94,7 +98,7 @@ fn cmd_info() -> Result<()> {
     println!("  Default Pool:  {} threads", backend.num_threads());
     println!("  Quantization:  F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q4_K, Q6_K");
     println!("  Architectures: llama, qwen2/qwen2.5, mistral, celestia (MLA + DeepSeekMoE)");
-    println!("  ARMv9 Ready:   NEON FMA + DotProd SDOT (W4A8/W8A8) + Compressed MLA Cache");
+    println!("  ARMv9 Ready:   NEON FMA + DotProd SDOT + I8MM SMMLA (2x2 GEMM) + Q8_0/MLA KV Cache");
     println!("============================================================");
     Ok(())
 }
@@ -159,6 +163,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let mut top_p = 0.9f32;
     let mut max_ctx: Option<usize> = None;
     let mut threads: Option<usize> = None;
+    let mut kv_precision = KvPrecision::F32;
     let mut constrain_json = false;
     let mut raw_mode = false;
 
@@ -203,6 +208,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
                 i += 1;
                 max_ctx = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--kv-q8" => kv_precision = KvPrecision::Q8_0,
             "--threads" => {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
@@ -224,16 +230,17 @@ fn cmd_run(args: &[String]) -> Result<()> {
     } else {
         Tokenizer::from_gguf(&gguf)?
     };
-    let mut model = CaelumModel::from_gguf(&gguf, max_ctx)?;
+    let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!(
-        "[Caelum] Loaded {} ({:.1}M params) in {:.1}ms | {} | {} threads | KV Cache {:.1} MB",
+        "[Caelum] Loaded {} ({:.1}M params) in {:.1}ms | {} | {} threads | KV {} ({:.1} MB)",
         arch,
         gguf.total_parameters() as f64 / 1e6,
         load_ms,
         backend.name(),
         backend.num_threads(),
+        model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0),
     );
 
@@ -278,12 +285,150 @@ fn cmd_run(args: &[String]) -> Result<()> {
 
     println!();
     eprintln!(
-        "\n[Caelum Stats] Prefill: {} tok ({:.2} tok/s) | Decode: {} tok ({:.2} tok/s)",
+        "\n[Caelum Stats] Prefill: {} tok (cached={}, {:.2} tok/s) | Decode: {} tok ({:.2} tok/s)",
         stats.prompt_tokens,
+        stats.cached_prompt_tokens,
         stats.prefill_tps(),
         stats.generated_tokens,
         stats.decode_tps()
     );
+    Ok(())
+}
+
+fn cmd_chat(args: &[String]) -> Result<()> {
+    let Some(model_path) = args.first() else {
+        return Err(caelum_core::CaelumError::Runtime(
+            "usage: caelum chat <model.gguf> [--system \"...\"] [--kv-q8]".into(),
+        ));
+    };
+
+    let mut system: Option<String> = None;
+    let mut max_tokens = 512usize;
+    let mut temp = 0.6f32;
+    let mut max_ctx: Option<usize> = Some(4096);
+    let mut threads: Option<usize> = None;
+    let mut kv_precision = KvPrecision::Q8_0; // Default Q8_0 for interactive long-context chat
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--system" => {
+                i += 1;
+                system = args.get(i).cloned();
+            }
+            "--max-tokens" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    max_tokens = v.parse().unwrap_or(512);
+                }
+            }
+            "--temp" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    temp = v.parse().unwrap_or(0.6);
+                }
+            }
+            "--ctx" => {
+                i += 1;
+                max_ctx = args.get(i).and_then(|v| v.parse().ok());
+            }
+            "--kv-f32" => kv_precision = KvPrecision::F32,
+            "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--threads" => {
+                i += 1;
+                threads = args.get(i).and_then(|v| v.parse().ok());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let backend = CpuBackend::new(threads);
+    let gguf = GgufFile::open(model_path)?;
+    let arch = gguf.architecture().unwrap_or("llama").to_string();
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
+    let template = ChatTemplate::from_architecture(&arch);
+
+    println!("============================================================");
+    println!("  CAELUM INTERACTIVE CHAT (Prefix Caching ON)");
+    println!(
+        "  Model: {arch} ({:.1}M) | {} | KV: {} ({:.1} MB)",
+        gguf.total_parameters() as f64 / 1e6,
+        backend.name(),
+        model.kv_mode_label(),
+        model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
+    );
+    println!("  Commands: /reset (clear history), /quit (exit)");
+    println!("============================================================");
+
+    let mut messages = Vec::new();
+    if let Some(sys) = system {
+        messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: sys,
+        });
+    }
+
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+    loop {
+        print!("\nYou> ");
+        let _ = io::stdout().flush();
+        let Some(Ok(line)) = lines.next() else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "/quit" || trimmed == "/exit" {
+            break;
+        }
+        if trimmed == "/reset" {
+            messages.retain(|m| m.role == ChatRole::System);
+            model.reset_cache();
+            println!("[Caelum] Context cleared.");
+            continue;
+        }
+
+        messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: trimmed.to_string(),
+        });
+        let formatted = template.format(&messages, true);
+        let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
+
+        print!("AI> ");
+        let _ = io::stdout().flush();
+        let (reply, stats) = model.generate(
+            &backend,
+            &tokenizer,
+            &prompt_tokens,
+            max_tokens,
+            &SamplerConfig {
+                temperature: temp,
+                ..Default::default()
+            },
+            false,
+            |_, piece| {
+                print!("{piece}");
+                let _ = io::stdout().flush();
+            },
+        )?;
+        println!(
+            "\n  [prefill: {}/{} cached ({:.1} tok/s) | decode: {} tok ({:.1} tok/s)]",
+            stats.cached_prompt_tokens,
+            stats.prompt_tokens,
+            stats.prefill_tps(),
+            stats.generated_tokens,
+            stats.decode_tps()
+        );
+        messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: reply,
+        });
+    }
     Ok(())
 }
 
@@ -299,6 +444,7 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     let mut max_tokens = 512usize;
     let mut temp = 0.2f32;
     let mut threads: Option<usize> = None;
+    let mut kv_precision = KvPrecision::F32;
 
     let mut i = 1;
     while i < args.len() {
@@ -327,6 +473,7 @@ fn cmd_propose(args: &[String]) -> Result<()> {
                     temp = v.parse().unwrap_or(0.2);
                 }
             }
+            "--kv-q8" => kv_precision = KvPrecision::Q8_0,
             "--threads" => {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
@@ -340,7 +487,7 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     let gguf = GgufFile::open(model_path)?;
     let arch = gguf.architecture().unwrap_or("llama").to_string();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let mut model = CaelumModel::from_gguf(&gguf, Some(2048))?;
+    let mut model = CaelumModel::from_gguf_with_kv(&gguf, Some(2048), kv_precision)?;
     let template = ChatTemplate::from_architecture(&arch);
 
     let sys = lenout::build_lenout_system_prompt(&mode, "req_caelum_cli", "fp_caelum_cli");
@@ -360,9 +507,11 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
 
     eprintln!(
-        "[Caelum Propose] mode={mode} | {} | {} threads | JSON Grammar=ON",
+        "[Caelum Propose] mode={mode} | {} | {} threads | KV {} ({:.1} MB) | JSON Grammar=ON",
         backend.name(),
-        backend.num_threads()
+        backend.num_threads(),
+        model.kv_mode_label(),
+        model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
     );
 
     let (json_out, stats) = model.generate(
@@ -380,8 +529,9 @@ fn cmd_propose(args: &[String]) -> Result<()> {
 
     println!("{json_out}");
     eprintln!(
-        "[Caelum Stats] Prefill: {} tok ({:.2} tok/s) | Decode: {} tok ({:.2} tok/s)",
+        "[Caelum Stats] Prefill: {} tok (cached={}, {:.2} tok/s) | Decode: {} tok ({:.2} tok/s)",
         stats.prompt_tokens,
+        stats.cached_prompt_tokens,
         stats.prefill_tps(),
         stats.generated_tokens,
         stats.decode_tps()
@@ -392,13 +542,14 @@ fn cmd_propose(args: &[String]) -> Result<()> {
 fn cmd_serve(args: &[String]) -> Result<()> {
     let Some(model_path) = args.first() else {
         return Err(caelum_core::CaelumError::Runtime(
-            "usage: caelum serve <model.gguf> [--host 0.0.0.0] [--port 8000]".into(),
+            "usage: caelum serve <model.gguf> [--host 127.0.0.1] [--port 8000] [--kv-q8]".into(),
         ));
     };
     let mut host = String::from("127.0.0.1");
     let mut port = 8000u16;
     let mut threads: Option<usize> = None;
     let mut max_ctx: Option<usize> = None;
+    let mut kv_precision = KvPrecision::F32;
 
     let mut i = 1;
     while i < args.len() {
@@ -423,12 +574,13 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                 i += 1;
                 max_ctx = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--kv-q8" => kv_precision = KvPrecision::Q8_0,
             _ => {}
         }
         i += 1;
     }
 
-    server::run_server(model_path, &host, port, threads, max_ctx)
+    server::run_server(model_path, &host, port, threads, max_ctx, kv_precision)
 }
 
 fn cmd_bench(args: &[String]) -> Result<()> {
@@ -583,6 +735,26 @@ fn cmd_bench(args: &[String]) -> Result<()> {
             bytes_q6k / dt_q6k / 1e9,
             flops / dt_q6k / 1e9,
             dt_f32 / dt_q6k
+        );
+
+        // 5. Batched Prefill GEMM benchmark (batch=16 tokens reusing weight loads)
+        let batch = 16usize;
+        let x_batch: Vec<f32> = (0..batch * dim)
+            .map(|k| ((k % 19) as f32 - 9.0) * 0.02)
+            .collect();
+        let mut out_batch = vec![0.0f32; batch * dim];
+        let b_iters = (iters / 4).max(10);
+        let t5 = Instant::now();
+        for _ in 0..b_iters {
+            backend.matmul(&buf_q4k.as_view(), &x_batch, batch, &mut out_batch)?;
+        }
+        let dt_gemm = t5.elapsed().as_secs_f64();
+        let flops_gemm = (2 * dim * dim * batch) as f64 * b_iters as f64;
+        println!(
+            "  Q4_K GEMM B=16: {:7.2} ms/op | {:6.2} GFLOP/s  ({:.2}x prefill throughput vs B=1)",
+            dt_gemm * 1000.0 / b_iters as f64,
+            flops_gemm / dt_gemm / 1e9,
+            (flops_gemm / dt_gemm) / (flops / dt_q4k)
         );
     }
     println!("============================================================");

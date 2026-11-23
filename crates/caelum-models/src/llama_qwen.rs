@@ -8,7 +8,7 @@
 //! - Tied or untied `output.weight` (`lm_head`)
 //! - Zero-allocation decode hot path with pre-allocated scratch buffers
 
-use crate::cache::KvCache;
+use crate::cache::{KvCache, KvPrecision};
 use caelum_core::{
     quantize_row_q8_0, quantize_row_q8_k, BlockQ8_0, BlockQ8_K, DType, Result, TensorView, QK8_0,
     QK_K,
@@ -162,6 +162,14 @@ pub struct LlamaQwenModel<'a> {
 
 impl<'a> LlamaQwenModel<'a> {
     pub fn from_gguf(gguf: &'a GgufFile, max_seq_override: Option<usize>) -> Result<Self> {
+        Self::from_gguf_with_kv(gguf, max_seq_override, KvPrecision::F32)
+    }
+
+    pub fn from_gguf_with_kv(
+        gguf: &'a GgufFile,
+        max_seq_override: Option<usize>,
+        kv_precision: KvPrecision,
+    ) -> Result<Self> {
         let config = LlamaQwenConfig::from_gguf(gguf, max_seq_override)?;
         let token_embd = gguf.tensor("token_embd.weight")?;
         let output_norm = gguf.tensor("output_norm.weight")?.to_f32_vec()?;
@@ -206,8 +214,13 @@ impl<'a> LlamaQwenModel<'a> {
             });
         }
 
-        let kv_dim = config.num_kv_heads * config.head_dim;
-        let cache = KvCache::new(config.num_layers, config.max_seq_len, kv_dim);
+        let cache = KvCache::new(
+            config.num_layers,
+            config.max_seq_len,
+            config.num_kv_heads,
+            config.head_dim,
+            kv_precision,
+        );
         let scratch = ScratchBuf::new(&config);
 
         Ok(Self {
@@ -229,16 +242,22 @@ impl<'a> LlamaQwenModel<'a> {
         self.cache.memory_bytes()
     }
 
+    pub fn kv_precision(&self) -> KvPrecision {
+        self.cache.precision
+    }
+
     pub fn reset_cache(&mut self) {
         self.cache.clear();
     }
 
-    /// Runs one autoregressive step for `token_id` at sequence position `pos` and returns `&[f32]` logits.
+    /// Runs one autoregressive step for `token_id` at sequence position `pos`.
+    /// When `compute_logits` is `false`, skips the expensive `lm_head` projection.
     pub fn forward_token(
         &mut self,
         backend: &dyn Backend,
         token_id: u32,
         pos: usize,
+        compute_logits: bool,
     ) -> Result<&[f32]> {
         let cfg = &self.config;
         let head_dim = cfg.head_dim;
@@ -317,31 +336,24 @@ impl<'a> LlamaQwenModel<'a> {
                 backend.apply_rope(kh_slice, pos, cfg.rope_dim, cfg.rope_theta, cfg.rope_style);
             }
 
-            // Store K, V into cache slot `pos`
-            self.cache.k_slot_mut(l, pos).copy_from_slice(&self.scratch.k);
-            self.cache.v_slot_mut(l, pos).copy_from_slice(&self.scratch.v);
+            // Store K, V into cache slot `pos` (F32 or Q8_0)
+            self.cache.store(l, pos, &self.scratch.k, &self.scratch.v);
 
             // Grouped Query Attention over `0..=pos`
-            self.scratch.xb2.fill(0.0);
             for h in 0..cfg.num_heads {
                 let qh = &self.scratch.q[h * head_dim..(h + 1) * head_dim];
                 let kv_h = h / kv_mul;
-                let kv_off = kv_h * head_dim;
-
-                for t in 0..=pos {
-                    let kt = &self.cache.k_slot(l, t)[kv_off..kv_off + head_dim];
-                    self.scratch.att[t] = backend.dot_f32(qh, kt) * inv_sqrt_hd;
-                }
-                backend.softmax(&mut self.scratch.att[..=pos]);
-
                 let out_h = &mut self.scratch.xb2[h * head_dim..(h + 1) * head_dim];
-                for t in 0..=pos {
-                    let a = self.scratch.att[t];
-                    let vt = &self.cache.v_slot(l, t)[kv_off..kv_off + head_dim];
-                    for d in 0..head_dim {
-                        out_h[d] += a * vt[d];
-                    }
-                }
+                self.cache.attend_head(
+                    backend,
+                    l,
+                    kv_h,
+                    qh,
+                    pos,
+                    inv_sqrt_hd,
+                    &mut self.scratch.att,
+                    out_h,
+                );
             }
 
             // Output projection + Residual
@@ -394,14 +406,280 @@ impl<'a> LlamaQwenModel<'a> {
             }
         }
 
-        // 3. Final RMSNorm & LM Head
-        backend.rms_norm(
-            &self.scratch.x,
-            &self.output_norm,
-            cfg.rms_norm_eps,
-            &mut self.scratch.xb,
-        );
-        backend.matvec(&self.output_weight, &self.scratch.xb, &mut self.scratch.logits)?;
+        // 3. Final RMSNorm & LM Head (skipped on non-final prefill tokens!)
+        if compute_logits {
+            backend.rms_norm(
+                &self.scratch.x,
+                &self.output_norm,
+                cfg.rms_norm_eps,
+                &mut self.scratch.xb,
+            );
+            backend.matvec(&self.output_weight, &self.scratch.xb, &mut self.scratch.logits)?;
+        }
+
+        Ok(&self.scratch.logits)
+    }
+
+    /// High-throughput Batched Prefill GEMM: processes `tokens` starting at `start_pos` in chunks,
+    /// reading each layer's weight matrices ONCE per chunk and computing `lm_head` ONLY on the last token.
+    pub fn forward_batch(
+        &mut self,
+        backend: &dyn Backend,
+        tokens: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+    ) -> Result<&[f32]> {
+        if tokens.is_empty() {
+            return Ok(&self.scratch.logits);
+        }
+        if tokens.len() == 1 {
+            return self.forward_token(backend, tokens[0], start_pos, compute_last_logits);
+        }
+
+        const PREFILL_CHUNK: usize = 32;
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let ffn = cfg.intermediate_size;
+        let q_dim = cfg.num_heads * cfg.head_dim;
+        let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let head_dim = cfg.head_dim;
+        let kv_mul = cfg.num_heads / cfg.num_kv_heads;
+        let inv_sqrt_hd = 1.0 / (head_dim as f32).sqrt();
+        let can_q8k_h = h % QK_K == 0;
+        let can_q8k_ffn = ffn % QK_K == 0;
+        let can_q8_h = h % QK8_0 == 0;
+        let can_q8_ffn = ffn % QK8_0 == 0;
+
+        // Reusable batch buffers sized for up to `PREFILL_CHUNK` tokens
+        let max_b = tokens.len().min(PREFILL_CHUNK);
+        let mut x_buf = vec![0.0f32; max_b * h];
+        let mut xb_buf = vec![0.0f32; max_b * h];
+        let mut q_buf = vec![0.0f32; max_b * q_dim];
+        let mut k_buf = vec![0.0f32; max_b * kv_dim];
+        let mut v_buf = vec![0.0f32; max_b * kv_dim];
+        let mut attn_out_buf = vec![0.0f32; max_b * q_dim];
+        let mut hb_buf = vec![0.0f32; max_b * ffn];
+        let mut hb2_buf = vec![0.0f32; max_b * ffn];
+        let mut xq8k_buf = vec![BlockQ8_K::default(); max_b * (h / QK_K).max(1)];
+        let mut hbq8k_buf = vec![BlockQ8_K::default(); max_b * (ffn / QK_K).max(1)];
+        let mut xq8_buf = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; max_b * (h / QK8_0).max(1)];
+        let mut hbq8_buf = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; max_b * (ffn / QK8_0).max(1)];
+
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let chunk = &tokens[offset..(offset + PREFILL_CHUNK).min(tokens.len())];
+            let b = chunk.len();
+            let chunk_pos = start_pos + offset;
+            let is_last_chunk = offset + b == tokens.len();
+
+            // 1. Dequantize token embeddings for all `b` tokens in chunk
+            let x = &mut x_buf[..b * h];
+            for (t, &tok) in chunk.iter().enumerate() {
+                self.token_embd
+                    .dequantize_row(tok as usize, &mut x[t * h..(t + 1) * h])?;
+            }
+
+            let xb = &mut xb_buf[..b * h];
+            let q = &mut q_buf[..b * q_dim];
+            let k = &mut k_buf[..b * kv_dim];
+            let v = &mut v_buf[..b * kv_dim];
+            let attn_out = &mut attn_out_buf[..b * q_dim];
+            let hb = &mut hb_buf[..b * ffn];
+            let hb2 = &mut hb2_buf[..b * ffn];
+
+            // 2. Run all Transformer layers in batched GEMM mode
+            for l in 0..cfg.num_layers {
+                let layer = &self.layers[l];
+
+                // Pre-RMSNorm for all `b` tokens
+                for t in 0..b {
+                    backend.rms_norm(
+                        &x[t * h..(t + 1) * h],
+                        &layer.attn_norm,
+                        cfg.rms_norm_eps,
+                        &mut xb[t * h..(t + 1) * h],
+                    );
+                }
+
+                // Batched Q, K, V GEMM (reads weights ONCE for all `b` tokens!)
+                if can_q8k_h
+                    && matches!(layer.wq.dtype, DType::Q4_K | DType::Q6_K)
+                    && matches!(layer.wk.dtype, DType::Q4_K | DType::Q6_K)
+                    && matches!(layer.wv.dtype, DType::Q4_K | DType::Q6_K)
+                {
+                    let nb = h / QK_K;
+                    let xq = &mut xq8k_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_k(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
+                    }
+                    backend.matmul_q8k_act(&layer.wq, xb, xq, b, q)?;
+                    backend.matmul_q8k_act(&layer.wk, xb, xq, b, k)?;
+                    backend.matmul_q8k_act(&layer.wv, xb, xq, b, v)?;
+                } else if can_q8_h
+                    && matches!(layer.wq.dtype, DType::Q4_0 | DType::Q8_0)
+                    && matches!(layer.wk.dtype, DType::Q4_0 | DType::Q8_0)
+                    && matches!(layer.wv.dtype, DType::Q4_0 | DType::Q8_0)
+                {
+                    let nb = h / QK8_0;
+                    let xq = &mut xq8_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_0(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
+                    }
+                    backend.matmul_q8_act(&layer.wq, xb, xq, b, q)?;
+                    backend.matmul_q8_act(&layer.wk, xb, xq, b, k)?;
+                    backend.matmul_q8_act(&layer.wv, xb, xq, b, v)?;
+                } else {
+                    backend.matmul(&layer.wq, xb, b, q)?;
+                    backend.matmul(&layer.wk, xb, b, k)?;
+                    backend.matmul(&layer.wv, xb, b, v)?;
+                }
+
+                // QKV biases, exact RoPE at `chunk_pos + t`, KV store, and causal GQA
+                for t in 0..b {
+                    let pos = chunk_pos + t;
+                    let qt = &mut q[t * q_dim..(t + 1) * q_dim];
+                    let kt = &mut k[t * kv_dim..(t + 1) * kv_dim];
+                    let vt = &mut v[t * kv_dim..(t + 1) * kv_dim];
+
+                    if let Some(bq) = &layer.bq {
+                        for (qv, &bv) in qt.iter_mut().zip(bq.iter()) {
+                            *qv += bv;
+                        }
+                    }
+                    if let Some(bk) = &layer.bk {
+                        for (kv, &bv) in kt.iter_mut().zip(bk.iter()) {
+                            *kv += bv;
+                        }
+                    }
+                    if let Some(bv) = &layer.bv {
+                        for (vv, &bias) in vt.iter_mut().zip(bv.iter()) {
+                            *vv += bias;
+                        }
+                    }
+
+                    for head in 0..cfg.num_heads {
+                        backend.apply_rope(
+                            &mut qt[head * head_dim..(head + 1) * head_dim],
+                            pos,
+                            cfg.rope_dim,
+                            cfg.rope_theta,
+                            cfg.rope_style,
+                        );
+                    }
+                    for kh in 0..cfg.num_kv_heads {
+                        backend.apply_rope(
+                            &mut kt[kh * head_dim..(kh + 1) * head_dim],
+                            pos,
+                            cfg.rope_dim,
+                            cfg.rope_theta,
+                            cfg.rope_style,
+                        );
+                    }
+
+                    self.cache.store(l, pos, kt, vt);
+
+                    let out_t = &mut attn_out[t * q_dim..(t + 1) * q_dim];
+                    for head in 0..cfg.num_heads {
+                        let qh = &qt[head * head_dim..(head + 1) * head_dim];
+                        let kv_h = head / kv_mul;
+                        let out_h = &mut out_t[head * head_dim..(head + 1) * head_dim];
+                        self.cache.attend_head(
+                            backend,
+                            l,
+                            kv_h,
+                            qh,
+                            pos,
+                            inv_sqrt_hd,
+                            &mut self.scratch.att,
+                            out_h,
+                        );
+                    }
+                }
+
+                // Batched Output projection + Residual
+                backend.matmul(&layer.wo, attn_out, b, xb)?;
+                for (xv, &dx) in x.iter_mut().zip(xb.iter()) {
+                    *xv += dx;
+                }
+
+                // Pre-RMSNorm for SwiGLU FFN
+                for t in 0..b {
+                    backend.rms_norm(
+                        &x[t * h..(t + 1) * h],
+                        &layer.ffn_norm,
+                        cfg.rms_norm_eps,
+                        &mut xb[t * h..(t + 1) * h],
+                    );
+                }
+
+                // Batched Gate + Up GEMM
+                if can_q8k_h
+                    && matches!(layer.w_gate.dtype, DType::Q4_K | DType::Q6_K)
+                    && matches!(layer.w_up.dtype, DType::Q4_K | DType::Q6_K)
+                {
+                    let nb = h / QK_K;
+                    let xq = &mut xq8k_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_k(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
+                    }
+                    backend.matmul_q8k_act(&layer.w_gate, xb, xq, b, hb)?;
+                    backend.matmul_q8k_act(&layer.w_up, xb, xq, b, hb2)?;
+                } else if can_q8_h
+                    && matches!(layer.w_gate.dtype, DType::Q4_0 | DType::Q8_0)
+                    && matches!(layer.w_up.dtype, DType::Q4_0 | DType::Q8_0)
+                {
+                    let nb = h / QK8_0;
+                    let xq = &mut xq8_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_0(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
+                    }
+                    backend.matmul_q8_act(&layer.w_gate, xb, xq, b, hb)?;
+                    backend.matmul_q8_act(&layer.w_up, xb, xq, b, hb2)?;
+                } else {
+                    backend.matmul(&layer.w_gate, xb, b, hb)?;
+                    backend.matmul(&layer.w_up, xb, b, hb2)?;
+                }
+
+                backend.swiglu_inplace(hb, hb2);
+
+                // Batched Down GEMM + Residual
+                if can_q8k_ffn && matches!(layer.w_down.dtype, DType::Q4_K | DType::Q6_K) {
+                    let nb = ffn / QK_K;
+                    let hq = &mut hbq8k_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_k(&hb[t * ffn..(t + 1) * ffn], &mut hq[t * nb..(t + 1) * nb]);
+                    }
+                    backend.matmul_q8k_act(&layer.w_down, hb, hq, b, xb)?;
+                } else if can_q8_ffn && matches!(layer.w_down.dtype, DType::Q4_0 | DType::Q8_0) {
+                    let nb = ffn / QK8_0;
+                    let hq = &mut hbq8_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_0(&hb[t * ffn..(t + 1) * ffn], &mut hq[t * nb..(t + 1) * nb]);
+                    }
+                    backend.matmul_q8_act(&layer.w_down, hb, hq, b, xb)?;
+                } else {
+                    backend.matmul(&layer.w_down, hb, b, xb)?;
+                }
+
+                for (xv, &dx) in x.iter_mut().zip(xb.iter()) {
+                    *xv += dx;
+                }
+            }
+
+            // 3. Final RMSNorm & LM Head ONLY for the very last token of the prompt!
+            if is_last_chunk && compute_last_logits {
+                let last_x = &x[(b - 1) * h..b * h];
+                backend.rms_norm(
+                    last_x,
+                    &self.output_norm,
+                    cfg.rms_norm_eps,
+                    &mut self.scratch.xb,
+                );
+                backend.matvec(&self.output_weight, &self.scratch.xb, &mut self.scratch.logits)?;
+            }
+
+            offset += b;
+        }
 
         Ok(&self.scratch.logits)
     }
@@ -510,5 +788,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stats.generated_tokens, 8);
+        assert_eq!(stats.cached_prompt_tokens, 0);
+
+        // 1. Verify batched prefill matches sequential token-by-token prefill
+        let mut m_seq = LlamaQwenModel::from_gguf(&gguf, Some(64)).unwrap();
+        let mut seq_logits = Vec::new();
+        for (pos, &tok) in ids.iter().enumerate() {
+            let l = m_seq
+                .forward_token(&backend, tok, pos, pos + 1 == ids.len())
+                .unwrap();
+            if pos + 1 == ids.len() {
+                seq_logits = l.to_vec();
+            }
+        }
+        let mut m_batch = LlamaQwenModel::from_gguf(&gguf, Some(64)).unwrap();
+        let batch_logits = m_batch.forward_batch(&backend, &ids, 0, true).unwrap().to_vec();
+        for (a, b) in seq_logits.iter().zip(batch_logits.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "Batched prefill mismatch vs sequential: seq={a}, batch={b}"
+            );
+        }
+
+        // 2. Verify automatic KV Prefix Caching hits on shared prefix
+        let ids2 = tokenizer.encode("<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n", false);
+        let (_, stats2) = model
+            .generate(
+                &backend,
+                &tokenizer,
+                &ids2,
+                4,
+                &SamplerConfig {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+                false,
+                |_, _| {},
+            )
+            .unwrap();
+        assert!(
+            stats2.cached_prompt_tokens >= 7,
+            "Expected prefix cache hit (>= 7), got {}",
+            stats2.cached_prompt_tokens
+        );
+
+        // 3. Verify Q8_0 quantized KV cache runs cleanly and compresses memory when head_dim % 32 == 0
+        let m_q8 = LlamaQwenModel::from_gguf_with_kv(&gguf, Some(64), KvPrecision::Q8_0).unwrap();
+        assert!(m_q8.kv_cache_bytes() <= m_seq.kv_cache_bytes());
     }
 }

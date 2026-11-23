@@ -1,10 +1,13 @@
-//! Zero-dependency HTTP/1.1 API Server for Caelum (OpenAI-compatible + Lenout Action Proposal).
+//! Zero-dependency HTTP/1.1 API Server for Caelum:
+//! - `GET  /health`
+//! - `POST /v1/chat/completions` (OpenAI-compatible, supports `"stream": true` SSE!)
+//! - `POST /v1/celestia/propose` (Lenout Action DSL with JSON Grammar + Automatic Prefix Caching)
 
 use crate::lenout::build_lenout_system_prompt;
 use caelum_core::Result;
 use caelum_gguf::GgufFile;
 use caelum_kernels::{Backend, CpuBackend};
-use caelum_models::{CaelumModel, SamplerConfig};
+use caelum_models::{CaelumModel, KvPrecision, SamplerConfig};
 use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, Tokenizer};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -16,6 +19,7 @@ pub fn run_server(
     port: u16,
     threads: Option<usize>,
     max_ctx: Option<usize>,
+    kv_precision: KvPrecision,
 ) -> Result<()> {
     let backend = CpuBackend::new(threads);
     println!("[Caelum Server] Loading GGUF via zero-copy mmap: {model_path}");
@@ -27,20 +31,26 @@ pub fn run_server(
     } else {
         Tokenizer::from_gguf(&gguf)?
     };
-    let mut model = CaelumModel::from_gguf(&gguf, max_ctx)?;
+    let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
     let template = ChatTemplate::from_architecture(&arch);
 
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)?;
     println!("============================================================");
-    println!("  CAELUM RUST INFERENCE SERVER READY");
+    println!("  CAELUM v{} RUST INFERENCE SERVER READY", env!("CARGO_PKG_VERSION"));
     println!("  Listen:   http://{addr}");
-    println!("  Model:    {arch} ({:.1}M params)", gguf.total_parameters() as f64 / 1e6);
+    println!(
+        "  Model:    {arch} ({:.1}M params) | KV: {} ({:.1} MB)",
+        gguf.total_parameters() as f64 / 1e6,
+        model.kv_mode_label(),
+        model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
+    );
     println!("  Hardware: {} ({} threads)", backend.caps(), backend.num_threads());
+    println!("  Features: Batched Prefill GEMM + Automatic Prefix Cache + SSE Stream");
     println!("  Endpoints:");
     println!("    GET  /health");
-    println!("    POST /v1/chat/completions");
-    println!("    POST /v1/celestia/propose");
+    println!("    POST /v1/chat/completions  (stream: true/false)");
+    println!("    POST /v1/celestia/propose  (Lenout JSON Grammar + Prefix Cache)");
     println!("============================================================");
 
     for stream in listener.incoming() {
@@ -112,9 +122,11 @@ fn handle_connection(
         ("GET", "/health") => {
             let now = unix_ts();
             let resp = format!(
-                r#"{{"status":"healthy","engine":"caelum-rs","architecture":"{}","kernel":"{}","threads":{},"timestamp":{}}}"#,
+                r#"{{"status":"healthy","engine":"caelum-rs","version":"{}","architecture":"{}","kernel":"{}","kv_mode":"{}","threads":{},"timestamp":{}}}"#,
+                env!("CARGO_PKG_VERSION"),
                 escape_json(arch),
                 escape_json(backend.name()),
+                model.kv_mode_label(),
                 backend.num_threads(),
                 now
             );
@@ -125,6 +137,7 @@ fn handle_connection(
                 .unwrap_or_else(|| "Hello".to_string());
             let max_tokens = extract_json_usize(&body_str, "max_tokens").unwrap_or(256);
             let temp = extract_json_f32(&body_str, "temperature").unwrap_or(0.7);
+            let is_stream = extract_json_bool(&body_str, "stream").unwrap_or(false);
 
             let messages = vec![ChatMessage {
                 role: ChatRole::User,
@@ -132,6 +145,56 @@ fn handle_connection(
             }];
             let formatted = template.format(&messages, true);
             let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
+
+            if is_stream {
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+                stream.write_all(header.as_bytes())?;
+                stream.flush()?;
+
+                let cmpl_id = format!("chatcmpl-caelum-{}", unix_ts());
+                let created = unix_ts();
+                let model_name = format!("caelum-{arch}");
+                let mut write_err = false;
+
+                let _ = model.generate(
+                    backend,
+                    tokenizer,
+                    &prompt_tokens,
+                    max_tokens,
+                    &SamplerConfig {
+                        temperature: temp,
+                        ..Default::default()
+                    },
+                    false,
+                    |_, piece| {
+                        if write_err || piece.is_empty() {
+                            return;
+                        }
+                        let chunk = format!(
+                            "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n",
+                            cmpl_id,
+                            created,
+                            escape_json(&model_name),
+                            escape_json(piece)
+                        );
+                        if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
+                            write_err = true;
+                        }
+                    },
+                )?;
+
+                if !write_err {
+                    let final_chunk = format!(
+                        "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                        cmpl_id,
+                        created,
+                        escape_json(&model_name)
+                    );
+                    let _ = stream.write_all(final_chunk.as_bytes());
+                    let _ = stream.flush();
+                }
+                return Ok(());
+            }
 
             let (output, stats) = model.generate(
                 backend,
@@ -147,13 +210,15 @@ fn handle_connection(
             )?;
 
             let resp = format!(
-                r#"{{"id":"chatcmpl-caelum-{}","object":"chat.completion","created":{},"model":"caelum-{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"decode_tps":{:.2}}}}}"#,
+                r#"{{"id":"chatcmpl-caelum-{}","object":"chat.completion","created":{},"model":"caelum-{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{},"cached_prompt_tokens":{},"completion_tokens":{},"prefill_tps":{:.2},"decode_tps":{:.2}}}}}"#,
                 unix_ts(),
                 unix_ts(),
                 escape_json(arch),
                 escape_json(&output),
                 stats.prompt_tokens,
+                stats.cached_prompt_tokens,
                 stats.generated_tokens,
+                stats.prefill_tps(),
                 stats.decode_tps()
             );
             write_response(stream, "200 OK", &resp)
@@ -164,10 +229,11 @@ fn handle_connection(
             let mode = extract_last_json_string(&body_str, "workspace_mode")
                 .unwrap_or_else(|| "design".to_string());
             let request_id = extract_last_json_string(&body_str, "request_id")
-                .unwrap_or_else(|| format!("req_{}", unix_ts()));
+                .unwrap_or_else(|| "req_caelum".to_string());
             let fp = extract_last_json_string(&body_str, "context_fingerprint")
-                .unwrap_or_else(|| format!("fp_{}", unix_ts()));
+                .unwrap_or_else(|| "fp_caelum".to_string());
 
+            // Keep static system prompt stable so Automatic Prefix Cache achieves >80% hit rate!
             let sys = build_lenout_system_prompt(&mode, &request_id, &fp);
             let messages = vec![
                 ChatMessage {
@@ -182,7 +248,6 @@ fn handle_connection(
             let formatted = template.format(&messages, true);
             let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
 
-            // Constrained JSON decoding guarantees valid JSON output from the engine itself!
             let (output, stats) = model.generate(
                 backend,
                 tokenizer,
@@ -199,7 +264,9 @@ fn handle_connection(
             let trimmed = output.trim();
             let resp = if trimmed.starts_with('{') && trimmed.ends_with('}') {
                 format!(
-                    r#"{{"ok":true,"engine":"caelum-rs","decode_tps":{:.2},"proposal":{}}}"#,
+                    r#"{{"ok":true,"engine":"caelum-rs","cached_prompt_tokens":{},"prefill_tps":{:.2},"decode_tps":{:.2},"proposal":{}}}"#,
+                    stats.cached_prompt_tokens,
+                    stats.prefill_tps(),
                     stats.decode_tps(),
                     trimmed
                 )
@@ -211,11 +278,7 @@ fn handle_connection(
             };
             write_response(stream, "200 OK", &resp)
         }
-        _ => write_response(
-            stream,
-            "404 Not Found",
-            r#"{"error":"route not found"}"#,
-        ),
+        _ => write_response(stream, "404 Not Found", r#"{"error":"route not found"}"#),
     }
 }
 
@@ -253,7 +316,6 @@ fn escape_json(s: &str) -> String {
     out
 }
 
-/// Lightweight zero-dep extractor for the last occurrence of `"key": "value"` in a JSON payload.
 fn extract_last_json_string(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let pos = json.rfind(&needle)?;
@@ -310,4 +372,19 @@ fn extract_json_f32(json: &str, key: &str) -> Option<f32> {
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
         .collect();
     num_str.parse().ok()
+}
+
+fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let pos = json.find(&needle)?;
+    let rest = &json[pos + needle.len()..];
+    let colon = rest.find(':')?;
+    let tail = rest[colon + 1..].trim_start();
+    if tail.starts_with("true") {
+        Some(true)
+    } else if tail.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }

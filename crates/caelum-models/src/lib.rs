@@ -1,4 +1,5 @@
-//! Model implementations: Unified Llama/Qwen2.5 GGUF runner + Native Celestia (MLA + DeepSeekMoE).
+//! Model implementations: Unified Llama/Qwen2.5 GGUF runner (Batched Prefill GEMM + Q8_0 KV Cache
+//! + Automatic Prefix Caching) and Native Celestia (True Compressed MLA + DeepSeekMoE).
 
 pub mod cache;
 pub mod celestia;
@@ -11,7 +12,7 @@ use caelum_kernels::Backend;
 use caelum_tokenizer::{JsonGrammar, Tokenizer};
 use std::time::Instant;
 
-pub use cache::{KvCache, MlaLatentCache};
+pub use cache::{KvCache, KvPrecision, MlaLatentCache};
 pub use celestia::{write_synthetic_celestia_gguf, CelestiaConfig, CelestiaModel};
 pub use llama_qwen::{LlamaQwenConfig, LlamaQwenModel};
 pub use sampler::{Sampler, SamplerConfig};
@@ -19,6 +20,8 @@ pub use sampler::{Sampler, SamplerConfig};
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
     pub prompt_tokens: usize,
+    /// Number of prompt tokens served instantaneously from KV Prefix Cache (0 compute).
+    pub cached_prompt_tokens: usize,
     pub generated_tokens: usize,
     pub prefill_secs: f64,
     pub decode_secs: f64,
@@ -26,9 +29,15 @@ pub struct GenerationStats {
 }
 
 impl GenerationStats {
+    /// Tokens actually computed during prefill (excluding prefix cache hits).
+    pub fn computed_prefill_tokens(&self) -> usize {
+        self.prompt_tokens.saturating_sub(self.cached_prompt_tokens)
+    }
+
     pub fn prefill_tps(&self) -> f64 {
-        if self.prefill_secs > 0.0 {
-            self.prompt_tokens as f64 / self.prefill_secs
+        let n = self.computed_prefill_tokens();
+        if self.prefill_secs > 0.0 && n > 0 {
+            n as f64 / self.prefill_secs
         } else {
             0.0
         }
@@ -43,58 +52,92 @@ impl GenerationStats {
     }
 }
 
-/// Unified model enum auto-dispatched from GGUF `general.architecture`.
-pub enum CaelumModel<'a> {
+enum ModelInner<'a> {
     LlamaQwen(LlamaQwenModel<'a>),
     Celestia(CelestiaModel<'a>),
 }
 
+/// Unified model container with automatic KV Prefix Caching across turns and API requests.
+pub struct CaelumModel<'a> {
+    inner: ModelInner<'a>,
+    cached_tokens: Vec<u32>,
+}
+
 impl<'a> CaelumModel<'a> {
     pub fn from_gguf(gguf: &'a GgufFile, max_seq_len: Option<usize>) -> Result<Self> {
+        Self::from_gguf_with_kv(gguf, max_seq_len, KvPrecision::F32)
+    }
+
+    pub fn from_gguf_with_kv(
+        gguf: &'a GgufFile,
+        max_seq_len: Option<usize>,
+        kv_precision: KvPrecision,
+    ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("llama");
-        match arch {
-            "celestia" => Ok(Self::Celestia(CelestiaModel::from_gguf(gguf, max_seq_len)?)),
+        let inner = match arch {
+            "celestia" => ModelInner::Celestia(CelestiaModel::from_gguf(gguf, max_seq_len)?),
             "llama" | "qwen2" | "qwen3" | "mistral" => {
-                Ok(Self::LlamaQwen(LlamaQwenModel::from_gguf(gguf, max_seq_len)?))
+                ModelInner::LlamaQwen(LlamaQwenModel::from_gguf_with_kv(
+                    gguf,
+                    max_seq_len,
+                    kv_precision,
+                )?)
             }
-            other => Err(CaelumError::InvalidFormat(format!(
-                "unsupported GGUF architecture '{other}' (supported: llama, qwen2, mistral, celestia)"
-            ))),
-        }
+            other => {
+                return Err(CaelumError::InvalidFormat(format!(
+                    "unsupported GGUF architecture '{other}' (supported: llama, qwen2, mistral, celestia)"
+                )))
+            }
+        };
+        Ok(Self {
+            inner,
+            cached_tokens: Vec::new(),
+        })
     }
 
     pub fn architecture(&self) -> &str {
-        match self {
-            Self::LlamaQwen(m) => &m.config.arch,
-            Self::Celestia(_) => "celestia",
+        match &self.inner {
+            ModelInner::LlamaQwen(m) => &m.config.arch,
+            ModelInner::Celestia(_) => "celestia",
         }
     }
 
     pub fn vocab_size(&self) -> usize {
-        match self {
-            Self::LlamaQwen(m) => m.config.vocab_size,
-            Self::Celestia(m) => m.config.vocab_size,
+        match &self.inner {
+            ModelInner::LlamaQwen(m) => m.config.vocab_size,
+            ModelInner::Celestia(m) => m.config.vocab_size,
         }
     }
 
     pub fn max_seq_len(&self) -> usize {
-        match self {
-            Self::LlamaQwen(m) => m.max_seq_len(),
-            Self::Celestia(m) => m.max_seq_len(),
+        match &self.inner {
+            ModelInner::LlamaQwen(m) => m.max_seq_len(),
+            ModelInner::Celestia(m) => m.max_seq_len(),
         }
     }
 
     pub fn kv_cache_bytes(&self) -> usize {
-        match self {
-            Self::LlamaQwen(m) => m.kv_cache_bytes(),
-            Self::Celestia(m) => m.kv_cache_bytes(),
+        match &self.inner {
+            ModelInner::LlamaQwen(m) => m.kv_cache_bytes(),
+            ModelInner::Celestia(m) => m.kv_cache_bytes(),
+        }
+    }
+
+    pub fn kv_mode_label(&self) -> &'static str {
+        match &self.inner {
+            ModelInner::LlamaQwen(m) => match m.kv_precision() {
+                KvPrecision::F32 => "GQA-F32",
+                KvPrecision::Q8_0 => "GQA-Q8_0",
+            },
+            ModelInner::Celestia(_) => "MLA-Latent",
         }
     }
 
     pub fn reset_cache(&mut self) {
-        match self {
-            Self::LlamaQwen(m) => m.reset_cache(),
-            Self::Celestia(m) => m.reset_cache(),
+        self.cached_tokens.clear();
+        match &mut self.inner {
+            ModelInner::LlamaQwen(m) => m.reset_cache(),
+            ModelInner::Celestia(m) => m.reset_cache(),
         }
     }
 
@@ -103,14 +146,46 @@ impl<'a> CaelumModel<'a> {
         backend: &dyn Backend,
         token_id: u32,
         pos: usize,
+        compute_logits: bool,
     ) -> Result<&[f32]> {
-        match self {
-            Self::LlamaQwen(m) => m.forward_token(backend, token_id, pos),
-            Self::Celestia(m) => m.forward_token(backend, token_id, pos),
+        match &mut self.inner {
+            ModelInner::LlamaQwen(m) => m.forward_token(backend, token_id, pos, compute_logits),
+            ModelInner::Celestia(m) => m.forward_token(backend, token_id, pos, compute_logits),
         }
     }
 
-    /// Runs prefill + autoregressive decode, invoking `on_token(token_id, piece)` for each generated token.
+    pub fn forward_batch(
+        &mut self,
+        backend: &dyn Backend,
+        tokens: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+    ) -> Result<&[f32]> {
+        match &mut self.inner {
+            ModelInner::LlamaQwen(m) => {
+                m.forward_batch(backend, tokens, start_pos, compute_last_logits)
+            }
+            ModelInner::Celestia(m) => {
+                let n = tokens.len();
+                for (i, &tok) in tokens.iter().enumerate() {
+                    let is_last = i + 1 == n && compute_last_logits;
+                    m.forward_token(backend, tok, start_pos + i, is_last)?;
+                }
+                // Re-borrow logits cleanly (already populated when is_last == true)
+                if n > 0 && compute_last_logits {
+                    // Already computed on the last iteration; return slice directly
+                    m.forward_token(backend, tokens[n - 1], start_pos + n - 1, true)
+                } else {
+                    Ok(&[])
+                }
+            }
+        }
+    }
+
+    /// Runs prefix-cached batched prefill + autoregressive decode, invoking `on_token(id, piece)`.
+    ///
+    /// Automatically reuses the longest matching token prefix already stored in the KV cache
+    /// (ideal for repeated Lenout system prompts and multi-turn `caelum chat`).
     pub fn generate<F>(
         &mut self,
         backend: &dyn Backend,
@@ -127,7 +202,6 @@ impl<'a> CaelumModel<'a> {
         if prompt_tokens.is_empty() {
             return Err(CaelumError::Runtime("prompt_tokens cannot be empty".into()));
         }
-        self.reset_cache();
 
         let max_ctx = self.max_seq_len();
         if prompt_tokens.len() >= max_ctx {
@@ -137,18 +211,37 @@ impl<'a> CaelumModel<'a> {
             )));
         }
 
-        // 1. Prefill prompt tokens
-        let t_prefill = Instant::now();
-        let mut last_logits_vec = Vec::new();
-        for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            let logits = self.forward_token(backend, tok, pos)?;
-            if pos + 1 == prompt_tokens.len() {
-                last_logits_vec = logits.to_vec();
-            }
+        // 1. Automatic KV Prefix Cache match (always recompute at least the final prompt token for logits)
+        let mut common = 0usize;
+        let max_reuse = self.cached_tokens.len().min(prompt_tokens.len() - 1);
+        while common < max_reuse && self.cached_tokens[common] == prompt_tokens[common] {
+            common += 1;
         }
+        self.cached_tokens.truncate(common);
+
+        // 2. Batched Prefill for uncached suffix `prompt_tokens[common..]`
+        let t_prefill = Instant::now();
+        let uncached = &prompt_tokens[common..];
+        let mut last_logits_vec = match &mut self.inner {
+            ModelInner::LlamaQwen(m) => {
+                m.forward_batch(backend, uncached, common, true)?.to_vec()
+            }
+            ModelInner::Celestia(m) => {
+                let mut out = Vec::new();
+                for (i, &tok) in uncached.iter().enumerate() {
+                    let is_last = i + 1 == uncached.len();
+                    let logits = m.forward_token(backend, tok, common + i, is_last)?;
+                    if is_last {
+                        out = logits.to_vec();
+                    }
+                }
+                out
+            }
+        };
+        self.cached_tokens.extend_from_slice(uncached);
         let prefill_secs = t_prefill.elapsed().as_secs_f64();
 
-        // 2. Autoregressive Decode
+        // 3. Autoregressive Decode
         let mut sampler = Sampler::new(sampler_cfg.clone());
         let mut grammar = if constrain_json {
             Some(JsonGrammar::new())
@@ -174,8 +267,8 @@ impl<'a> CaelumModel<'a> {
             }
 
             if let Some(ref mut g) = grammar {
-                let raw_bytes = tokenizer.token_to_bytes(next_tok, true);
-                g.advance_bytes(&raw_bytes);
+                let raw_bytes = tokenizer.cached_token_bytes(next_tok);
+                g.advance_bytes(raw_bytes);
             }
 
             let piece = decoder.push(tokenizer, next_tok);
@@ -192,8 +285,9 @@ impl<'a> CaelumModel<'a> {
             }
 
             if generated < max_new_tokens && pos < max_ctx {
-                let logits = self.forward_token(backend, next_tok, pos)?;
+                let logits = self.forward_token(backend, next_tok, pos, true)?;
                 last_logits_vec.copy_from_slice(logits);
+                self.cached_tokens.push(next_tok);
                 pos += 1;
             }
         }
@@ -207,6 +301,7 @@ impl<'a> CaelumModel<'a> {
         let decode_secs = t_decode.elapsed().as_secs_f64();
         let stats = GenerationStats {
             prompt_tokens: prompt_tokens.len(),
+            cached_prompt_tokens: common,
             generated_tokens: generated,
             prefill_secs,
             decode_secs,

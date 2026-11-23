@@ -13,10 +13,14 @@ No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a s
 
 - **Zero External Dependencies:** Pure Rust standard library (`std`) — builds in seconds and compiles cleanly for `x86_64`, **ARMv9 (`aarch64`)**, and **`wasm32`**.
 - **ARMv9-First Hardware Kernels:**
-  - `aarch64` **NEON FMA + ARMv9 `dotprod` (`vdotq_s32`)** fused W4A8 (`Q4_0 × Q8_0`, `Q4_K × Q8_K`) and W6A8/W8A8 (`Q6_K × Q8_K`, `Q8_0 × Q8_0`) SIMD kernels.
-  - `x86_64` **AVX2 + FMA** (`_mm256_maddubs_epi16` / `_mm256_madd_epi16` / `_mm256_fmadd_ps`) kernels.
-  - Pluggable `Backend` trait designed for drop-in **Arm KleidiAI (`i8mm` / `SME2`)** or `wgpu` GPU backends.
+  - `aarch64` **NEON FMA + ARMv9 `dotprod` (`vdotq_s32`) + ARMv9 `i8mm` (`SMMLA` 2×2 tiled matrix multiply)** fused W4A8 (`Q4_0 × Q8_0`, `Q4_K × Q8_K`) and W6A8/W8A8 (`Q6_K × Q8_K`, `Q8_0 × Q8_0`) SIMD kernels.
+  - `x86_64` **AVX2 + FMA** fused-scale vector-accumulator kernels (`~119 GFLOP/s` decode matvec, **`~199 GFLOP/s`** batched prefill GEMM).
+  - Pluggable `Backend` trait designed for drop-in **Arm KleidiAI (`SME2`)** or `wgpu` GPU backends.
   - Zero-dependency persistent worker thread pool avoiding per-layer thread spawn overhead.
+- **High-Efficiency Memory & Prefill Engine (v0.2.0):**
+  - **Batched Prefill GEMM:** Reads each layer's quantized weight matrix once across multi-token chunks and skips intermediate `lm_head` projections.
+  - **Quantized `Q8_0` KV Cache (`--kv-q8`):** Cuts GQA KV cache RAM & bandwidth by **3.76×** (e.g., `112 MB` → `29.8 MB` at 2048 context) with SIMD integer attention scoring.
+  - **Automatic KV Prefix Caching:** Reuses the longest matching token prefix across multi-turn `caelum chat` and repeated `/v1/celestia/propose` API calls with zero recomputation.
 - **Zero-Copy GGUF v2/v3 Engine:** POSIX `mmap` loader + GGUF v3 writer supporting exact GGML binary block layouts (`F32`, `F16`, `BF16`, `Q8_0`, `Q4_0`, `Q4_1`, `Q4_K`, `Q6_K`).
 - **Dual Model Architecture Support:**
   - **Standard GGUF Models:** Qwen2 / Qwen2.5 / Qwen2.5-Coder, Llama 2/3, Mistral (GQA, Normal & NeoX RoPE, optional QKV biases, tied/untied embeddings).
@@ -24,7 +28,7 @@ No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a s
 - **Multilingual BPE & Constrained JSON Decoding:**
   - Exact Qwen2.5 / GPT-2 byte-level BPE & SentencePiece BPE with incremental UTF-8 `StreamDecoder` (safe for multi-byte Thai & emoji sequences).
   - Zero-allocation **JSON Grammar Constrained Sampler** (`--json` / `propose`) guaranteeing syntactically valid JSON even on small models.
-- **Built-In HTTP/1.1 Server:** OpenAI-compatible `/v1/chat/completions`, Lenout-native `/v1/celestia/propose`, and `/health`.
+- **Built-In HTTP/1.1 Server:** OpenAI-compatible `/v1/chat/completions` (supporting real **SSE `"stream": true`**), Lenout-native `/v1/celestia/propose` (with Prefix Caching), and `/health`.
 
 ---
 
@@ -72,37 +76,41 @@ cargo build --release
 # Inspect GGUF metadata & quantization breakdown via mmap
 ./target/release/caelum inspect /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
 
-# Streaming text generation
-./target/release/caelum run /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf \
+# Streaming text generation (add --kv-q8 for 3.76× smaller KV cache RAM)
+./target/release/caelum run /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --kv-q8 \
   -p "Explain why ARMv9 SME2 accelerates LLM inference."
 
+# Interactive multi-turn chat REPL (automatic KV Prefix Caching enabled)
+./target/release/caelum chat /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --kv-q8
+
 # Constrained JSON Action Proposal (Lenout Action DSL)
-./target/release/caelum propose /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf \
+./target/release/caelum propose /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --kv-q8 \
   --mode design -p "Create 2 pricing cards horizontally: Basic and Pro"
 
-# Start OpenAI + Lenout HTTP API server
-./target/release/caelum serve /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --port 8000
+# Start OpenAI (SSE streaming) + Lenout (Prefix-Cached) HTTP API server
+./target/release/caelum serve /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --kv-q8 --port 8000
 ```
 
 ---
 
-## Verified Benchmarks (CPU-Only, Intel i5-13400F, 8 Threads)
+## Verified Benchmarks (v0.2.0, CPU-Only, Intel i5-13400F, 8 Threads)
 
-| Benchmark | Result |
-|---|---|
-| Release binary size (`caelum`) | **760 KB** (0 external crates) |
-| `Qwen2.5-Coder-1.5B-Instruct-Q4_K_M` (`1.06 GB`) `mmap` load | **32.2 ms** |
-| `2048×2048` `Q4_K` (W4A8-K) matvec kernel | **0.10 ms/op** (**80.98 GFLOP/s**, 1.72× faster than F32) |
-| `2048×2048` `Q6_K` (W6A8-K) matvec kernel | **0.12 ms/op** (**67.40 GFLOP/s**, 1.43× faster than F32) |
-| `Qwen2.5-Coder-1.5B-Instruct-Q4_K_M` Decode speed | **~20.1 tok/s** (CPU-only, no GPU) |
-| `Qwen2.5-Coder-1.5B` Lenout JSON Proposal (`--json` 151k vocab) | **13.5 tok/s** (100% Zod-valid JSON) |
+| Benchmark | v0.1.0 | v0.2.0 |
+|---|---|---|
+| Release binary size (`caelum`) | 760 KB | **872 KB** (0 external crates) |
+| `Qwen2.5-Coder-1.5B-Instruct-Q4_K_M` (`1.06 GB`) `mmap` load | 32.2 ms | **32.2 ms** |
+| `2048×2048` `Q4_K` matvec (`B=1`, decode) | 80.98 GFLOP/s | **118.82 GFLOP/s** (`0.07 ms/op`) |
+| `2048×2048` `Q4_K` batched GEMM (`B=16`, prefill) | — | **198.52 GFLOP/s** (`0.68 ms/op`) |
+| `Qwen2.5-Coder-1.5B` KV Cache RAM (2048 ctx) | 112.0 MB (`F32`) | **29.8 MB** (`--kv-q8`, **3.76× smaller**) |
+| `Qwen2.5-Coder-1.5B` Prefill speed (`334 tok`) | 21.76 tok/s | **57.78 tok/s** (**2.65× faster**) |
+| `Qwen2.5-Coder-1.5B` Lenout JSON Decode (`--json` 151k vocab) | 13.47 tok/s | **18.14 tok/s** (**+35% faster**) |
 
 ---
 
 ## Cross-Compilation (ARMv9 & WebAssembly)
 
 ```bash
-# Verify ARMv9 / AArch64 (NEON + DotProd SDOT kernels)
+# Verify ARMv9 / AArch64 (NEON + DotProd SDOT + I8MM SMMLA 2×2 tiled GEMM)
 cargo check --workspace --target aarch64-unknown-linux-gnu
 
 # Verify core inference crates for WebAssembly (browser edge deployment)
@@ -115,9 +123,10 @@ cargo check --target wasm32-unknown-unknown \
 
 ## Roadmap
 
-- [ ] Batched Prefill GEMM (tiled matrix-matrix multiplication for fast long-context prefill)
-- [ ] Optional **Arm KleidiAI** FFI backend for ARMv9 `i8mm` & `SME2` matrix tiles
-- [ ] Quantized `Q8_0` KV Cache & Prefix Caching for instant repeated Lenout prompts
+- [x] Batched Prefill GEMM (multi-token weight reuse + ARMv9 `i8mm` `SMMLA` 2×2 tiled kernel)
+- [x] Quantized `Q8_0` KV Cache (`--kv-q8`, 3.76× memory reduction) & Automatic KV Prefix Caching
+- [x] OpenAI SSE Streaming (`"stream": true`) & Interactive Multi-Turn `caelum chat` REPL
+- [ ] Optional **Arm KleidiAI** FFI backend for ARMv9.2+ `SME2` matrix tiles
 - [ ] Full JSON Schema Grammar (constraining field names, enums, and types at token level)
 - [ ] `wgpu` / Vulkan GPU compute backend
 
