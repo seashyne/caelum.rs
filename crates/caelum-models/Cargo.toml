@@ -1,0 +1,11 @@
+[package]
+name = "caelum-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+caelum-core = { path = "../caelum-core" }
+caelum-gguf = { path = "../caelum-gguf" }
+caelum-kernels = { path = "../caelum-kernels" }
+caelum-tokenizer = { path = "../caelum-tokenizer" }

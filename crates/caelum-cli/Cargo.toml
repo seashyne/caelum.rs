@@ -1,0 +1,16 @@
+[package]
+name = "caelum-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "caelum"
+path = "src/main.rs"
+
+[dependencies]
+caelum-core = { path = "../caelum-core" }
+caelum-kernels = { path = "../caelum-kernels" }
+caelum-gguf = { path = "../caelum-gguf" }
+caelum-tokenizer = { path = "../caelum-tokenizer" }
+caelum-models = { path = "../caelum-models" }

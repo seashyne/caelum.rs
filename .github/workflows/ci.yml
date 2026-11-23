@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test-and-cross-check:
+    name: Test (x86_64) + Cross-Check (ARMv9 & WASM32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain & targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu,wasm32-unknown-unknown
+
+      - name: Run workspace unit & integration tests (x86_64)
+        run: cargo test --workspace
+
+      - name: Cross-check ARMv9 / AArch64 (NEON + DotProd kernels)
+        run: cargo check --workspace --target aarch64-unknown-linux-gnu
+
+      - name: Cross-check WebAssembly (core crates)
+        run: >
+          cargo check --target wasm32-unknown-unknown
+          -p caelum-core -p caelum-kernels -p caelum-gguf
+          -p caelum-tokenizer -p caelum-models
+
+      - name: Build release binary & run smoke tests
+        run: |
+          cargo build --release
+          ./target/release/caelum info
+          ./target/release/caelum demo-celestia
+          ./target/release/caelum bench --dim 512 --iters 20
