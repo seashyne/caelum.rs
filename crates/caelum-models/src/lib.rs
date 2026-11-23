@@ -9,7 +9,7 @@ pub mod sampler;
 use caelum_core::{CaelumError, Result};
 use caelum_gguf::GgufFile;
 use caelum_kernels::Backend;
-use caelum_tokenizer::{JsonGrammar, Tokenizer};
+use caelum_tokenizer::{JsonGrammar, LogitGrammar, Tokenizer};
 use std::time::Instant;
 
 pub use cache::{KvCache, KvPrecision, MlaLatentCache};
@@ -194,6 +194,40 @@ impl<'a> CaelumModel<'a> {
         max_new_tokens: usize,
         sampler_cfg: &SamplerConfig,
         constrain_json: bool,
+        on_token: F,
+    ) -> Result<(String, GenerationStats)>
+    where
+        F: FnMut(u32, &str),
+    {
+        let mut json_g = if constrain_json {
+            Some(JsonGrammar::new())
+        } else {
+            None
+        };
+        let grammar_ref: Option<&mut dyn LogitGrammar> = json_g
+            .as_mut()
+            .map(|g| g as &mut dyn LogitGrammar);
+        self.generate_with_grammar(
+            backend,
+            tokenizer,
+            prompt_tokens,
+            max_new_tokens,
+            sampler_cfg,
+            grammar_ref,
+            on_token,
+        )
+    }
+
+    /// Runs prefix-cached batched prefill + autoregressive decode with an optional arbitrary
+    /// `LogitGrammar` (e.g., `JsonGrammar` or strict `SchemaGrammar::lenout_proposal(mode)`).
+    pub fn generate_with_grammar<F>(
+        &mut self,
+        backend: &dyn Backend,
+        tokenizer: &Tokenizer,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        sampler_cfg: &SamplerConfig,
+        mut grammar: Option<&mut dyn LogitGrammar>,
         mut on_token: F,
     ) -> Result<(String, GenerationStats)>
     where
@@ -243,11 +277,6 @@ impl<'a> CaelumModel<'a> {
 
         // 3. Autoregressive Decode
         let mut sampler = Sampler::new(sampler_cfg.clone());
-        let mut grammar = if constrain_json {
-            Some(JsonGrammar::new())
-        } else {
-            None
-        };
         let mut history: Vec<u32> = prompt_tokens.to_vec();
         let mut decoder = tokenizer.stream_decoder(true);
         let mut full_text = String::new();

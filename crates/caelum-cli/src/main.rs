@@ -11,7 +11,7 @@ use caelum_kernels::{Backend, CpuBackend, CpuCaps};
 use caelum_models::{
     write_synthetic_celestia_gguf, CaelumModel, CelestiaConfig, KvPrecision, SamplerConfig,
 };
-use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, Tokenizer};
+use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, SchemaGrammar, Tokenizer};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
@@ -507,14 +507,15 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
 
     eprintln!(
-        "[Caelum Propose] mode={mode} | {} | {} threads | KV {} ({:.1} MB) | JSON Grammar=ON",
+        "[Caelum Propose] mode={mode} | {} | {} threads | KV {} ({:.1} MB) | Strict SchemaGrammar=ON",
         backend.name(),
         backend.num_threads(),
         model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
     );
 
-    let (json_out, stats) = model.generate(
+    let mut schema_grammar = SchemaGrammar::lenout_proposal(&mode);
+    let (json_out, stats) = model.generate_with_grammar(
         &backend,
         &tokenizer,
         &prompt_tokens,
@@ -523,7 +524,7 @@ fn cmd_propose(args: &[String]) -> Result<()> {
             temperature: temp,
             ..Default::default()
         },
-        true,
+        Some(&mut schema_grammar),
         |_, _| {},
     )?;
 

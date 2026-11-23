@@ -5,7 +5,7 @@
 
 **Caelum** (*Latin: "The Chisel / The Sky"*) is a **zero-dependency, pure-Rust, ARMv9-first LLM inference engine** built from scratch to power **Celestia** (MLA + DeepSeekMoE), **Astraea** (Qwen2.5 / Llama / Mistral GGUF), and **Lenout Creative Workspace**.
 
-No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a single **~760 KB** native binary.
+No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a single **~936 KB** native binary.
 
 ---
 
@@ -25,9 +25,9 @@ No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a s
 - **Dual Model Architecture Support:**
   - **Standard GGUF Models:** Qwen2 / Qwen2.5 / Qwen2.5-Coder, Llama 2/3, Mistral (GQA, Normal & NeoX RoPE, optional QKV biases, tied/untied embeddings).
   - **Native Celestia Architecture:** True **Compressed Multi-Head Latent Attention (MLA)** caching only `c_t^{KV}` (75–87.5% KV cache memory savings) + **Sparse DeepSeekMoE** (Shared Expert + Top-K Routed Experts).
-- **Multilingual BPE & Constrained JSON Decoding:**
+- **Multilingual BPE & Strict JSON Schema Constrained Decoding (v0.3.0):**
   - Exact Qwen2.5 / GPT-2 byte-level BPE & SentencePiece BPE with incremental UTF-8 `StreamDecoder` (safe for multi-byte Thai & emoji sequences).
-  - Zero-allocation **JSON Grammar Constrained Sampler** (`--json` / `propose`) guaranteeing syntactically valid JSON even on small models.
+  - **Full `SchemaGrammar` Engine** (`caelum-tokenizer::SchemaGrammar`): enforces exact required fields, `Enum` literals, discriminated `OneOf` action unions, 6-digit `HexColor`, `Identifier`, `UnitFloat` (`[0, 1]`), and 3D `Tuple` coordinates at token-sampling time with an `O(1)` 256-byte prefilter.
 - **Built-In HTTP/1.1 Server:** OpenAI-compatible `/v1/chat/completions` (supporting real **SSE `"stream": true`**), Lenout-native `/v1/celestia/propose` (with Prefix Caching), and `/health`.
 
 ---
@@ -93,17 +93,18 @@ cargo build --release
 
 ---
 
-## Verified Benchmarks (v0.2.0, CPU-Only, Intel i5-13400F, 8 Threads)
+## Verified Benchmarks (v0.3.0, CPU-Only, Intel i5-13400F, 8 Threads)
 
-| Benchmark | v0.1.0 | v0.2.0 |
+| Benchmark | v0.1.0 | v0.3.0 |
 |---|---|---|
-| Release binary size (`caelum`) | 760 KB | **872 KB** (0 external crates) |
+| Release binary size (`caelum`) | 760 KB | **937 KB** (0 external crates) |
 | `Qwen2.5-Coder-1.5B-Instruct-Q4_K_M` (`1.06 GB`) `mmap` load | 32.2 ms | **32.2 ms** |
 | `2048×2048` `Q4_K` matvec (`B=1`, decode) | 80.98 GFLOP/s | **118.82 GFLOP/s** (`0.07 ms/op`) |
 | `2048×2048` `Q4_K` batched GEMM (`B=16`, prefill) | — | **198.52 GFLOP/s** (`0.68 ms/op`) |
 | `Qwen2.5-Coder-1.5B` KV Cache RAM (2048 ctx) | 112.0 MB (`F32`) | **29.8 MB** (`--kv-q8`, **3.76× smaller**) |
-| `Qwen2.5-Coder-1.5B` Prefill speed (`334 tok`) | 21.76 tok/s | **57.78 tok/s** (**2.65× faster**) |
-| `Qwen2.5-Coder-1.5B` Lenout JSON Decode (`--json` 151k vocab) | 13.47 tok/s | **18.14 tok/s** (**+35% faster**) |
+| `Qwen2.5-Coder-1.5B` Prefill speed (`341 tok`) | 21.76 tok/s | **53.5–60.4 tok/s** (**~2.7× faster**) |
+| `Qwen2.5-Coder-1.5B` Strict `SchemaGrammar` Decode (151k vocab) | 13.47 tok/s *(JSON only)* | **15.34 tok/s** (**100% Zod-valid 5/5 modes**) |
+| Repeated `/v1/celestia/propose` Prefix Cache Hit | 0 tok | **311 tok cached** (`<0.4s` TTFT) |
 
 ---
 
@@ -123,11 +124,11 @@ cargo check --target wasm32-unknown-unknown \
 
 ## Roadmap
 
-- [x] Batched Prefill GEMM (multi-token weight reuse + ARMv9 `i8mm` `SMMLA` 2×2 tiled kernel)
+- [x] Batched Prefill GEMM (multi-token weight reuse + ARMv9 `i8mm` `SMMLA` 2×2 tiled & `Q4_K`/`Q6_K` `dotprod` kernels)
 - [x] Quantized `Q8_0` KV Cache (`--kv-q8`, 3.76× memory reduction) & Automatic KV Prefix Caching
 - [x] OpenAI SSE Streaming (`"stream": true`) & Interactive Multi-Turn `caelum chat` REPL
+- [x] Full JSON Schema Grammar (`SchemaGrammar`: required keys, enums, `OneOf` unions, hex colors, `[0,1]` floats, 3D tuples)
 - [ ] Optional **Arm KleidiAI** FFI backend for ARMv9.2+ `SME2` matrix tiles
-- [ ] Full JSON Schema Grammar (constraining field names, enums, and types at token level)
 - [ ] `wgpu` / Vulkan GPU compute backend
 
 ---

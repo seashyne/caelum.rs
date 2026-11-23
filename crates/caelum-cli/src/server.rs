@@ -8,7 +8,7 @@ use caelum_core::Result;
 use caelum_gguf::GgufFile;
 use caelum_kernels::{Backend, CpuBackend};
 use caelum_models::{CaelumModel, KvPrecision, SamplerConfig};
-use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, Tokenizer};
+use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, SchemaGrammar, Tokenizer};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -248,7 +248,8 @@ fn handle_connection(
             let formatted = template.format(&messages, true);
             let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
 
-            let (output, stats) = model.generate(
+            let mut schema_grammar = SchemaGrammar::lenout_proposal(&mode);
+            let (output, stats) = model.generate_with_grammar(
                 backend,
                 tokenizer,
                 &prompt_tokens,
@@ -257,7 +258,7 @@ fn handle_connection(
                     temperature: 0.2,
                     ..Default::default()
                 },
-                true,
+                Some(&mut schema_grammar),
                 |_, _| {},
             )?;
 

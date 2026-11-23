@@ -3,6 +3,7 @@
 //! Masks invalid next tokens directly on logits so even tiny models emit guaranteed valid JSON.
 
 use crate::bpe::Tokenizer;
+use crate::schema::LogitGrammar;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Container {
@@ -424,6 +425,20 @@ impl JsonGrammar {
         if !any_allowed {
             logits.copy_from_slice(&orig);
         }
+    }
+}
+
+impl LogitGrammar for JsonGrammar {
+    fn is_complete(&self) -> bool {
+        JsonGrammar::is_complete(self)
+    }
+
+    fn mask_logits(&self, logits: &mut [f32], tokenizer: &Tokenizer) {
+        JsonGrammar::mask_logits(self, logits, tokenizer)
+    }
+
+    fn advance_bytes(&mut self, bytes: &[u8]) -> bool {
+        JsonGrammar::advance_bytes(self, bytes)
     }
 }
 

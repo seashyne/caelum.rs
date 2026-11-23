@@ -523,9 +523,15 @@ impl Backend for CpuBackend {
                                     None
                                 }
                             }
-                            #[cfg(not(target_arch = "x86_64"))]
+                            #[cfg(target_arch = "aarch64")]
                             {
-                                None
+                                if self.caps.dotprod {
+                                    Some(unsafe {
+                                        armv9::dot_q6_k_q8_k_batch4_dotprod(row, x0, x1, x2, x3)
+                                    })
+                                } else {
+                                    None
+                                }
                             }
                         }
                         _ => None,

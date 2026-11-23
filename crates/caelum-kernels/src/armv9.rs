@@ -474,3 +474,78 @@ pub unsafe fn dot_q4_k_q8_k_batch4_dotprod(
     }
     sumf
 }
+
+/// ARMv9 `dotprod` 4-token batched `Q6_K × Q8_K` prefill GEMM micro-kernel (unpacks 6-bit weights once).
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn dot_q6_k_q8_k_batch4_dotprod(
+    raw: &[u8],
+    x0: &[BlockQ8_K],
+    x1: &[BlockQ8_K],
+    x2: &[BlockQ8_K],
+    x3: &[BlockQ8_K],
+) -> [f32; 4] {
+    let nb = x0.len();
+    let mask_low4 = vdupq_n_u8(0x0F);
+    let mask_low2 = vdupq_n_u8(0x03);
+    let thirty_two = vdupq_n_s8(32);
+    let mut sumf = [0.0f32; 4];
+
+    for b in 0..nb {
+        let off = b * 210;
+        let ql_base = raw.as_ptr().add(off);
+        let qh_base = raw.as_ptr().add(off + 128);
+        let sc_base = raw.as_ptr().add(off + 192) as *const i8;
+        let dw = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off + 208),
+            *raw.get_unchecked(off + 209),
+        ]));
+        let xbs = [
+            x0.get_unchecked(b),
+            x1.get_unchecked(b),
+            x2.get_unchecked(b),
+            x3.get_unchecked(b),
+        ];
+
+        let mut isum = [0i32; 4];
+        for half in 0..2 {
+            let ql_h = ql_base.add(half * 64);
+            let qh_h = qh_base.add(half * 32);
+            let sc_h = sc_base.add(half * 8);
+
+            for is in 0..2 {
+                let l = is * 16;
+                let ql0 = vld1q_u8(ql_h.add(l));
+                let ql1 = vld1q_u8(ql_h.add(l + 32));
+                let qh = vld1q_u8(qh_h.add(l));
+
+                let qh0 = vshlq_n_u8::<4>(vandq_u8(qh, mask_low2));
+                let qh1 = vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<2>(qh), mask_low2));
+                let qh2 = vshlq_n_u8::<4>(vandq_u8(vshrq_n_u8::<4>(qh), mask_low2));
+                let qh3 = vshlq_n_u8::<4>(vshrq_n_u8::<6>(qh));
+
+                let q1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql0, mask_low4), qh0)), thirty_two);
+                let q2 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql1, mask_low4), qh1)), thirty_two);
+                let q3 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql0), qh2)), thirty_two);
+                let q4 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql1), qh3)), thirty_two);
+
+                let sc0 = *sc_h.add(is) as i32;
+                let sc2 = *sc_h.add(is + 2) as i32;
+                let sc4 = *sc_h.add(is + 4) as i32;
+                let sc6 = *sc_h.add(is + 6) as i32;
+
+                for t in 0..4 {
+                    let x_h = xbs[t].qs.as_ptr().add(half * 128);
+                    let d1 = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q1, vld1q_s8(x_h.add(l))));
+                    let d2 = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q2, vld1q_s8(x_h.add(l + 32))));
+                    let d3 = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q3, vld1q_s8(x_h.add(l + 64))));
+                    let d4 = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), q4, vld1q_s8(x_h.add(l + 96))));
+                    isum[t] += sc0 * d1 + sc2 * d2 + sc4 * d3 + sc6 * d4;
+                }
+            }
+        }
+        for t in 0..4 {
+            sumf[t] += (dw * xbs[t].d) * (isum[t] as f32);
+        }
+    }
+    sumf
+}
