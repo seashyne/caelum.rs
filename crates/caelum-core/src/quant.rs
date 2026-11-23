@@ -46,6 +46,17 @@ pub struct BlockQ4_K {
     pub qs: [u8; 128],    // 256 x 4-bit quants
 }
 
+/// GGML `block_q5_K`: 256 weights in 176 bytes (5.5 bpw super-block, used in Q5_K_M / Q5_K_S).
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
+pub struct BlockQ5_K {
+    pub d: u16,           // f16 super-block scale for quantized scales
+    pub dmin: u16,        // f16 super-block scale for quantized mins
+    pub scales: [u8; 12], // 8 x (6-bit scale + 6-bit min)
+    pub qh: [u8; 32],     // 256 x 1-bit high bits (8 bits per byte, 2 bits per 64-elem chunk)
+    pub qs: [u8; 128],    // 256 x 4-bit low nibbles
+}
+
 /// GGML `block_q6_K`: 256 weights in 210 bytes (6.56 bpw super-block, used in Q4_K_M & Q6_K).
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +91,7 @@ const _: () = {
     assert!(std::mem::size_of::<BlockQ4_1>() == 20);
     assert!(std::mem::size_of::<BlockQ8_0>() == 34);
     assert!(std::mem::size_of::<BlockQ4_K>() == 144);
+    assert!(std::mem::size_of::<BlockQ5_K>() == 176);
     assert!(std::mem::size_of::<BlockQ6_K>() == 210);
 };
 
@@ -256,6 +268,45 @@ pub fn dequantize_row_q4_k(raw: &[u8], dst: &mut [f32]) {
                 out[y_base + 32 + l] = d2 * (q[l] >> 4) as f32 - min2;
             }
             is += 2;
+        }
+    }
+}
+
+/// Dequantizes a `Q5_K` byte slice into `dst: &mut [f32]` (matches `dequantize_row_q5_K` bit-for-bit).
+pub fn dequantize_row_q5_k(raw: &[u8], dst: &mut [f32]) {
+    let nb = dst.len() / QK_K;
+    debug_assert_eq!(raw.len(), nb * 176);
+    for b in 0..nb {
+        let off = b * 176;
+        let d = f16_to_f32(u16::from_le_bytes([raw[off], raw[off + 1]]));
+        let min = f16_to_f32(u16::from_le_bytes([raw[off + 2], raw[off + 3]]));
+        let scales = &raw[off + 4..off + 16];
+        let qh = &raw[off + 16..off + 48];
+        let qs = &raw[off + 48..off + 176];
+        let out = &mut dst[b * QK_K..(b + 1) * QK_K];
+
+        let mut is = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for chunk in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let d1 = d * sc1 as f32;
+            let min1 = min * m1 as f32;
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc2 as f32;
+            let min2 = min * m2 as f32;
+
+            let q = &qs[chunk * 32..(chunk + 1) * 32];
+            let y_base = chunk * 64;
+            for l in 0..32 {
+                let hi1 = if (qh[l] & u1) != 0 { 16 } else { 0 };
+                let hi2 = if (qh[l] & u2) != 0 { 16 } else { 0 };
+                out[y_base + l] = d1 * ((q[l] & 0x0F) + hi1) as f32 - min1;
+                out[y_base + 32 + l] = d2 * ((q[l] >> 4) + hi2) as f32 - min2;
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 }

@@ -14,6 +14,7 @@ pub enum DType {
     Q4_1 = 3,
     Q8_0 = 8,
     Q4_K = 12,
+    Q5_K = 13,
     Q6_K = 14,
     BF16 = 30,
 }
@@ -27,6 +28,7 @@ impl DType {
             3 => Ok(DType::Q4_1),
             8 => Ok(DType::Q8_0),
             12 => Ok(DType::Q4_K),
+            13 => Ok(DType::Q5_K),
             14 => Ok(DType::Q6_K),
             30 => Ok(DType::BF16),
             other => Err(CaelumError::UnsupportedDType(format!(
@@ -41,7 +43,7 @@ impl DType {
         match self {
             DType::F32 | DType::F16 | DType::BF16 => 1,
             DType::Q4_0 | DType::Q4_1 | DType::Q8_0 => 32,
-            DType::Q4_K | DType::Q6_K => 256,
+            DType::Q4_K | DType::Q5_K | DType::Q6_K => 256,
         }
     }
 
@@ -55,6 +57,7 @@ impl DType {
             DType::Q4_1 => 20,
             DType::Q8_0 => 34,
             DType::Q4_K => 144,
+            DType::Q5_K => 176,
             DType::Q6_K => 210,
         }
     }
@@ -83,6 +86,7 @@ impl fmt::Display for DType {
             DType::Q4_1 => write!(f, "Q4_1"),
             DType::Q8_0 => write!(f, "Q8_0"),
             DType::Q4_K => write!(f, "Q4_K"),
+            DType::Q5_K => write!(f, "Q5_K"),
             DType::Q6_K => write!(f, "Q6_K"),
         }
     }

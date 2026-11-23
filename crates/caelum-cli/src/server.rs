@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_server(
     model_path: &str,
     host: &str,
@@ -20,6 +21,8 @@ pub fn run_server(
     threads: Option<usize>,
     max_ctx: Option<usize>,
     kv_precision: KvPrecision,
+    template_override: Option<&str>,
+    enable_repack: bool,
 ) -> Result<()> {
     let backend = CpuBackend::new(threads);
     println!("[Caelum Server] Loading GGUF via zero-copy mmap: {model_path}");
@@ -32,7 +35,15 @@ pub fn run_server(
         Tokenizer::from_gguf(&gguf)?
     };
     let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
-    let template = ChatTemplate::from_architecture(&arch);
+    if enable_repack {
+        model.optimize_for_backend(&backend);
+    }
+    let template = match template_override {
+        None | Some("auto") => ChatTemplate::from_gguf(&gguf),
+        Some(name) => ChatTemplate::from_name(name).ok_or_else(|| {
+            caelum_core::CaelumError::Runtime(format!("unknown --template '{name}'"))
+        })?,
+    };
 
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)?;

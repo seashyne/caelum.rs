@@ -253,7 +253,14 @@ impl Tokenizer {
         if let Some(tok) = self.vocab.get(id as usize) {
             matches!(
                 tok.as_str(),
-                "<|im_end|>" | "<|endoftext|>" | "<|eot_id|>" | "</s>" | "</assistant>"
+                "<|im_end|>"
+                    | "<|endoftext|>"
+                    | "<|eot_id|>"
+                    | "<|end_of_text|>"
+                    | "<|EOT|>"
+                    | "<｜end▁of▁sentence｜>"
+                    | "</s>"
+                    | "</assistant>"
             )
         } else {
             false

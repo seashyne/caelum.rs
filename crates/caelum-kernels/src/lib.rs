@@ -3,6 +3,7 @@
 
 pub mod cpu_caps;
 pub mod pool;
+pub mod repack;
 pub mod scalar;
 
 #[cfg(target_arch = "x86_64")]
@@ -17,6 +18,7 @@ use caelum_core::{
 };
 pub use cpu_caps::CpuCaps;
 pub use pool::ThreadPool;
+pub use repack::{PackedMatrix, PackedTiles};
 
 /// RoPE pairing convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +117,50 @@ pub trait Backend: Send + Sync {
 
     /// Dot product of two `f32` slices (used for attention scores).
     fn dot_f32(&self, a: &[f32], b: &[f32]) -> f32;
+
+    /// Repacks a `Q4_K`/`Q6_K` matrix into cache-aligned 8-row SIMD tiles when beneficial.
+    fn pack_matrix(&self, _w: &TensorView<'_>) -> Option<PackedMatrix> {
+        None
+    }
+
+    /// 8-row repacked GEMV (`Q4_K`/`Q6_K` × `Q8_K`) with zero horizontal reductions.
+    fn matvec_packed_q8k(
+        &self,
+        w: &PackedMatrix,
+        x_q8k: &[BlockQ8_K],
+        out: &mut [f32],
+    ) -> Result<()>;
+
+    /// 8×4 / 8×8 register-tiled repacked Prefill GEMM (`Q4_K`/`Q6_K` × `Q8_K`).
+    fn matmul_packed_q8k(
+        &self,
+        w: &PackedMatrix,
+        x_batch_q8k: &[BlockQ8_K],
+        batch: usize,
+        out_batch: &mut [f32],
+    ) -> Result<()>;
+
+    /// Fused single-barrier QKV projection over repacked `Q4_K`/`Q6_K` matrices.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_qkv_packed_q8k(
+        &self,
+        wq: &PackedMatrix,
+        wk: &PackedMatrix,
+        wv: &PackedMatrix,
+        x_q8k: &[BlockQ8_K],
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+    ) -> Result<()>;
+
+    /// Fused single-barrier Gate + Up + SwiGLU over repacked `Q4_K`/`Q6_K` matrices.
+    fn fused_gate_up_swiglu_packed_q8k(
+        &self,
+        w_gate: &PackedMatrix,
+        w_up: &PackedMatrix,
+        x_q8k: &[BlockQ8_K],
+        out_hb: &mut [f32],
+    ) -> Result<()>;
 }
 
 /// Primary Caelum CPU backend with runtime SIMD dispatch and persistent worker pool.
@@ -126,15 +172,7 @@ pub struct CpuBackend {
 impl CpuBackend {
     pub fn new(num_threads: Option<usize>) -> Self {
         let caps = CpuCaps::detect();
-        let default_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        // On hybrid CPUs, balance performance-core throughput without oversubscribing slow cores
-        #[cfg(target_arch = "x86_64")]
-        let auto_threads = default_threads.min(10).max(1);
-        #[cfg(not(target_arch = "x86_64"))]
-        let auto_threads = default_threads.min(8).max(1);
-        let threads = num_threads.unwrap_or(auto_threads);
+        let threads = num_threads.unwrap_or_else(pool::recommended_thread_count);
         Self {
             caps,
             pool: ThreadPool::new(threads),
@@ -165,6 +203,7 @@ impl CpuBackend {
             DType::Q4_1 => scalar::dot_q4_1_f32(row, x),
             DType::Q8_0 => scalar::dot_q8_0_f32(row, x),
             DType::Q4_K => scalar::dot_q4_k_f32(row, x),
+            DType::Q5_K => scalar::dot_q5_k_f32(row, x),
             DType::Q6_K => scalar::dot_q6_k_f32(row, x),
         }
     }
@@ -216,6 +255,17 @@ impl CpuBackend {
                 }
                 scalar::dot_q4_k_q8_k(row, x_q8k)
             }
+            DType::Q5_K => {
+                #[cfg(target_arch = "aarch64")]
+                if self.caps.dotprod {
+                    return unsafe { armv9::dot_q5_k_q8_k_dotprod(row, x_q8k) };
+                }
+                #[cfg(target_arch = "x86_64")]
+                if self.caps.avx2 {
+                    return unsafe { x86::dot_q5_k_q8_k_avx2(row, x_q8k) };
+                }
+                scalar::dot_q5_k_q8_k(row, x_q8k)
+            }
             DType::Q6_K => {
                 #[cfg(target_arch = "aarch64")]
                 if self.caps.dotprod {
@@ -256,7 +306,7 @@ impl Backend for CpuBackend {
             quantize_row_q8_0(x, &mut x_q8);
             return self.matvec_q8_act(w, x, &x_q8, out);
         }
-        if matches!(w.dtype, DType::Q4_K | DType::Q6_K) && cols % QK_K == 0 {
+        if matches!(w.dtype, DType::Q4_K | DType::Q5_K | DType::Q6_K) && cols % QK_K == 0 {
             let mut x_q8k = vec![BlockQ8_K::default(); cols / QK_K];
             quantize_row_q8_k(x, &mut x_q8k);
             return self.matvec_q8k_act(w, x, &x_q8k, out);
@@ -339,15 +389,27 @@ impl Backend for CpuBackend {
         let compute_chunk = |row_start: usize, chunk: &mut [f32]| {
             let mut i = 0usize;
             #[cfg(target_arch = "x86_64")]
-            if dtype == DType::Q4_K && self.caps.avx2 {
-                while i + 2 <= chunk.len() {
-                    let r = row_start + i;
-                    let row0 = &data[r * row_stride..(r + 1) * row_stride];
-                    let row1 = &data[(r + 1) * row_stride..(r + 2) * row_stride];
-                    let pair = unsafe { x86::dot_q4_k_q8_k_2row_avx2(row0, row1, x_q8k) };
-                    chunk[i] = pair[0];
-                    chunk[i + 1] = pair[1];
-                    i += 2;
+            if self.caps.avx2 {
+                if dtype == DType::Q4_K {
+                    while i + 2 <= chunk.len() {
+                        let r = row_start + i;
+                        let row0 = &data[r * row_stride..(r + 1) * row_stride];
+                        let row1 = &data[(r + 1) * row_stride..(r + 2) * row_stride];
+                        let pair = unsafe { x86::dot_q4_k_q8_k_2row_avx2(row0, row1, x_q8k) };
+                        chunk[i] = pair[0];
+                        chunk[i + 1] = pair[1];
+                        i += 2;
+                    }
+                } else if dtype == DType::Q6_K {
+                    while i + 2 <= chunk.len() {
+                        let r = row_start + i;
+                        let row0 = &data[r * row_stride..(r + 1) * row_stride];
+                        let row1 = &data[(r + 1) * row_stride..(r + 2) * row_stride];
+                        let pair = unsafe { x86::dot_q6_k_q8_k_2row_avx2(row0, row1, x_q8k) };
+                        chunk[i] = pair[0];
+                        chunk[i + 1] = pair[1];
+                        i += 2;
+                    }
                 }
             }
             while i < chunk.len() {
@@ -359,7 +421,20 @@ impl Backend for CpuBackend {
         };
 
         if rows >= 64 && self.pool.num_threads() > 1 {
-            self.pool.parallel_for_rows(out, compute_chunk);
+            if rows >= 1024 {
+                let out_addr = out.as_mut_ptr() as usize;
+                self.pool.parallel_for_dynamic(rows, 128, |start, end| {
+                    let slice = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out_addr as *mut f32).add(start),
+                            end - start,
+                        )
+                    };
+                    compute_chunk(start, slice);
+                });
+            } else {
+                self.pool.parallel_for_rows(out, compute_chunk);
+            }
         } else {
             compute_chunk(0, out);
         }
@@ -384,7 +459,7 @@ impl Backend for CpuBackend {
             });
         }
 
-        if matches!(w.dtype, DType::Q4_K | DType::Q6_K) && cols % QK_K == 0 {
+        if matches!(w.dtype, DType::Q4_K | DType::Q5_K | DType::Q6_K) && cols % QK_K == 0 {
             let nb = cols / QK_K;
             let mut x_q8k = vec![BlockQ8_K::default(); batch * nb];
             for t in 0..batch {
@@ -561,6 +636,26 @@ impl Backend for CpuBackend {
                                 }
                             }
                         }
+                        DType::Q5_K => {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                if self.caps.avx2 {
+                                    Some(unsafe { x86::dot_q5_k_q8_k_batch4_avx2(row, x0, x1, x2, x3) })
+                                } else {
+                                    None
+                                }
+                            }
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                if self.caps.dotprod {
+                                    Some(unsafe {
+                                        armv9::dot_q5_k_q8_k_batch4_dotprod(row, x0, x1, x2, x3)
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                        }
                         DType::Q6_K => {
                             #[cfg(target_arch = "x86_64")]
                             {
@@ -716,6 +811,238 @@ impl Backend for CpuBackend {
         }
         scalar::dot_f32(a, b)
     }
+
+    fn pack_matrix(&self, w: &TensorView<'_>) -> Option<PackedMatrix> {
+        PackedMatrix::try_pack(w, &self.caps, &self.pool)
+    }
+
+    fn matvec_packed_q8k(
+        &self,
+        w: &PackedMatrix,
+        x_q8k: &[BlockQ8_K],
+        out: &mut [f32],
+    ) -> Result<()> {
+        if x_q8k.len() != w.nb || out.len() != w.rows {
+            return Err(CaelumError::ShapeMismatch {
+                expected: format!("Packed=[{},{}], x_nb={}", w.rows, w.cols, w.nb),
+                actual: format!("x_nb={}, out={}", x_q8k.len(), out.len()),
+            });
+        }
+        let groups = w.num_groups();
+        let out_addr = out.as_mut_ptr() as usize;
+        let caps = &self.caps;
+
+        let work = |g_start: usize, g_end: usize| {
+            let out_ptr = out_addr as *mut f32;
+            for g in g_start..g_end {
+                let mut v8 = [0.0f32; 8];
+                w.compute_group_1tok(g, x_q8k, caps, &mut v8);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(v8.as_ptr(), out_ptr.add(g * 8), 8);
+                }
+            }
+        };
+
+        if groups >= 8 && self.pool.num_threads() > 1 {
+            let chunk = (groups / (self.pool.num_threads() * 4)).clamp(4, 32);
+            self.pool.parallel_for_dynamic(groups, chunk, work);
+        } else {
+            work(0, groups);
+        }
+        Ok(())
+    }
+
+    fn matmul_packed_q8k(
+        &self,
+        w: &PackedMatrix,
+        x_batch_q8k: &[BlockQ8_K],
+        batch: usize,
+        out_batch: &mut [f32],
+    ) -> Result<()> {
+        if batch == 1 {
+            return self.matvec_packed_q8k(w, x_batch_q8k, out_batch);
+        }
+        let rows = w.rows;
+        let nb = w.nb;
+        if x_batch_q8k.len() != batch * nb || out_batch.len() != batch * rows {
+            return Err(CaelumError::ShapeMismatch {
+                expected: format!("Packed=[{rows},{}], batch={batch}", w.cols),
+                actual: format!("x_q8k={}, out={}", x_batch_q8k.len(), out_batch.len()),
+            });
+        }
+
+        let groups = w.num_groups();
+        let out_addr = out_batch.as_mut_ptr() as usize;
+        let caps = &self.caps;
+        let is_q6k = matches!(w.tiles, PackedTiles::Q6Kx8(_));
+
+        let work = |g_start: usize, g_end: usize| {
+            let out_ptr = out_addr as *mut f32;
+            for g in g_start..g_end {
+                let r_base = g * 8;
+                let mut t = 0usize;
+
+                if is_q6k {
+                    while t + 8 <= batch {
+                        let xs = [
+                            &x_batch_q8k[t * nb..(t + 1) * nb],
+                            &x_batch_q8k[(t + 1) * nb..(t + 2) * nb],
+                            &x_batch_q8k[(t + 2) * nb..(t + 3) * nb],
+                            &x_batch_q8k[(t + 3) * nb..(t + 4) * nb],
+                            &x_batch_q8k[(t + 4) * nb..(t + 5) * nb],
+                            &x_batch_q8k[(t + 5) * nb..(t + 6) * nb],
+                            &x_batch_q8k[(t + 6) * nb..(t + 7) * nb],
+                            &x_batch_q8k[(t + 7) * nb..(t + 8) * nb],
+                        ];
+                        let mut tile_out = [[0.0f32; 8]; 8];
+                        w.compute_group_8tok_q6k(g, xs, caps, &mut tile_out);
+                        unsafe {
+                            for k in 0..8 {
+                                std::ptr::copy_nonoverlapping(
+                                    tile_out[k].as_ptr(),
+                                    out_ptr.add((t + k) * rows + r_base),
+                                    8,
+                                );
+                            }
+                        }
+                        t += 8;
+                    }
+                }
+
+                while t + 4 <= batch {
+                    let xs = [
+                        &x_batch_q8k[t * nb..(t + 1) * nb],
+                        &x_batch_q8k[(t + 1) * nb..(t + 2) * nb],
+                        &x_batch_q8k[(t + 2) * nb..(t + 3) * nb],
+                        &x_batch_q8k[(t + 3) * nb..(t + 4) * nb],
+                    ];
+                    let mut tile_out = [[0.0f32; 8]; 4];
+                    w.compute_group_4tok(g, xs, caps, &mut tile_out);
+                    unsafe {
+                        for k in 0..4 {
+                            std::ptr::copy_nonoverlapping(
+                                tile_out[k].as_ptr(),
+                                out_ptr.add((t + k) * rows + r_base),
+                                8,
+                            );
+                        }
+                    }
+                    t += 4;
+                }
+
+                while t < batch {
+                    let xt = &x_batch_q8k[t * nb..(t + 1) * nb];
+                    let mut v8 = [0.0f32; 8];
+                    w.compute_group_1tok(g, xt, caps, &mut v8);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(v8.as_ptr(), out_ptr.add(t * rows + r_base), 8);
+                    }
+                    t += 1;
+                }
+            }
+        };
+
+        if groups >= 4 && self.pool.num_threads() > 1 {
+            let chunk = (groups / (self.pool.num_threads() * 4)).clamp(2, 16);
+            self.pool.parallel_for_dynamic(groups, chunk, work);
+        } else {
+            work(0, groups);
+        }
+        Ok(())
+    }
+
+    fn fused_qkv_packed_q8k(
+        &self,
+        wq: &PackedMatrix,
+        wk: &PackedMatrix,
+        wv: &PackedMatrix,
+        x_q8k: &[BlockQ8_K],
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+    ) -> Result<()> {
+        let gq = wq.num_groups();
+        let gk = wk.num_groups();
+        let gv = wv.num_groups();
+        let total = gq + gk + gv;
+        let q_addr = q.as_mut_ptr() as usize;
+        let k_addr = k.as_mut_ptr() as usize;
+        let v_addr = v.as_mut_ptr() as usize;
+        let caps = &self.caps;
+
+        let work = |start: usize, end: usize| {
+            let q_ptr = q_addr as *mut f32;
+            let k_ptr = k_addr as *mut f32;
+            let v_ptr = v_addr as *mut f32;
+            for idx in start..end {
+                let mut v8 = [0.0f32; 8];
+                if idx < gq {
+                    wq.compute_group_1tok(idx, x_q8k, caps, &mut v8);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(v8.as_ptr(), q_ptr.add(idx * 8), 8);
+                    }
+                } else if idx < gq + gk {
+                    let kg = idx - gq;
+                    wk.compute_group_1tok(kg, x_q8k, caps, &mut v8);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(v8.as_ptr(), k_ptr.add(kg * 8), 8);
+                    }
+                } else {
+                    let vg = idx - gq - gk;
+                    wv.compute_group_1tok(vg, x_q8k, caps, &mut v8);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(v8.as_ptr(), v_ptr.add(vg * 8), 8);
+                    }
+                }
+            }
+        };
+
+        if total >= 8 && self.pool.num_threads() > 1 {
+            let chunk = (total / (self.pool.num_threads() * 4)).clamp(4, 24);
+            self.pool.parallel_for_dynamic(total, chunk, work);
+        } else {
+            work(0, total);
+        }
+        Ok(())
+    }
+
+    fn fused_gate_up_swiglu_packed_q8k(
+        &self,
+        w_gate: &PackedMatrix,
+        w_up: &PackedMatrix,
+        x_q8k: &[BlockQ8_K],
+        out_hb: &mut [f32],
+    ) -> Result<()> {
+        let groups = w_gate.num_groups();
+        let out_addr = out_hb.as_mut_ptr() as usize;
+        let caps = &self.caps;
+
+        let work = |g_start: usize, g_end: usize| {
+            let out_ptr = out_addr as *mut f32;
+            for g in g_start..g_end {
+                let mut g8 = [0.0f32; 8];
+                let mut u8 = [0.0f32; 8];
+                w_gate.compute_group_1tok(g, x_q8k, caps, &mut g8);
+                w_up.compute_group_1tok(g, x_q8k, caps, &mut u8);
+                for i in 0..8 {
+                    let gv = g8[i];
+                    let silu = gv / (1.0 + (-gv).exp());
+                    g8[i] = silu * u8[i];
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(g8.as_ptr(), out_ptr.add(g * 8), 8);
+                }
+            }
+        };
+
+        if groups >= 8 && self.pool.num_threads() > 1 {
+            let chunk = (groups / (self.pool.num_threads() * 4)).clamp(4, 32);
+            self.pool.parallel_for_dynamic(groups, chunk, work);
+        } else {
+            work(0, groups);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -861,6 +1188,103 @@ mod tests {
                 assert!(
                     (out_batch_q6k[t * rows + r] - ref6[r]).abs() < 1e-3,
                     "Q6_K matmul mismatch at t={t}, r={r}"
+                );
+            }
+        }
+
+        // Verify Q5_K SIMD & batched matmul parity against scalar reference
+        let mut raw_q5k = vec![0u8; rows * 2 * 176];
+        for (i, b) in raw_q5k.iter_mut().enumerate() {
+            *b = ((i * 41 + 19) & 0xFF) as u8;
+        }
+        for blk in 0..(rows * 2) {
+            let off = blk * 176;
+            raw_q5k[off..off + 2].copy_from_slice(&f32_to_f16(0.04).to_le_bytes());
+            raw_q5k[off + 2..off + 4].copy_from_slice(&f32_to_f16(0.015).to_le_bytes());
+        }
+        let buf_q5k = TensorBuf::from_raw(raw_q5k, vec![rows, cols], DType::Q5_K).unwrap();
+        let mut out_q5k = vec![0.0f32; rows];
+        backend.matvec(&buf_q5k.as_view(), &x, &mut out_q5k).unwrap();
+        for r in 0..rows {
+            let expected = scalar::dot_q5_k_q8_k(buf_q5k.as_view().row_bytes(r), &x_q8k);
+            assert!(
+                (out_q5k[r] - expected).abs() < 1e-3,
+                "Q5_K SIMD mismatch at row {r}: simd={}, scalar={expected}",
+                out_q5k[r]
+            );
+        }
+        let mut out_batch_q5k = vec![0.0f32; batch * rows];
+        backend
+            .matmul(&buf_q5k.as_view(), &x_batch, batch, &mut out_batch_q5k)
+            .unwrap();
+        for t in 0..batch {
+            let xt = &x_batch[t * cols..(t + 1) * cols];
+            let mut ref5 = vec![0.0f32; rows];
+            backend.matvec(&buf_q5k.as_view(), xt, &mut ref5).unwrap();
+            for r in 0..rows {
+                assert!(
+                    (out_batch_q5k[t * rows + r] - ref5[r]).abs() < 1e-3,
+                    "Q5_K matmul mismatch at t={t}, r={r}"
+                );
+            }
+        }
+
+        // Verify PackedMatrix (TileQ4Kx8 & TileQ6Kx8) AVX-VNNI/AVX2 matvec, matmul & fused ops
+        let nb = cols / QK_K;
+        let mut x_batch_q8k = vec![BlockQ8_K::default(); batch * nb];
+        for t in 0..batch {
+            quantize_row_q8_k(
+                &x_batch[t * cols..(t + 1) * cols],
+                &mut x_batch_q8k[t * nb..(t + 1) * nb],
+            );
+        }
+
+        if let Some(packed4) = backend.pack_matrix(&buf_q4k.as_view()) {
+            let mut p_out = vec![0.0f32; rows];
+            backend.matvec_packed_q8k(&packed4, &x_q8k, &mut p_out).unwrap();
+            for r in 0..rows {
+                assert!(
+                    (p_out[r] - out_q4k[r]).abs() < 2e-3,
+                    "Packed Q4_K matvec mismatch at r={r}: packed={}, raw={}",
+                    p_out[r],
+                    out_q4k[r]
+                );
+            }
+            let mut pb_out = vec![0.0f32; batch * rows];
+            backend
+                .matmul_packed_q8k(&packed4, &x_batch_q8k, batch, &mut pb_out)
+                .unwrap();
+            for idx in 0..batch * rows {
+                assert!(
+                    (pb_out[idx] - out_batch_q4k[idx]).abs() < 2e-3,
+                    "Packed Q4_K matmul mismatch at idx={idx}: packed={}, raw={}",
+                    pb_out[idx],
+                    out_batch_q4k[idx]
+                );
+            }
+        }
+
+        if let Some(packed6) = backend.pack_matrix(&buf_q6k.as_view()) {
+            let mut p_out = vec![0.0f32; rows];
+            backend.matvec_packed_q8k(&packed6, &x_q8k, &mut p_out).unwrap();
+            for r in 0..rows {
+                assert!(
+                    (p_out[r] - out_q6k[r]).abs() < 2e-3,
+                    "Packed Q6_K matvec mismatch at r={r}: packed={}, raw={}",
+                    p_out[r],
+                    out_q6k[r]
+                );
+            }
+            let mut pb_out = vec![0.0f32; batch * rows];
+            backend
+                .matmul_packed_q8k(&packed6, &x_batch_q8k, batch, &mut pb_out)
+                .unwrap();
+            for idx in 0..batch * rows {
+                assert!(
+                    (pb_out[idx] - out_batch_q6k[idx]).abs() < 2e-3,
+                    "Packed Q6_K matmul mismatch at idx={idx}: packed={}, raw={}",
+                    pb_out[idx],
+                    out_batch_q6k[idx]
                 );
             }
         }

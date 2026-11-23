@@ -39,9 +39,12 @@ OPTIONS:
   --top-p <FLOAT>         Top-P nucleus sampling cutoff (default: 0.9)
   --ctx <N>               Max KV context length (default: model min 4096)
   --kv-q8                 Use 8-bit Q8_0 quantized KV cache (3.76× less RAM)
-  --threads <N>           Worker thread count (default: auto P-core heuristic)
+  --threads <N>           Worker thread count (default: auto P-core pinning)
+  --template <NAME>       Chat template: auto, chatml, qwen3-nothink, llama3,
+                          deepseek2, deepseek-v1, mistral, celestia, raw
+  --no-repack             Disable online 8-row SIMD weight repacking
   --json                  Enable strict JSON Grammar Constrained Decoding
-  --raw                   Disable chat template wrapping
+  --raw                   Disable chat template wrapping (alias for --template raw)
 "#,
         env!("CARGO_PKG_VERSION")
     );
@@ -95,12 +98,26 @@ fn cmd_info() -> Result<()> {
     println!("============================================================");
     println!("  Version:       v{}", env!("CARGO_PKG_VERSION"));
     println!("  Hardware:      {caps}");
-    println!("  Default Pool:  {} threads", backend.num_threads());
-    println!("  Quantization:  F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q4_K, Q6_K");
-    println!("  Architectures: llama, qwen2/qwen2.5, mistral, celestia (MLA + DeepSeekMoE)");
-    println!("  ARMv9 Ready:   NEON FMA + DotProd SDOT + I8MM SMMLA (2x2 GEMM) + Q8_0/MLA KV Cache");
+    println!("  Default Pool:  {} threads (P-core pinned)", backend.num_threads());
+    println!("  Quantization:  F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K");
+    println!("  Architectures: llama, qwen2/2.5, qwen2moe, qwen3, qwen3moe, deepseek2 (MLA+MoE), mistral, celestia");
+    println!("  Accelerators:  x86 AVX-VNNI/AVX2+FMA+F16C (8x4/8x8 Repacked) | ARMv9 NEON+DotProd+I8MM SMMLA");
     println!("============================================================");
     Ok(())
+}
+
+fn resolve_template(gguf: &GgufFile, override_name: Option<&str>, raw_mode: bool) -> Result<ChatTemplate> {
+    if raw_mode {
+        return Ok(ChatTemplate::Raw);
+    }
+    match override_name {
+        None | Some("auto") => Ok(ChatTemplate::from_gguf(gguf)),
+        Some(name) => ChatTemplate::from_name(name).ok_or_else(|| {
+            caelum_core::CaelumError::Runtime(format!(
+                "unknown --template '{name}' (expected: auto, chatml, qwen3-nothink, llama3, deepseek2, deepseek-v1, mistral, celestia, raw)"
+            ))
+        }),
+    }
 }
 
 fn cmd_inspect(path: &str) -> Result<()> {
@@ -122,6 +139,7 @@ fn cmd_inspect(path: &str) -> Result<()> {
     println!("  Size:          {:.2} MB", gguf.file_size() as f64 / (1024.0 * 1024.0));
     println!("  GGUF Version:  v{}", gguf.version);
     println!("  Architecture:  {}", gguf.architecture().unwrap_or("unknown"));
+    println!("  Chat Template: {}", ChatTemplate::from_gguf(&gguf).name());
     println!("  Parameters:    {:.2}M", gguf.total_parameters() as f64 / 1e6);
     println!("  Tensors:       {}", gguf.tensors.len());
     println!("  Metadata KVs:  {}", gguf.metadata.len());
@@ -166,6 +184,8 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let mut kv_precision = KvPrecision::F32;
     let mut constrain_json = false;
     let mut raw_mode = false;
+    let mut template_override: Option<String> = None;
+    let mut enable_repack = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -213,6 +233,11 @@ fn cmd_run(args: &[String]) -> Result<()> {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--template" => {
+                i += 1;
+                template_override = args.get(i).cloned();
+            }
+            "--no-repack" => enable_repack = false,
             "--json" => constrain_json = true,
             "--raw" => raw_mode = true,
             _ => {}
@@ -231,23 +256,28 @@ fn cmd_run(args: &[String]) -> Result<()> {
         Tokenizer::from_gguf(&gguf)?
     };
     let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
+    if enable_repack {
+        model.optimize_for_backend(&backend);
+    }
+    let template = resolve_template(&gguf, template_override.as_deref(), raw_mode)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!(
-        "[Caelum] Loaded {} ({:.1}M params) in {:.1}ms | {} | {} threads | KV {} ({:.1} MB)",
+        "[Caelum] Loaded {} ({:.1}M params) in {:.1}ms | {} | {} threads | tmpl={} | packed={:.0}MB | KV {} ({:.1} MB)",
         arch,
         gguf.total_parameters() as f64 / 1e6,
         load_ms,
         backend.name(),
         backend.num_threads(),
+        template.name(),
+        model.packed_bytes() as f64 / (1024.0 * 1024.0),
         model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0),
     );
 
-    let full_prompt = if raw_mode {
+    let full_prompt = if matches!(template, ChatTemplate::Raw) {
         prompt
     } else {
-        let template = ChatTemplate::from_architecture(&arch);
         let mut msgs = Vec::new();
         if let Some(sys) = system {
             msgs.push(ChatMessage {
@@ -308,6 +338,8 @@ fn cmd_chat(args: &[String]) -> Result<()> {
     let mut max_ctx: Option<usize> = Some(4096);
     let mut threads: Option<usize> = None;
     let mut kv_precision = KvPrecision::Q8_0; // Default Q8_0 for interactive long-context chat
+    let mut template_override: Option<String> = None;
+    let mut enable_repack = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -338,6 +370,11 @@ fn cmd_chat(args: &[String]) -> Result<()> {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--template" => {
+                i += 1;
+                template_override = args.get(i).cloned();
+            }
+            "--no-repack" => enable_repack = false,
             _ => {}
         }
         i += 1;
@@ -348,7 +385,10 @@ fn cmd_chat(args: &[String]) -> Result<()> {
     let arch = gguf.architecture().unwrap_or("llama").to_string();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
-    let template = ChatTemplate::from_architecture(&arch);
+    if enable_repack {
+        model.optimize_for_backend(&backend);
+    }
+    let template = resolve_template(&gguf, template_override.as_deref(), false)?;
 
     println!("============================================================");
     println!("  CAELUM INTERACTIVE CHAT (Prefix Caching ON)");
@@ -445,6 +485,8 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     let mut temp = 0.2f32;
     let mut threads: Option<usize> = None;
     let mut kv_precision = KvPrecision::F32;
+    let mut template_override: Option<String> = None;
+    let mut enable_repack = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -478,6 +520,11 @@ fn cmd_propose(args: &[String]) -> Result<()> {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--template" => {
+                i += 1;
+                template_override = args.get(i).cloned();
+            }
+            "--no-repack" => enable_repack = false,
             _ => {}
         }
         i += 1;
@@ -485,10 +532,12 @@ fn cmd_propose(args: &[String]) -> Result<()> {
 
     let backend = CpuBackend::new(threads);
     let gguf = GgufFile::open(model_path)?;
-    let arch = gguf.architecture().unwrap_or("llama").to_string();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let mut model = CaelumModel::from_gguf_with_kv(&gguf, Some(2048), kv_precision)?;
-    let template = ChatTemplate::from_architecture(&arch);
+    if enable_repack {
+        model.optimize_for_backend(&backend);
+    }
+    let template = resolve_template(&gguf, template_override.as_deref(), false)?;
 
     let sys = lenout::build_lenout_system_prompt(&mode, "req_caelum_cli", "fp_caelum_cli");
     let formatted = template.format(
@@ -551,6 +600,8 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let mut threads: Option<usize> = None;
     let mut max_ctx: Option<usize> = None;
     let mut kv_precision = KvPrecision::F32;
+    let mut template_override: Option<String> = None;
+    let mut enable_repack = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -576,12 +627,26 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                 max_ctx = args.get(i).and_then(|v| v.parse().ok());
             }
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--template" => {
+                i += 1;
+                template_override = args.get(i).cloned();
+            }
+            "--no-repack" => enable_repack = false,
             _ => {}
         }
         i += 1;
     }
 
-    server::run_server(model_path, &host, port, threads, max_ctx, kv_precision)
+    server::run_server(
+        model_path,
+        &host,
+        port,
+        threads,
+        max_ctx,
+        kv_precision,
+        template_override.as_deref(),
+        enable_repack,
+    )
 }
 
 fn cmd_bench(args: &[String]) -> Result<()> {

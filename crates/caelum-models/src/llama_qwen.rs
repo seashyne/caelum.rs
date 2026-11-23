@@ -1,20 +1,28 @@
-//! Unified Llama / Qwen2 / Qwen2.5 / Mistral GGUF Transformer runtime.
+//! Unified Llama / Qwen2 / Qwen2.5 / Qwen2MoE / Qwen3 / Qwen3MoE / Mistral GGUF runtime.
 //!
-//! Supports:
-//! - Zero-copy `mmap` weights (`F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q8_0`, `Q4_K`, `Q6_K`)
-//! - Grouped Query Attention (GQA)
-//! - Exact `Normal` (Llama) and `NeoX` (Qwen2/Qwen2.5) RoPE with position offset
-//! - Optional QKV biases (Qwen2 / Qwen2.5)
-//! - Tied or untied `output.weight` (`lm_head`)
-//! - Zero-allocation decode hot path with pre-allocated scratch buffers
+//! Features:
+//! - Zero-copy `mmap` weights (`F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`)
+//! - Online 8-row cache-aligned weight repacking (`TileQ4Kx8`, `TileQ6Kx8`) with AVX-VNNI `vpdpbusd`
+//! - Single-barrier Fused QKV and Fused Gate+Up+SwiGLU decode hot path (zero heap allocations)
+//! - 256-token Batched Prefill GEMM (`8×4` / `8×8` micro-tiles, reading weights ONCE per chunk)
+//! - Grouped Query Attention (GQA) + Qwen3 per-head QK-Norm + YaRN/Linear/Normal/NeoX RoPE
+//! - Sparse Mixture-of-Experts (`qwen3moe` / `qwen2moe`) via shared `moe` engine
+//! - `F32` and `Q8_0` quantized KV cache
 
 use crate::cache::{KvCache, KvPrecision};
+use crate::moe::{forward_moe_token, ExpertGating, MoeConfig, MoeLayerWeights, MoeScratch};
+use crate::rope::{RopeConfig, RopeTable};
 use caelum_core::{
     quantize_row_q8_0, quantize_row_q8_k, BlockQ8_0, BlockQ8_K, DType, Result, TensorView, QK8_0,
     QK_K,
 };
 use caelum_gguf::GgufFile;
-use caelum_kernels::{Backend, RopeStyle};
+use caelum_kernels::{Backend, PackedMatrix};
+
+#[inline]
+fn is_k_quant(dt: DType) -> bool {
+    matches!(dt, DType::Q4_K | DType::Q5_K | DType::Q6_K)
+}
 
 #[derive(Debug, Clone)]
 pub struct LlamaQwenConfig {
@@ -26,11 +34,10 @@ pub struct LlamaQwenConfig {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
-    pub rope_dim: usize,
-    pub rope_theta: f32,
-    pub rope_style: RopeStyle,
+    pub rope: RopeConfig,
     pub rms_norm_eps: f32,
     pub max_seq_len: usize,
+    pub moe: Option<MoeConfig>,
 }
 
 impl LlamaQwenConfig {
@@ -40,7 +47,6 @@ impl LlamaQwenConfig {
 
         let hidden_size = gguf.require_usize(&format!("{p}.embedding_length"))?;
         let num_layers = gguf.require_usize(&format!("{p}.block_count"))?;
-        let intermediate_size = gguf.require_usize(&format!("{p}.feed_forward_length"))?;
         let num_heads = gguf.require_usize(&format!("{p}.attention.head_count"))?;
         let num_kv_heads = gguf
             .get_meta(&format!("{p}.attention.head_count_kv"))
@@ -50,14 +56,6 @@ impl LlamaQwenConfig {
             .get_meta(&format!("{p}.attention.key_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(hidden_size / num_heads);
-        let rope_dim = gguf
-            .get_meta(&format!("{p}.rope.dimension_count"))
-            .and_then(|v| v.as_usize())
-            .unwrap_or(head_dim);
-        let rope_theta = gguf
-            .get_meta(&format!("{p}.rope.freq_base"))
-            .and_then(|v| v.as_f32())
-            .unwrap_or_else(|| if arch.starts_with("qwen") { 1_000_000.0 } else { 10_000.0 });
         let rms_norm_eps = gguf
             .get_meta(&format!("{p}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
@@ -68,14 +66,67 @@ impl LlamaQwenConfig {
             .unwrap_or(4096);
         let max_seq_len = max_seq_override.unwrap_or(ctx_len.min(4096));
 
+        let rope = RopeConfig::from_gguf(gguf, &arch, head_dim, ctx_len);
+
+        let num_experts = gguf
+            .get_meta(&format!("{p}.expert_count"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+        let intermediate_meta = gguf
+            .get_meta(&format!("{p}.feed_forward_length"))
+            .and_then(|v| v.as_usize());
+
+        let (intermediate_size, moe) = if num_experts > 0 {
+            let num_active = gguf
+                .get_meta(&format!("{p}.expert_used_count"))
+                .and_then(|v| v.as_usize())
+                .unwrap_or(2);
+            let expert_ffn_dim = gguf
+                .get_meta(&format!("{p}.expert_feed_forward_length"))
+                .and_then(|v| v.as_usize())
+                .unwrap_or_else(|| {
+                    intermediate_meta.unwrap_or(hidden_size) / num_active.max(1)
+                });
+            let shared_ffn_dim = gguf
+                .get_meta(&format!("{p}.expert_shared_feed_forward_length"))
+                .and_then(|v| v.as_usize())
+                .unwrap_or(expert_ffn_dim);
+            let norm_weights = gguf
+                .get_meta(&format!("{p}.expert_weights_norm"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(arch == "qwen3moe");
+            let weights_scale = gguf
+                .get_meta(&format!("{p}.expert_weights_scale"))
+                .and_then(|v| v.as_f32())
+                .unwrap_or(1.0);
+            let gating = match gguf
+                .get_meta(&format!("{p}.expert_gating_func"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+            {
+                2 => ExpertGating::Sigmoid,
+                _ => ExpertGating::Softmax,
+            };
+            let ffn = intermediate_meta.unwrap_or(expert_ffn_dim);
+            (
+                ffn,
+                Some(MoeConfig {
+                    num_experts,
+                    num_active_experts: num_active,
+                    expert_ffn_dim,
+                    shared_ffn_dim,
+                    gating,
+                    norm_weights,
+                    weights_scale,
+                }),
+            )
+        } else {
+            let ffn = gguf.require_usize(&format!("{p}.feed_forward_length"))?;
+            (ffn, None)
+        };
+
         let embd = gguf.tensor("token_embd.weight")?;
         let (vocab_size, _) = embd.dims_2d()?;
-
-        let rope_style = if arch.starts_with("qwen") {
-            RopeStyle::NeoX
-        } else {
-            RopeStyle::Normal
-        };
 
         Ok(Self {
             arch,
@@ -86,13 +137,24 @@ impl LlamaQwenConfig {
             num_heads,
             num_kv_heads,
             head_dim,
-            rope_dim,
-            rope_theta,
-            rope_style,
+            rope,
             rms_norm_eps,
             max_seq_len,
+            moe,
         })
     }
+}
+
+enum FfnBlock<'a> {
+    Dense {
+        w_gate: TensorView<'a>,
+        w_up: TensorView<'a>,
+        w_down: TensorView<'a>,
+        p_gate: Option<PackedMatrix>,
+        p_up: Option<PackedMatrix>,
+        p_down: Option<PackedMatrix>,
+    },
+    Moe(MoeLayerWeights<'a>),
 }
 
 struct LayerWeights<'a> {
@@ -101,13 +163,18 @@ struct LayerWeights<'a> {
     wk: TensorView<'a>,
     wv: TensorView<'a>,
     wo: TensorView<'a>,
+    p_wq: Option<PackedMatrix>,
+    p_wk: Option<PackedMatrix>,
+    p_wv: Option<PackedMatrix>,
+    p_wo: Option<PackedMatrix>,
     bq: Option<Vec<f32>>,
     bk: Option<Vec<f32>>,
     bv: Option<Vec<f32>>,
+    /// Per-head QK-Norm weights (`Qwen3` / `Qwen3MoE`, applied before RoPE).
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
-    w_gate: TensorView<'a>,
-    w_up: TensorView<'a>,
-    w_down: TensorView<'a>,
+    ffn: FfnBlock<'a>,
 }
 
 struct ScratchBuf {
@@ -117,20 +184,28 @@ struct ScratchBuf {
     q: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
+    head_tmp: Vec<f32>,
     att: Vec<f32>,
     hb: Vec<f32>,
     hb2: Vec<f32>,
     logits: Vec<f32>,
     xq8: Vec<BlockQ8_0>,
+    woq8: Vec<BlockQ8_0>,
     hbq8: Vec<BlockQ8_0>,
     xq8k: Vec<BlockQ8_K>,
+    woq8k: Vec<BlockQ8_K>,
     hbq8k: Vec<BlockQ8_K>,
+    moe: Option<MoeScratch>,
 }
 
 impl ScratchBuf {
     fn new(cfg: &LlamaQwenConfig) -> Self {
         let q_dim = cfg.num_heads * cfg.head_dim;
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
+        let moe = cfg
+            .moe
+            .as_ref()
+            .map(|m| MoeScratch::new(cfg.hidden_size, m));
         Self {
             x: vec![0.0; cfg.hidden_size],
             xb: vec![0.0; cfg.hidden_size],
@@ -138,78 +213,18 @@ impl ScratchBuf {
             q: vec![0.0; q_dim],
             k: vec![0.0; kv_dim],
             v: vec![0.0; kv_dim],
+            head_tmp: vec![0.0; cfg.head_dim],
             att: vec![0.0; cfg.max_seq_len],
             hb: vec![0.0; cfg.intermediate_size],
             hb2: vec![0.0; cfg.intermediate_size],
             logits: vec![0.0; cfg.vocab_size],
             xq8: vec![BlockQ8_0 { d: 0, qs: [0; 32] }; (cfg.hidden_size / QK8_0).max(1)],
+            woq8: vec![BlockQ8_0 { d: 0, qs: [0; 32] }; (q_dim / QK8_0).max(1)],
             hbq8: vec![BlockQ8_0 { d: 0, qs: [0; 32] }; (cfg.intermediate_size / QK8_0).max(1)],
             xq8k: vec![BlockQ8_K::default(); (cfg.hidden_size / QK_K).max(1)],
+            woq8k: vec![BlockQ8_K::default(); (q_dim / QK_K).max(1)],
             hbq8k: vec![BlockQ8_K::default(); (cfg.intermediate_size / QK_K).max(1)],
-        }
-    }
-}
-
-struct RopeTable {
-    half_dim: usize,
-    style: RopeStyle,
-    cos: Vec<f32>,
-    sin: Vec<f32>,
-}
-
-impl RopeTable {
-    fn new(max_seq_len: usize, rope_dim: usize, theta: f32, style: RopeStyle) -> Self {
-        let half_dim = rope_dim / 2;
-        let mut freqs = Vec::with_capacity(half_dim);
-        for i in 0..half_dim {
-            freqs.push(1.0 / theta.powf((2 * i) as f32 / rope_dim as f32));
-        }
-        let mut cos = vec![0.0f32; max_seq_len * half_dim];
-        let mut sin = vec![0.0f32; max_seq_len * half_dim];
-        for pos in 0..max_seq_len {
-            let p = pos as f32;
-            let row = pos * half_dim;
-            for i in 0..half_dim {
-                let (s, c) = (p * freqs[i]).sin_cos();
-                cos[row + i] = c;
-                sin[row + i] = s;
-            }
-        }
-        Self {
-            half_dim,
-            style,
-            cos,
-            sin,
-        }
-    }
-
-    #[inline]
-    fn apply(&self, vec: &mut [f32], pos: usize) {
-        let half = self.half_dim;
-        let row = pos * half;
-        let cs = &self.cos[row..row + half];
-        let sn = &self.sin[row..row + half];
-        match self.style {
-            RopeStyle::Normal => {
-                for i in 0..half {
-                    let c = cs[i];
-                    let s = sn[i];
-                    let x0 = vec[2 * i];
-                    let x1 = vec[2 * i + 1];
-                    vec[2 * i] = x0 * c - x1 * s;
-                    vec[2 * i + 1] = x0 * s + x1 * c;
-                }
-            }
-            RopeStyle::NeoX => {
-                for i in 0..half {
-                    let c = cs[i];
-                    let s = sn[i];
-                    let x0 = vec[i];
-                    let x1 = vec[i + half];
-                    vec[i] = x0 * c - x1 * s;
-                    vec[i + half] = x0 * s + x1 * c;
-                }
-            }
+            moe,
         }
     }
 }
@@ -223,6 +238,7 @@ pub struct LlamaQwenModel<'a> {
     rope: RopeTable,
     cache: KvCache,
     scratch: ScratchBuf,
+    packed_bytes: usize,
 }
 
 impl<'a> LlamaQwenModel<'a> {
@@ -241,26 +257,36 @@ impl<'a> LlamaQwenModel<'a> {
         let output_weight = if gguf.has_tensor("output.weight") {
             gguf.tensor("output.weight")?
         } else {
-            // Tied word embeddings (common in Qwen2.5-0.5B/1.5B, Llama 3.2 1B)
             token_embd
         };
 
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let bq = if gguf.has_tensor(&format!("blk.{i}.attn_q.bias")) {
-                Some(gguf.tensor(&format!("blk.{i}.attn_q.bias"))?.to_f32_vec()?)
-            } else {
-                None
+            let opt_vec = |name: String| -> Result<Option<Vec<f32>>> {
+                if gguf.has_tensor(&name) {
+                    Ok(Some(gguf.tensor(&name)?.to_f32_vec()?))
+                } else {
+                    Ok(None)
+                }
             };
-            let bk = if gguf.has_tensor(&format!("blk.{i}.attn_k.bias")) {
-                Some(gguf.tensor(&format!("blk.{i}.attn_k.bias"))?.to_f32_vec()?)
+
+            let bq = opt_vec(format!("blk.{i}.attn_q.bias"))?;
+            let bk = opt_vec(format!("blk.{i}.attn_k.bias"))?;
+            let bv = opt_vec(format!("blk.{i}.attn_v.bias"))?;
+            let q_norm = opt_vec(format!("blk.{i}.attn_q_norm.weight"))?;
+            let k_norm = opt_vec(format!("blk.{i}.attn_k_norm.weight"))?;
+
+            let ffn = if gguf.has_tensor(&format!("blk.{i}.ffn_gate_exps.weight")) {
+                FfnBlock::Moe(MoeLayerWeights::from_gguf(gguf, i)?)
             } else {
-                None
-            };
-            let bv = if gguf.has_tensor(&format!("blk.{i}.attn_v.bias")) {
-                Some(gguf.tensor(&format!("blk.{i}.attn_v.bias"))?.to_f32_vec()?)
-            } else {
-                None
+                FfnBlock::Dense {
+                    w_gate: gguf.tensor(&format!("blk.{i}.ffn_gate.weight"))?,
+                    w_up: gguf.tensor(&format!("blk.{i}.ffn_up.weight"))?,
+                    w_down: gguf.tensor(&format!("blk.{i}.ffn_down.weight"))?,
+                    p_gate: None,
+                    p_up: None,
+                    p_down: None,
+                }
             };
 
             layers.push(LayerWeights {
@@ -269,13 +295,17 @@ impl<'a> LlamaQwenModel<'a> {
                 wk: gguf.tensor(&format!("blk.{i}.attn_k.weight"))?,
                 wv: gguf.tensor(&format!("blk.{i}.attn_v.weight"))?,
                 wo: gguf.tensor(&format!("blk.{i}.attn_output.weight"))?,
+                p_wq: None,
+                p_wk: None,
+                p_wv: None,
+                p_wo: None,
                 bq,
                 bk,
                 bv,
+                q_norm,
+                k_norm,
                 ffn_norm: gguf.tensor(&format!("blk.{i}.ffn_norm.weight"))?.to_f32_vec()?,
-                w_gate: gguf.tensor(&format!("blk.{i}.ffn_gate.weight"))?,
-                w_up: gguf.tensor(&format!("blk.{i}.ffn_up.weight"))?,
-                w_down: gguf.tensor(&format!("blk.{i}.ffn_down.weight"))?,
+                ffn,
             });
         }
 
@@ -286,12 +316,7 @@ impl<'a> LlamaQwenModel<'a> {
             config.head_dim,
             kv_precision,
         );
-        let rope = RopeTable::new(
-            config.max_seq_len,
-            config.rope_dim,
-            config.rope_theta,
-            config.rope_style,
-        );
+        let rope = RopeTable::new(config.max_seq_len, &config.rope);
         let scratch = ScratchBuf::new(&config);
 
         Ok(Self {
@@ -303,7 +328,57 @@ impl<'a> LlamaQwenModel<'a> {
             rope,
             cache,
             scratch,
+            packed_bytes: 0,
         })
+    }
+
+    /// Repacks `Q4_K` and `Q6_K` layer projection matrices into cache-aligned 8-row SIMD tiles
+    /// (`TileQ4Kx8` / `TileQ6Kx8`) for AVX-VNNI / AVX2+FMA fused decode & tiled prefill GEMM.
+    pub fn optimize_for_backend(&mut self, backend: &dyn Backend) {
+        let mut total_bytes = 0usize;
+        for layer in &mut self.layers {
+            layer.p_wq = backend.pack_matrix(&layer.wq);
+            layer.p_wk = backend.pack_matrix(&layer.wk);
+            layer.p_wv = backend.pack_matrix(&layer.wv);
+            layer.p_wo = backend.pack_matrix(&layer.wo);
+            for p in [&layer.p_wq, &layer.p_wk, &layer.p_wv, &layer.p_wo]
+                .into_iter()
+                .flatten()
+            {
+                total_bytes += p.byte_size();
+            }
+            match &mut layer.ffn {
+                FfnBlock::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                    p_gate,
+                    p_up,
+                    p_down,
+                } => {
+                    *p_gate = backend.pack_matrix(w_gate);
+                    *p_up = backend.pack_matrix(w_up);
+                    *p_down = backend.pack_matrix(w_down);
+                    for p in [p_gate, p_up, p_down].into_iter().flatten() {
+                        total_bytes += p.byte_size();
+                    }
+                }
+                FfnBlock::Moe(m) => {
+                    m.optimize_for_backend(backend);
+                    for p in [&m.p_shexp_gate, &m.p_shexp_up, &m.p_shexp_down]
+                        .into_iter()
+                        .flatten()
+                    {
+                        total_bytes += p.byte_size();
+                    }
+                }
+            }
+        }
+        self.packed_bytes = total_bytes;
+    }
+
+    pub fn packed_bytes(&self) -> usize {
+        self.packed_bytes
     }
 
     pub fn max_seq_len(&self) -> usize {
@@ -323,7 +398,7 @@ impl<'a> LlamaQwenModel<'a> {
     }
 
     /// Runs one autoregressive step for `token_id` at sequence position `pos`.
-    /// When `compute_logits` is `false`, skips the expensive `lm_head` projection.
+    /// Zero heap allocations in the decode hot path.
     pub fn forward_token(
         &mut self,
         backend: &dyn Backend,
@@ -333,11 +408,14 @@ impl<'a> LlamaQwenModel<'a> {
     ) -> Result<&[f32]> {
         let cfg = &self.config;
         let head_dim = cfg.head_dim;
+        let q_dim = cfg.num_heads * head_dim;
         let kv_mul = cfg.num_heads / cfg.num_kv_heads;
         let inv_sqrt_hd = 1.0 / (head_dim as f32).sqrt();
         let can_q8_h = cfg.hidden_size % QK8_0 == 0;
+        let can_q8_q = q_dim % QK8_0 == 0;
         let can_q8_ffn = cfg.intermediate_size % QK8_0 == 0;
         let can_q8k_h = cfg.hidden_size % QK_K == 0;
+        let can_q8k_q = q_dim % QK_K == 0;
         let can_q8k_ffn = cfg.intermediate_size % QK_K == 0;
 
         // 1. Embedding lookup
@@ -356,11 +434,26 @@ impl<'a> LlamaQwenModel<'a> {
                 &mut self.scratch.xb,
             );
 
-            // Q, K, V projections (share dynamic Q8_K or Q8_0 quantization of xb across Q/K/V)
+            // Q, K, V projections: single-barrier Fused Repacked VNNI fast path when packed
             if can_q8k_h
-                && matches!(layer.wq.dtype, DType::Q4_K | DType::Q6_K)
-                && matches!(layer.wk.dtype, DType::Q4_K | DType::Q6_K)
-                && matches!(layer.wv.dtype, DType::Q4_K | DType::Q6_K)
+                && layer.p_wq.is_some()
+                && layer.p_wk.is_some()
+                && layer.p_wv.is_some()
+            {
+                quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
+                backend.fused_qkv_packed_q8k(
+                    layer.p_wq.as_ref().unwrap(),
+                    layer.p_wk.as_ref().unwrap(),
+                    layer.p_wv.as_ref().unwrap(),
+                    &self.scratch.xq8k,
+                    &mut self.scratch.q,
+                    &mut self.scratch.k,
+                    &mut self.scratch.v,
+                )?;
+            } else if can_q8k_h
+                && is_k_quant(layer.wq.dtype)
+                && is_k_quant(layer.wk.dtype)
+                && is_k_quant(layer.wv.dtype)
             {
                 quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
                 backend.matvec_q8k_act(&layer.wq, &self.scratch.xb, &self.scratch.xq8k, &mut self.scratch.q)?;
@@ -398,7 +491,23 @@ impl<'a> LlamaQwenModel<'a> {
                 }
             }
 
-            // Apply precomputed RoPE at exact sequence position `pos` (zero powf/sin_cos overhead!)
+            // Optional per-head QK-Norm (Qwen3 / Qwen3MoE — strictly BEFORE RoPE)
+            if let Some(qn) = &layer.q_norm {
+                for h in 0..cfg.num_heads {
+                    let slice = &mut self.scratch.q[h * head_dim..(h + 1) * head_dim];
+                    backend.rms_norm(slice, qn, cfg.rms_norm_eps, &mut self.scratch.head_tmp);
+                    slice.copy_from_slice(&self.scratch.head_tmp);
+                }
+            }
+            if let Some(kn) = &layer.k_norm {
+                for kh in 0..cfg.num_kv_heads {
+                    let slice = &mut self.scratch.k[kh * head_dim..(kh + 1) * head_dim];
+                    backend.rms_norm(slice, kn, cfg.rms_norm_eps, &mut self.scratch.head_tmp);
+                    slice.copy_from_slice(&self.scratch.head_tmp);
+                }
+            }
+
+            // Precomputed RoPE at exact sequence position `pos`
             for h in 0..cfg.num_heads {
                 self.rope
                     .apply(&mut self.scratch.q[h * head_dim..(h + 1) * head_dim], pos);
@@ -408,10 +517,10 @@ impl<'a> LlamaQwenModel<'a> {
                     .apply(&mut self.scratch.k[kh * head_dim..(kh + 1) * head_dim], pos);
             }
 
-            // Store K, V into cache slot `pos` (F32 or Q8_0)
+            // Store K, V into cache slot `pos`
             self.cache.store(l, pos, &self.scratch.k, &self.scratch.v);
 
-            // Grouped Query Attention over `0..=pos` (parallelized across heads on longer contexts)
+            // Grouped Query Attention over `0..=pos`
             if pos >= 128 && backend.num_threads() > 1 {
                 let q_ref: &[f32] = &self.scratch.q;
                 let cache_ref = &self.cache;
@@ -456,13 +565,24 @@ impl<'a> LlamaQwenModel<'a> {
                 }
             }
 
-            // Output projection + Residual
-            backend.matvec(&layer.wo, &self.scratch.xb2, &mut self.scratch.xb)?;
+            // Output projection + Residual (zero-allocation using pre-sized woq8k / woq8)
+            if let (Some(pwo), true) = (&layer.p_wo, can_q8k_q) {
+                quantize_row_q8_k(&self.scratch.xb2, &mut self.scratch.woq8k);
+                backend.matvec_packed_q8k(pwo, &self.scratch.woq8k, &mut self.scratch.xb)?;
+            } else if can_q8k_q && is_k_quant(layer.wo.dtype) {
+                quantize_row_q8_k(&self.scratch.xb2, &mut self.scratch.woq8k);
+                backend.matvec_q8k_act(&layer.wo, &self.scratch.xb2, &self.scratch.woq8k, &mut self.scratch.xb)?;
+            } else if can_q8_q && matches!(layer.wo.dtype, DType::Q4_0 | DType::Q8_0) {
+                quantize_row_q8_0(&self.scratch.xb2, &mut self.scratch.woq8);
+                backend.matvec_q8_act(&layer.wo, &self.scratch.xb2, &self.scratch.woq8, &mut self.scratch.xb)?;
+            } else {
+                backend.matvec(&layer.wo, &self.scratch.xb2, &mut self.scratch.xb)?;
+            }
             for (x, &dx) in self.scratch.x.iter_mut().zip(self.scratch.xb.iter()) {
                 *x += dx;
             }
 
-            // Pre-RMSNorm for SwiGLU FFN
+            // Pre-RMSNorm for FFN (Dense SwiGLU or Sparse MoE)
             backend.rms_norm(
                 &self.scratch.x,
                 &layer.ffn_norm,
@@ -470,35 +590,83 @@ impl<'a> LlamaQwenModel<'a> {
                 &mut self.scratch.xb,
             );
 
-            if can_q8k_h
-                && matches!(layer.w_gate.dtype, DType::Q4_K | DType::Q6_K)
-                && matches!(layer.w_up.dtype, DType::Q4_K | DType::Q6_K)
-            {
-                quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
-                backend.matvec_q8k_act(&layer.w_gate, &self.scratch.xb, &self.scratch.xq8k, &mut self.scratch.hb)?;
-                backend.matvec_q8k_act(&layer.w_up, &self.scratch.xb, &self.scratch.xq8k, &mut self.scratch.hb2)?;
-            } else if can_q8_h
-                && matches!(layer.w_gate.dtype, DType::Q4_0 | DType::Q8_0)
-                && matches!(layer.w_up.dtype, DType::Q4_0 | DType::Q8_0)
-            {
-                quantize_row_q8_0(&self.scratch.xb, &mut self.scratch.xq8);
-                backend.matvec_q8_act(&layer.w_gate, &self.scratch.xb, &self.scratch.xq8, &mut self.scratch.hb)?;
-                backend.matvec_q8_act(&layer.w_up, &self.scratch.xb, &self.scratch.xq8, &mut self.scratch.hb2)?;
-            } else {
-                backend.matvec(&layer.w_gate, &self.scratch.xb, &mut self.scratch.hb)?;
-                backend.matvec(&layer.w_up, &self.scratch.xb, &mut self.scratch.hb2)?;
-            }
+            match &layer.ffn {
+                FfnBlock::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                    p_gate,
+                    p_up,
+                    p_down,
+                } => {
+                    if let (Some(pg), Some(pu), true) = (p_gate, p_up, can_q8k_h) {
+                        quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
+                        backend.fused_gate_up_swiglu_packed_q8k(
+                            pg,
+                            pu,
+                            &self.scratch.xq8k,
+                            &mut self.scratch.hb,
+                        )?;
+                    } else {
+                        if can_q8k_h && is_k_quant(w_gate.dtype) && is_k_quant(w_up.dtype) {
+                            quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
+                            backend.matvec_q8k_act(w_gate, &self.scratch.xb, &self.scratch.xq8k, &mut self.scratch.hb)?;
+                            backend.matvec_q8k_act(w_up, &self.scratch.xb, &self.scratch.xq8k, &mut self.scratch.hb2)?;
+                        } else if can_q8_h
+                            && matches!(w_gate.dtype, DType::Q4_0 | DType::Q8_0)
+                            && matches!(w_up.dtype, DType::Q4_0 | DType::Q8_0)
+                        {
+                            quantize_row_q8_0(&self.scratch.xb, &mut self.scratch.xq8);
+                            backend.matvec_q8_act(w_gate, &self.scratch.xb, &self.scratch.xq8, &mut self.scratch.hb)?;
+                            backend.matvec_q8_act(w_up, &self.scratch.xb, &self.scratch.xq8, &mut self.scratch.hb2)?;
+                        } else {
+                            backend.matvec(w_gate, &self.scratch.xb, &mut self.scratch.hb)?;
+                            backend.matvec(w_up, &self.scratch.xb, &mut self.scratch.hb2)?;
+                        }
+                        backend.swiglu_inplace(&mut self.scratch.hb, &self.scratch.hb2);
+                    }
 
-            backend.swiglu_inplace(&mut self.scratch.hb, &self.scratch.hb2);
-
-            if can_q8k_ffn && matches!(layer.w_down.dtype, DType::Q4_K | DType::Q6_K) {
-                quantize_row_q8_k(&self.scratch.hb, &mut self.scratch.hbq8k);
-                backend.matvec_q8k_act(&layer.w_down, &self.scratch.hb, &self.scratch.hbq8k, &mut self.scratch.xb)?;
-            } else if can_q8_ffn && matches!(layer.w_down.dtype, DType::Q4_0 | DType::Q8_0) {
-                quantize_row_q8_0(&self.scratch.hb, &mut self.scratch.hbq8);
-                backend.matvec_q8_act(&layer.w_down, &self.scratch.hb, &self.scratch.hbq8, &mut self.scratch.xb)?;
-            } else {
-                backend.matvec(&layer.w_down, &self.scratch.hb, &mut self.scratch.xb)?;
+                    if let (Some(pd), true) = (p_down, can_q8k_ffn) {
+                        quantize_row_q8_k(&self.scratch.hb, &mut self.scratch.hbq8k);
+                        backend.matvec_packed_q8k(pd, &self.scratch.hbq8k, &mut self.scratch.xb)?;
+                    } else if can_q8k_ffn && is_k_quant(w_down.dtype) {
+                        quantize_row_q8_k(&self.scratch.hb, &mut self.scratch.hbq8k);
+                        backend.matvec_q8k_act(w_down, &self.scratch.hb, &self.scratch.hbq8k, &mut self.scratch.xb)?;
+                    } else if can_q8_ffn && matches!(w_down.dtype, DType::Q4_0 | DType::Q8_0) {
+                        quantize_row_q8_0(&self.scratch.hb, &mut self.scratch.hbq8);
+                        backend.matvec_q8_act(w_down, &self.scratch.hb, &self.scratch.hbq8, &mut self.scratch.xb)?;
+                    } else {
+                        backend.matvec(w_down, &self.scratch.hb, &mut self.scratch.xb)?;
+                    }
+                }
+                FfnBlock::Moe(moe_layer) => {
+                    let moe_cfg = cfg.moe.as_ref().expect("MoE layer requires MoeConfig");
+                    let moe_scratch = self.scratch.moe.as_mut().expect("MoE scratch initialized");
+                    let xq8k_opt = if can_q8k_h {
+                        quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
+                        Some(self.scratch.xq8k.as_slice())
+                    } else {
+                        None
+                    };
+                    let xq8_opt = if can_q8_h && xq8k_opt.is_none() {
+                        quantize_row_q8_0(&self.scratch.xb, &mut self.scratch.xq8);
+                        Some(self.scratch.xq8.as_slice())
+                    } else {
+                        None
+                    };
+                    let mut out_tmp = vec![0.0f32; cfg.hidden_size];
+                    forward_moe_token(
+                        backend,
+                        moe_layer,
+                        moe_cfg,
+                        &self.scratch.xb,
+                        xq8k_opt,
+                        xq8_opt,
+                        moe_scratch,
+                        &mut out_tmp,
+                    )?;
+                    self.scratch.xb.copy_from_slice(&out_tmp);
+                }
             }
 
             for (x, &dx) in self.scratch.x.iter_mut().zip(self.scratch.xb.iter()) {
@@ -506,7 +674,7 @@ impl<'a> LlamaQwenModel<'a> {
             }
         }
 
-        // 3. Final RMSNorm & LM Head (skipped on non-final prefill tokens!)
+        // 3. Final RMSNorm & LM Head (zero-alloc using pre-sized xq8k / xq8)
         if compute_logits {
             backend.rms_norm(
                 &self.scratch.x,
@@ -514,14 +682,32 @@ impl<'a> LlamaQwenModel<'a> {
                 cfg.rms_norm_eps,
                 &mut self.scratch.xb,
             );
-            backend.matvec(&self.output_weight, &self.scratch.xb, &mut self.scratch.logits)?;
+            if can_q8k_h && is_k_quant(self.output_weight.dtype) {
+                quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
+                backend.matvec_q8k_act(
+                    &self.output_weight,
+                    &self.scratch.xb,
+                    &self.scratch.xq8k,
+                    &mut self.scratch.logits,
+                )?;
+            } else if can_q8_h && matches!(self.output_weight.dtype, DType::Q4_0 | DType::Q8_0) {
+                quantize_row_q8_0(&self.scratch.xb, &mut self.scratch.xq8);
+                backend.matvec_q8_act(
+                    &self.output_weight,
+                    &self.scratch.xb,
+                    &self.scratch.xq8,
+                    &mut self.scratch.logits,
+                )?;
+            } else {
+                backend.matvec(&self.output_weight, &self.scratch.xb, &mut self.scratch.logits)?;
+            }
         }
 
         Ok(&self.scratch.logits)
     }
 
-    /// High-throughput Batched Prefill GEMM: processes `tokens` starting at `start_pos` in chunks,
-    /// reading each layer's weight matrices ONCE per chunk and computing `lm_head` ONLY on the last token.
+    /// High-throughput Batched Prefill GEMM (`PREFILL_CHUNK = 256`):
+    /// reads each layer's repacked weight matrices ONCE across up to 256 tokens in L1 cache.
     pub fn forward_batch(
         &mut self,
         backend: &dyn Backend,
@@ -536,7 +722,7 @@ impl<'a> LlamaQwenModel<'a> {
             return self.forward_token(backend, tokens[0], start_pos, compute_last_logits);
         }
 
-        const PREFILL_CHUNK: usize = 32;
+        const PREFILL_CHUNK: usize = 256;
         let cfg = &self.config;
         let h = cfg.hidden_size;
         let ffn = cfg.intermediate_size;
@@ -546,11 +732,15 @@ impl<'a> LlamaQwenModel<'a> {
         let kv_mul = cfg.num_heads / cfg.num_kv_heads;
         let inv_sqrt_hd = 1.0 / (head_dim as f32).sqrt();
         let can_q8k_h = h % QK_K == 0;
+        let can_q8k_q = q_dim % QK_K == 0;
         let can_q8k_ffn = ffn % QK_K == 0;
         let can_q8_h = h % QK8_0 == 0;
         let can_q8_ffn = ffn % QK8_0 == 0;
+        let has_dense_ffn = self
+            .layers
+            .iter()
+            .any(|l| matches!(l.ffn, FfnBlock::Dense { .. }));
 
-        // Reusable batch buffers sized for up to `PREFILL_CHUNK` tokens
         let max_b = tokens.len().min(PREFILL_CHUNK);
         let mut x_buf = vec![0.0f32; max_b * h];
         let mut xb_buf = vec![0.0f32; max_b * h];
@@ -558,12 +748,22 @@ impl<'a> LlamaQwenModel<'a> {
         let mut k_buf = vec![0.0f32; max_b * kv_dim];
         let mut v_buf = vec![0.0f32; max_b * kv_dim];
         let mut attn_out_buf = vec![0.0f32; max_b * q_dim];
-        let mut hb_buf = vec![0.0f32; max_b * ffn];
-        let mut hb2_buf = vec![0.0f32; max_b * ffn];
+        let mut hb_buf = if has_dense_ffn { vec![0.0f32; max_b * ffn] } else { Vec::new() };
+        let mut hb2_buf = if has_dense_ffn { vec![0.0f32; max_b * ffn] } else { Vec::new() };
         let mut xq8k_buf = vec![BlockQ8_K::default(); max_b * (h / QK_K).max(1)];
-        let mut hbq8k_buf = vec![BlockQ8_K::default(); max_b * (ffn / QK_K).max(1)];
+        let mut woq8k_buf = vec![BlockQ8_K::default(); max_b * (q_dim / QK_K).max(1)];
+        let mut hbq8k_buf = if has_dense_ffn {
+            vec![BlockQ8_K::default(); max_b * (ffn / QK_K).max(1)]
+        } else {
+            Vec::new()
+        };
         let mut xq8_buf = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; max_b * (h / QK8_0).max(1)];
-        let mut hbq8_buf = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; max_b * (ffn / QK8_0).max(1)];
+        let mut hbq8_buf = if has_dense_ffn {
+            vec![BlockQ8_0 { d: 0, qs: [0; 32] }; max_b * (ffn / QK8_0).max(1)]
+        } else {
+            Vec::new()
+        };
+        let mut head_tmp = vec![0.0f32; head_dim];
 
         let mut offset = 0usize;
         while offset < tokens.len() {
@@ -584,14 +784,11 @@ impl<'a> LlamaQwenModel<'a> {
             let k = &mut k_buf[..b * kv_dim];
             let v = &mut v_buf[..b * kv_dim];
             let attn_out = &mut attn_out_buf[..b * q_dim];
-            let hb = &mut hb_buf[..b * ffn];
-            let hb2 = &mut hb2_buf[..b * ffn];
 
-            // 2. Run all Transformer layers in batched GEMM mode
+            // 2. Transformer layers in tiled batched GEMM mode
             for l in 0..cfg.num_layers {
                 let layer = &self.layers[l];
 
-                // Pre-RMSNorm for all `b` tokens
                 for t in 0..b {
                     backend.rms_norm(
                         &x[t * h..(t + 1) * h],
@@ -601,20 +798,33 @@ impl<'a> LlamaQwenModel<'a> {
                     );
                 }
 
-                // Batched Q, K, V GEMM (reads weights ONCE for all `b` tokens!)
+                // Batched Q, K, V GEMM (using repacked VNNI 8×4 / 8×8 tiles when available!)
                 if can_q8k_h
-                    && matches!(layer.wq.dtype, DType::Q4_K | DType::Q6_K)
-                    && matches!(layer.wk.dtype, DType::Q4_K | DType::Q6_K)
-                    && matches!(layer.wv.dtype, DType::Q4_K | DType::Q6_K)
+                    && (layer.p_wq.is_some()
+                        || (is_k_quant(layer.wq.dtype)
+                            && is_k_quant(layer.wk.dtype)
+                            && is_k_quant(layer.wv.dtype)))
                 {
                     let nb = h / QK_K;
                     let xq = &mut xq8k_buf[..b * nb];
                     for t in 0..b {
                         quantize_row_q8_k(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
                     }
-                    backend.matmul_q8k_act(&layer.wq, xb, xq, b, q)?;
-                    backend.matmul_q8k_act(&layer.wk, xb, xq, b, k)?;
-                    backend.matmul_q8k_act(&layer.wv, xb, xq, b, v)?;
+                    if let Some(p) = &layer.p_wq {
+                        backend.matmul_packed_q8k(p, xq, b, q)?;
+                    } else {
+                        backend.matmul_q8k_act(&layer.wq, xb, xq, b, q)?;
+                    }
+                    if let Some(p) = &layer.p_wk {
+                        backend.matmul_packed_q8k(p, xq, b, k)?;
+                    } else {
+                        backend.matmul_q8k_act(&layer.wk, xb, xq, b, k)?;
+                    }
+                    if let Some(p) = &layer.p_wv {
+                        backend.matmul_packed_q8k(p, xq, b, v)?;
+                    } else {
+                        backend.matmul_q8k_act(&layer.wv, xb, xq, b, v)?;
+                    }
                 } else if can_q8_h
                     && matches!(layer.wq.dtype, DType::Q4_0 | DType::Q8_0)
                     && matches!(layer.wk.dtype, DType::Q4_0 | DType::Q8_0)
@@ -634,7 +844,7 @@ impl<'a> LlamaQwenModel<'a> {
                     backend.matmul(&layer.wv, xb, b, v)?;
                 }
 
-                // QKV biases, exact RoPE at `chunk_pos + t`, KV store, and causal GQA
+                // QKV biases, optional Qwen3 QK-Norm, exact RoPE, and KV cache store
                 for t in 0..b {
                     let pos = chunk_pos + t;
                     let qt = &mut q[t * q_dim..(t + 1) * q_dim];
@@ -654,6 +864,21 @@ impl<'a> LlamaQwenModel<'a> {
                     if let Some(bv) = &layer.bv {
                         for (vv, &bias) in vt.iter_mut().zip(bv.iter()) {
                             *vv += bias;
+                        }
+                    }
+
+                    if let Some(qn) = &layer.q_norm {
+                        for head in 0..cfg.num_heads {
+                            let s = &mut qt[head * head_dim..(head + 1) * head_dim];
+                            backend.rms_norm(s, qn, cfg.rms_norm_eps, &mut head_tmp);
+                            s.copy_from_slice(&head_tmp);
+                        }
+                    }
+                    if let Some(kn) = &layer.k_norm {
+                        for kh in 0..cfg.num_kv_heads {
+                            let s = &mut kt[kh * head_dim..(kh + 1) * head_dim];
+                            backend.rms_norm(s, kn, cfg.rms_norm_eps, &mut head_tmp);
+                            s.copy_from_slice(&head_tmp);
                         }
                     }
 
@@ -703,13 +928,35 @@ impl<'a> LlamaQwenModel<'a> {
                     }
                 });
 
-                // Batched Output projection + Residual
-                backend.matmul(&layer.wo, attn_out, b, xb)?;
+                // Batched Output projection + Residual (using repacked VNNI tiles!)
+                if let (Some(pwo), true) = (&layer.p_wo, can_q8k_q) {
+                    let nb = q_dim / QK_K;
+                    let wq = &mut woq8k_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_k(
+                            &attn_out[t * q_dim..(t + 1) * q_dim],
+                            &mut wq[t * nb..(t + 1) * nb],
+                        );
+                    }
+                    backend.matmul_packed_q8k(pwo, wq, b, xb)?;
+                } else if can_q8k_q && is_k_quant(layer.wo.dtype) {
+                    let nb = q_dim / QK_K;
+                    let wq = &mut woq8k_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_k(
+                            &attn_out[t * q_dim..(t + 1) * q_dim],
+                            &mut wq[t * nb..(t + 1) * nb],
+                        );
+                    }
+                    backend.matmul_q8k_act(&layer.wo, attn_out, wq, b, xb)?;
+                } else {
+                    backend.matmul(&layer.wo, attn_out, b, xb)?;
+                }
                 for (xv, &dx) in x.iter_mut().zip(xb.iter()) {
                     *xv += dx;
                 }
 
-                // Pre-RMSNorm for SwiGLU FFN
+                // Pre-RMSNorm for FFN
                 for t in 0..b {
                     backend.rms_norm(
                         &x[t * h..(t + 1) * h],
@@ -719,53 +966,129 @@ impl<'a> LlamaQwenModel<'a> {
                     );
                 }
 
-                // Batched Gate + Up GEMM
-                if can_q8k_h
-                    && matches!(layer.w_gate.dtype, DType::Q4_K | DType::Q6_K)
-                    && matches!(layer.w_up.dtype, DType::Q4_K | DType::Q6_K)
-                {
-                    let nb = h / QK_K;
-                    let xq = &mut xq8k_buf[..b * nb];
-                    for t in 0..b {
-                        quantize_row_q8_k(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
-                    }
-                    backend.matmul_q8k_act(&layer.w_gate, xb, xq, b, hb)?;
-                    backend.matmul_q8k_act(&layer.w_up, xb, xq, b, hb2)?;
-                } else if can_q8_h
-                    && matches!(layer.w_gate.dtype, DType::Q4_0 | DType::Q8_0)
-                    && matches!(layer.w_up.dtype, DType::Q4_0 | DType::Q8_0)
-                {
-                    let nb = h / QK8_0;
-                    let xq = &mut xq8_buf[..b * nb];
-                    for t in 0..b {
-                        quantize_row_q8_0(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
-                    }
-                    backend.matmul_q8_act(&layer.w_gate, xb, xq, b, hb)?;
-                    backend.matmul_q8_act(&layer.w_up, xb, xq, b, hb2)?;
-                } else {
-                    backend.matmul(&layer.w_gate, xb, b, hb)?;
-                    backend.matmul(&layer.w_up, xb, b, hb2)?;
-                }
+                match &layer.ffn {
+                    FfnBlock::Dense {
+                        w_gate,
+                        w_up,
+                        w_down,
+                        p_gate,
+                        p_up,
+                        p_down,
+                    } => {
+                        let hb = &mut hb_buf[..b * ffn];
+                        let hb2 = &mut hb2_buf[..b * ffn];
 
-                backend.swiglu_inplace(hb, hb2);
+                        if can_q8k_h
+                            && (p_gate.is_some()
+                                || (is_k_quant(w_gate.dtype) && is_k_quant(w_up.dtype)))
+                        {
+                            let nb = h / QK_K;
+                            let xq = &mut xq8k_buf[..b * nb];
+                            for t in 0..b {
+                                quantize_row_q8_k(
+                                    &xb[t * h..(t + 1) * h],
+                                    &mut xq[t * nb..(t + 1) * nb],
+                                );
+                            }
+                            if let Some(pg) = p_gate {
+                                backend.matmul_packed_q8k(pg, xq, b, hb)?;
+                            } else {
+                                backend.matmul_q8k_act(w_gate, xb, xq, b, hb)?;
+                            }
+                            if let Some(pu) = p_up {
+                                backend.matmul_packed_q8k(pu, xq, b, hb2)?;
+                            } else {
+                                backend.matmul_q8k_act(w_up, xb, xq, b, hb2)?;
+                            }
+                        } else if can_q8_h
+                            && matches!(w_gate.dtype, DType::Q4_0 | DType::Q8_0)
+                            && matches!(w_up.dtype, DType::Q4_0 | DType::Q8_0)
+                        {
+                            let nb = h / QK8_0;
+                            let xq = &mut xq8_buf[..b * nb];
+                            for t in 0..b {
+                                quantize_row_q8_0(
+                                    &xb[t * h..(t + 1) * h],
+                                    &mut xq[t * nb..(t + 1) * nb],
+                                );
+                            }
+                            backend.matmul_q8_act(w_gate, xb, xq, b, hb)?;
+                            backend.matmul_q8_act(w_up, xb, xq, b, hb2)?;
+                        } else {
+                            backend.matmul(w_gate, xb, b, hb)?;
+                            backend.matmul(w_up, xb, b, hb2)?;
+                        }
 
-                // Batched Down GEMM + Residual
-                if can_q8k_ffn && matches!(layer.w_down.dtype, DType::Q4_K | DType::Q6_K) {
-                    let nb = ffn / QK_K;
-                    let hq = &mut hbq8k_buf[..b * nb];
-                    for t in 0..b {
-                        quantize_row_q8_k(&hb[t * ffn..(t + 1) * ffn], &mut hq[t * nb..(t + 1) * nb]);
+                        backend.swiglu_inplace(hb, hb2);
+
+                        if let (Some(pd), true) = (p_down, can_q8k_ffn) {
+                            let nb = ffn / QK_K;
+                            let hq = &mut hbq8k_buf[..b * nb];
+                            for t in 0..b {
+                                quantize_row_q8_k(
+                                    &hb[t * ffn..(t + 1) * ffn],
+                                    &mut hq[t * nb..(t + 1) * nb],
+                                );
+                            }
+                            backend.matmul_packed_q8k(pd, hq, b, xb)?;
+                        } else if can_q8k_ffn && is_k_quant(w_down.dtype) {
+                            let nb = ffn / QK_K;
+                            let hq = &mut hbq8k_buf[..b * nb];
+                            for t in 0..b {
+                                quantize_row_q8_k(
+                                    &hb[t * ffn..(t + 1) * ffn],
+                                    &mut hq[t * nb..(t + 1) * nb],
+                                );
+                            }
+                            backend.matmul_q8k_act(w_down, hb, hq, b, xb)?;
+                        } else if can_q8_ffn && matches!(w_down.dtype, DType::Q4_0 | DType::Q8_0) {
+                            let nb = ffn / QK8_0;
+                            let hq = &mut hbq8_buf[..b * nb];
+                            for t in 0..b {
+                                quantize_row_q8_0(
+                                    &hb[t * ffn..(t + 1) * ffn],
+                                    &mut hq[t * nb..(t + 1) * nb],
+                                );
+                            }
+                            backend.matmul_q8_act(w_down, hb, hq, b, xb)?;
+                        } else {
+                            backend.matmul(w_down, hb, b, xb)?;
+                        }
                     }
-                    backend.matmul_q8k_act(&layer.w_down, hb, hq, b, xb)?;
-                } else if can_q8_ffn && matches!(layer.w_down.dtype, DType::Q4_0 | DType::Q8_0) {
-                    let nb = ffn / QK8_0;
-                    let hq = &mut hbq8_buf[..b * nb];
-                    for t in 0..b {
-                        quantize_row_q8_0(&hb[t * ffn..(t + 1) * ffn], &mut hq[t * nb..(t + 1) * nb]);
+                    FfnBlock::Moe(moe_layer) => {
+                        let moe_cfg = cfg.moe.as_ref().expect("MoE layer requires MoeConfig");
+                        let moe_scratch =
+                            self.scratch.moe.as_mut().expect("MoE scratch initialized");
+                        let nb_k = h / QK_K;
+                        let nb_8 = h / QK8_0;
+                        let mut tok_out = vec![0.0f32; h];
+                        for t in 0..b {
+                            let x_tok = &xb[t * h..(t + 1) * h];
+                            let xq8k_opt = if can_q8k_h {
+                                quantize_row_q8_k(x_tok, &mut xq8k_buf[..nb_k]);
+                                Some(&xq8k_buf[..nb_k])
+                            } else {
+                                None
+                            };
+                            let xq8_opt = if can_q8_h && xq8k_opt.is_none() {
+                                quantize_row_q8_0(x_tok, &mut xq8_buf[..nb_8]);
+                                Some(&xq8_buf[..nb_8])
+                            } else {
+                                None
+                            };
+                            forward_moe_token(
+                                backend,
+                                moe_layer,
+                                moe_cfg,
+                                x_tok,
+                                xq8k_opt,
+                                xq8_opt,
+                                moe_scratch,
+                                &mut tok_out,
+                            )?;
+                            xb[t * h..(t + 1) * h].copy_from_slice(&tok_out);
+                        }
                     }
-                    backend.matmul_q8_act(&layer.w_down, hb, hq, b, xb)?;
-                } else {
-                    backend.matmul(&layer.w_down, hb, b, xb)?;
                 }
 
                 for (xv, &dx) in x.iter_mut().zip(xb.iter()) {
@@ -773,7 +1096,7 @@ impl<'a> LlamaQwenModel<'a> {
                 }
             }
 
-            // 3. Final RMSNorm & LM Head ONLY for the very last token of the prompt!
+            // 3. Final RMSNorm & LM Head ONLY for the very last token of the prompt
             if is_last_chunk && compute_last_logits {
                 let last_x = &x[(b - 1) * h..b * h];
                 backend.rms_norm(
@@ -782,7 +1105,21 @@ impl<'a> LlamaQwenModel<'a> {
                     cfg.rms_norm_eps,
                     &mut self.scratch.xb,
                 );
-                backend.matvec(&self.output_weight, &self.scratch.xb, &mut self.scratch.logits)?;
+                if can_q8k_h && is_k_quant(self.output_weight.dtype) {
+                    quantize_row_q8_k(&self.scratch.xb, &mut self.scratch.xq8k);
+                    backend.matvec_q8k_act(
+                        &self.output_weight,
+                        &self.scratch.xb,
+                        &self.scratch.xq8k,
+                        &mut self.scratch.logits,
+                    )?;
+                } else {
+                    backend.matvec(
+                        &self.output_weight,
+                        &self.scratch.xb,
+                        &mut self.scratch.logits,
+                    )?;
+                }
             }
 
             offset += b;
@@ -801,6 +1138,35 @@ mod tests {
     use caelum_kernels::CpuBackend;
     use caelum_tokenizer::Tokenizer;
 
+    fn make_q4_matrix(rows: usize, cols: usize, salt: usize) -> Vec<u8> {
+        let vals: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i + salt) % 23) as f32 - 11.0) * 0.02)
+            .collect();
+        let mut blocks = vec![BlockQ4_0 { d: 0, qs: [0; 16] }; (rows * cols) / 32];
+        for r in 0..rows {
+            quantize_row_q4_0(
+                &vals[r * cols..(r + 1) * cols],
+                &mut blocks[r * (cols / 32)..(r + 1) * (cols / 32)],
+            );
+        }
+        unsafe {
+            std::slice::from_raw_parts(blocks.as_ptr() as *const u8, blocks.len() * 18)
+        }
+        .to_vec()
+    }
+
+    fn mini_chatml_vocab() -> (Vec<GgufValue>, Vec<GgufValue>) {
+        let mut tokens: Vec<GgufValue> = (0u8..=127)
+            .map(|b| GgufValue::String((b as char).to_string()))
+            .collect();
+        let mut token_types: Vec<GgufValue> = vec![GgufValue::I32(1); tokens.len()];
+        tokens.push(GgufValue::String("<|im_start|>".into()));
+        token_types.push(GgufValue::I32(3));
+        tokens.push(GgufValue::String("<|im_end|>".into()));
+        token_types.push(GgufValue::I32(3));
+        (tokens, token_types)
+    }
+
     #[test]
     fn test_qwen2_gguf_gqa_bias_tied_embeddings_q4_0() {
         let h = 64usize;
@@ -810,15 +1176,7 @@ mod tests {
         let head_dim = h / heads;
         let kv_dim = kv_heads * head_dim;
 
-        // Mini GPT-2 byte-level vocab covering ASCII + ChatML special tokens
-        let mut tokens: Vec<GgufValue> = (0u8..=127)
-            .map(|b| GgufValue::String((b as char).to_string()))
-            .collect();
-        let mut token_types: Vec<GgufValue> = vec![GgufValue::I32(1); tokens.len()];
-        tokens.push(GgufValue::String("<|im_start|>".into()));
-        token_types.push(GgufValue::I32(3));
-        tokens.push(GgufValue::String("<|im_end|>".into()));
-        token_types.push(GgufValue::I32(3));
+        let (tokens, token_types) = mini_chatml_vocab();
         let vocab = tokens.len();
 
         let mut w = GgufWriter::new();
@@ -836,40 +1194,22 @@ mod tests {
         w.add_meta("tokenizer.ggml.token_type", GgufValue::Array(token_types));
         w.add_meta("tokenizer.ggml.eos_token_id", GgufValue::U32((vocab - 1) as u32));
 
-        let make_q4 = |rows: usize, cols: usize, salt: usize| -> Vec<u8> {
-            let vals: Vec<f32> = (0..rows * cols)
-                .map(|i| (((i + salt) % 23) as f32 - 11.0) * 0.02)
-                .collect();
-            let mut blocks = vec![BlockQ4_0 { d: 0, qs: [0; 16] }; (rows * cols) / 32];
-            for r in 0..rows {
-                quantize_row_q4_0(
-                    &vals[r * cols..(r + 1) * cols],
-                    &mut blocks[r * (cols / 32)..(r + 1) * (cols / 32)],
-                );
-            }
-            unsafe {
-                std::slice::from_raw_parts(blocks.as_ptr() as *const u8, blocks.len() * 18)
-            }
-            .to_vec()
-        };
-
-        // Tied embeddings: intentionally omit `output.weight`
-        w.add_tensor_raw("token_embd.weight", vec![vocab, h], DType::Q4_0, make_q4(vocab, h, 1)).unwrap();
+        w.add_tensor_raw("token_embd.weight", vec![vocab, h], DType::Q4_0, make_q4_matrix(vocab, h, 1)).unwrap();
         w.add_tensor_f32("output_norm.weight", vec![h], &vec![1.0; h]).unwrap();
 
         for l in 0..2 {
             w.add_tensor_f32(&format!("blk.{l}.attn_norm.weight"), vec![h], &vec![1.0; h]).unwrap();
-            w.add_tensor_raw(&format!("blk.{l}.attn_q.weight"), vec![h, h], DType::Q4_0, make_q4(h, h, l + 2)).unwrap();
-            w.add_tensor_raw(&format!("blk.{l}.attn_k.weight"), vec![kv_dim, h], DType::Q4_0, make_q4(kv_dim, h, l + 3)).unwrap();
-            w.add_tensor_raw(&format!("blk.{l}.attn_v.weight"), vec![kv_dim, h], DType::Q4_0, make_q4(kv_dim, h, l + 4)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_q.weight"), vec![h, h], DType::Q4_0, make_q4_matrix(h, h, l + 2)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_k.weight"), vec![kv_dim, h], DType::Q4_0, make_q4_matrix(kv_dim, h, l + 3)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_v.weight"), vec![kv_dim, h], DType::Q4_0, make_q4_matrix(kv_dim, h, l + 4)).unwrap();
             w.add_tensor_f32(&format!("blk.{l}.attn_q.bias"), vec![h], &vec![0.01; h]).unwrap();
             w.add_tensor_f32(&format!("blk.{l}.attn_k.bias"), vec![kv_dim], &vec![0.01; kv_dim]).unwrap();
             w.add_tensor_f32(&format!("blk.{l}.attn_v.bias"), vec![kv_dim], &vec![0.01; kv_dim]).unwrap();
-            w.add_tensor_raw(&format!("blk.{l}.attn_output.weight"), vec![h, h], DType::Q4_0, make_q4(h, h, l + 5)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_output.weight"), vec![h, h], DType::Q4_0, make_q4_matrix(h, h, l + 5)).unwrap();
             w.add_tensor_f32(&format!("blk.{l}.ffn_norm.weight"), vec![h], &vec![1.0; h]).unwrap();
-            w.add_tensor_raw(&format!("blk.{l}.ffn_gate.weight"), vec![ffn, h], DType::Q4_0, make_q4(ffn, h, l + 6)).unwrap();
-            w.add_tensor_raw(&format!("blk.{l}.ffn_up.weight"), vec![ffn, h], DType::Q4_0, make_q4(ffn, h, l + 7)).unwrap();
-            w.add_tensor_raw(&format!("blk.{l}.ffn_down.weight"), vec![h, ffn], DType::Q4_0, make_q4(h, ffn, l + 8)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_gate.weight"), vec![ffn, h], DType::Q4_0, make_q4_matrix(ffn, h, l + 6)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_up.weight"), vec![ffn, h], DType::Q4_0, make_q4_matrix(ffn, h, l + 7)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_down.weight"), vec![h, ffn], DType::Q4_0, make_q4_matrix(h, ffn, l + 8)).unwrap();
         }
 
         let gguf = GgufFile::from_bytes(w.to_bytes()).unwrap();
@@ -878,7 +1218,7 @@ mod tests {
         let backend = CpuBackend::new(Some(2));
 
         let ids = tokenizer.encode("<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n", false);
-        assert!(ids.contains(&((vocab - 2) as u32))); // <|im_start|>
+        assert!(ids.contains(&((vocab - 2) as u32)));
 
         let (_, stats) = model
             .generate(
@@ -897,7 +1237,7 @@ mod tests {
         assert_eq!(stats.generated_tokens, 8);
         assert_eq!(stats.cached_prompt_tokens, 0);
 
-        // 1. Verify batched prefill matches sequential token-by-token prefill
+        // Verify batched prefill matches sequential token-by-token prefill
         let mut m_seq = LlamaQwenModel::from_gguf(&gguf, Some(64)).unwrap();
         let mut seq_logits = Vec::new();
         for (pos, &tok) in ids.iter().enumerate() {
@@ -917,7 +1257,7 @@ mod tests {
             );
         }
 
-        // 2. Verify automatic KV Prefix Caching hits on shared prefix
+        // Verify automatic KV Prefix Caching hits on shared prefix
         let ids2 = tokenizer.encode("<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n", false);
         let (_, stats2) = model
             .generate(
@@ -933,14 +1273,83 @@ mod tests {
                 |_, _| {},
             )
             .unwrap();
-        assert!(
-            stats2.cached_prompt_tokens >= 7,
-            "Expected prefix cache hit (>= 7), got {}",
-            stats2.cached_prompt_tokens
-        );
+        assert!(stats2.cached_prompt_tokens >= 7);
 
-        // 3. Verify Q8_0 quantized KV cache runs cleanly and compresses memory when head_dim % 32 == 0
         let m_q8 = LlamaQwenModel::from_gguf_with_kv(&gguf, Some(64), KvPrecision::Q8_0).unwrap();
         assert!(m_q8.kv_cache_bytes() <= m_seq.kv_cache_bytes());
+    }
+
+    #[test]
+    fn test_qwen3_qk_norm_and_qwen3moe_3d_experts() {
+        let h = 64usize;
+        let heads = 4usize;
+        let kv_heads = 2usize;
+        let head_dim = 32usize; // Intentionally q_dim (128) != hidden_size (64), just like Qwen3-0.6B!
+        let q_dim = heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+        let n_exp = 4usize;
+        let exp_ffn = 64usize;
+
+        let (tokens, token_types) = mini_chatml_vocab();
+        let vocab = tokens.len();
+
+        let mut w = GgufWriter::new();
+        w.add_meta("general.architecture", GgufValue::String("qwen3moe".into()));
+        w.add_meta("qwen3moe.embedding_length", GgufValue::U32(h as u32));
+        w.add_meta("qwen3moe.block_count", GgufValue::U32(2));
+        w.add_meta("qwen3moe.attention.head_count", GgufValue::U32(heads as u32));
+        w.add_meta("qwen3moe.attention.head_count_kv", GgufValue::U32(kv_heads as u32));
+        w.add_meta("qwen3moe.attention.key_length", GgufValue::U32(head_dim as u32));
+        w.add_meta("qwen3moe.expert_count", GgufValue::U32(n_exp as u32));
+        w.add_meta("qwen3moe.expert_used_count", GgufValue::U32(2));
+        w.add_meta("qwen3moe.expert_feed_forward_length", GgufValue::U32(exp_ffn as u32));
+        w.add_meta("qwen3moe.rope.freq_base", GgufValue::F32(1_000_000.0));
+        w.add_meta("qwen3moe.attention.layer_norm_rms_epsilon", GgufValue::F32(1e-6));
+        w.add_meta("qwen3moe.context_length", GgufValue::U32(128));
+        w.add_meta("tokenizer.ggml.model", GgufValue::String("gpt2".into()));
+        w.add_meta("tokenizer.ggml.tokens", GgufValue::Array(tokens));
+        w.add_meta("tokenizer.ggml.token_type", GgufValue::Array(token_types));
+        w.add_meta("tokenizer.ggml.eos_token_id", GgufValue::U32((vocab - 1) as u32));
+
+        w.add_tensor_raw("token_embd.weight", vec![vocab, h], DType::Q4_0, make_q4_matrix(vocab, h, 1)).unwrap();
+        w.add_tensor_f32("output_norm.weight", vec![h], &vec![1.0; h]).unwrap();
+
+        for l in 0..2 {
+            w.add_tensor_f32(&format!("blk.{l}.attn_norm.weight"), vec![h], &vec![1.0; h]).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_q.weight"), vec![q_dim, h], DType::Q4_0, make_q4_matrix(q_dim, h, l + 2)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_k.weight"), vec![kv_dim, h], DType::Q4_0, make_q4_matrix(kv_dim, h, l + 3)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_v.weight"), vec![kv_dim, h], DType::Q4_0, make_q4_matrix(kv_dim, h, l + 4)).unwrap();
+            w.add_tensor_f32(&format!("blk.{l}.attn_q_norm.weight"), vec![head_dim], &vec![1.1; head_dim]).unwrap();
+            w.add_tensor_f32(&format!("blk.{l}.attn_k_norm.weight"), vec![head_dim], &vec![0.9; head_dim]).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_output.weight"), vec![h, q_dim], DType::Q4_0, make_q4_matrix(h, q_dim, l + 5)).unwrap();
+            w.add_tensor_f32(&format!("blk.{l}.ffn_norm.weight"), vec![h], &vec![1.0; h]).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_gate_inp.weight"), vec![n_exp, h], DType::Q4_0, make_q4_matrix(n_exp, h, l + 6)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_gate_exps.weight"), vec![n_exp, exp_ffn, h], DType::Q4_0, make_q4_matrix(n_exp * exp_ffn, h, l + 7)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_up_exps.weight"), vec![n_exp, exp_ffn, h], DType::Q4_0, make_q4_matrix(n_exp * exp_ffn, h, l + 8)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_down_exps.weight"), vec![n_exp, h, exp_ffn], DType::Q4_0, make_q4_matrix(n_exp * h, exp_ffn, l + 9)).unwrap();
+        }
+
+        let gguf = GgufFile::from_bytes(w.to_bytes()).unwrap();
+        let backend = CpuBackend::new(Some(2));
+        let ids = vec![65u32, 66, 67, 68, 69];
+
+        let mut m_seq = LlamaQwenModel::from_gguf(&gguf, Some(64)).unwrap();
+        let mut seq_logits = Vec::new();
+        for (pos, &tok) in ids.iter().enumerate() {
+            let l = m_seq
+                .forward_token(&backend, tok, pos, pos + 1 == ids.len())
+                .unwrap();
+            if pos + 1 == ids.len() {
+                seq_logits = l.to_vec();
+            }
+        }
+        let mut m_batch = LlamaQwenModel::from_gguf(&gguf, Some(64)).unwrap();
+        let batch_logits = m_batch.forward_batch(&backend, &ids, 0, true).unwrap().to_vec();
+        for (a, b) in seq_logits.iter().zip(batch_logits.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "Qwen3MoE batched prefill mismatch vs sequential: seq={a}, batch={b}"
+            );
+        }
     }
 }

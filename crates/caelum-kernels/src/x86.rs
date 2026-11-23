@@ -505,22 +505,17 @@ pub unsafe fn dot_q4_k_q8_k_batch4_avx2(
     sumf
 }
 
-/// Exact AVX2 W6A8 (`Q6_K × Q8_K`) super-block dot product with single horizontal reduction per block.
+/// Blazing-fast 32-wide AVX2 W6A8 (`Q6_K × Q8_K`) super-block dot product.
+///
+/// Shifts signed 6-bit quants `[-32, 31]` → unsigned `[0, 63]` to use 32-wide `_mm256_maddubs_epi16`
+/// + `_mm256_madd_epi16` (zero `mullo_epi32`), subtracting the exact `-32 * sum(sc * bsums)` bias
+/// in a single AVX2 instruction per 256-element super-block.
 #[target_feature(enable = "avx2")]
 pub unsafe fn dot_q6_k_q8_k_avx2(raw: &[u8], x: &[BlockQ8_K]) -> f32 {
     let nb = x.len();
-    let mask_low4 = _mm_set1_epi8(0x0F);
-    let mask_low2 = _mm_set1_epi8(0x03);
-    let thirty_two = _mm_set1_epi8(32);
+    let mask_low4 = _mm256_set1_epi8(0x0F);
+    let mask_low2 = _mm256_set1_epi8(0x03);
     let mut sumf = 0.0f32;
-
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn scaled_dot16_v(q16: __m128i, x_ptr: *const i8, sc: i32) -> __m256i {
-        let q_w = _mm256_cvtepi8_epi16(q16);
-        let x_w = _mm256_cvtepi8_epi16(_mm_loadu_si128(x_ptr as *const __m128i));
-        _mm256_mullo_epi32(_mm256_madd_epi16(q_w, x_w), _mm256_set1_epi32(sc))
-    }
 
     for b in 0..nb {
         let off = b * 210;
@@ -533,6 +528,11 @@ pub unsafe fn dot_q6_k_q8_k_avx2(raw: &[u8], x: &[BlockQ8_K]) -> f32 {
         ]));
         let xb = x.get_unchecked(b);
 
+        // Compute sum_{sub=0..15} sc[sub] * bsums[sub] in ONE AVX2 instruction
+        let sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(sc_base as *const __m128i));
+        let bs16 = _mm256_loadu_si256(xb.bsums.as_ptr() as *const __m256i);
+        let bias_v = _mm256_madd_epi16(sc16, bs16);
+
         let mut acc = _mm256_setzero_si256();
         for half in 0..2 {
             let ql_h = ql_base.add(half * 64);
@@ -540,36 +540,147 @@ pub unsafe fn dot_q6_k_q8_k_avx2(raw: &[u8], x: &[BlockQ8_K]) -> f32 {
             let sc_h = sc_base.add(half * 8);
             let x_h = xb.qs.as_ptr().add(half * 128);
 
-            for is in 0..2 {
-                let l = is * 16;
-                let ql0 = _mm_loadu_si128(ql_h.add(l) as *const __m128i);
-                let ql1 = _mm_loadu_si128(ql_h.add(l + 32) as *const __m128i);
-                let qh = _mm_loadu_si128(qh_h.add(l) as *const __m128i);
+            let ql0 = _mm256_loadu_si256(ql_h as *const __m256i);
+            let ql1 = _mm256_loadu_si256(ql_h.add(32) as *const __m256i);
+            let qh = _mm256_loadu_si256(qh_h as *const __m256i);
 
-                let qh0 = _mm_slli_epi16(_mm_and_si128(qh, mask_low2), 4);
-                let qh1 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh, 2), mask_low2), 4);
-                let qh2 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh, 4), mask_low2), 4);
-                let qh3 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh, 6), mask_low2), 4);
+            let qh0 = _mm256_slli_epi16(_mm256_and_si256(qh, mask_low2), 4);
+            let qh1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2), mask_low2), 4);
+            let qh2 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 4), mask_low2), 4);
+            let qh3 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 6), mask_low2), 4);
 
-                let q1 = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(ql0, mask_low4), qh0), thirty_two);
-                let q2 = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(ql1, mask_low4), qh1), thirty_two);
-                let q3 = _mm_sub_epi8(
-                    _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql0, 4), mask_low4), qh2),
-                    thirty_two,
-                );
-                let q4 = _mm_sub_epi8(
-                    _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql1, 4), mask_low4), qh3),
-                    thirty_two,
-                );
+            let q1 = _mm256_or_si256(_mm256_and_si256(ql0, mask_low4), qh0);
+            let q2 = _mm256_or_si256(_mm256_and_si256(ql1, mask_low4), qh1);
+            let q3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql0, 4), mask_low4), qh2);
+            let q4 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql1, 4), mask_low4), qh3);
 
-                let s0 = scaled_dot16_v(q1, x_h.add(l), *sc_h.add(is) as i32);
-                let s1 = scaled_dot16_v(q2, x_h.add(l + 32), *sc_h.add(is + 2) as i32);
-                let s2 = scaled_dot16_v(q3, x_h.add(l + 64), *sc_h.add(is + 4) as i32);
-                let s3 = scaled_dot16_v(q4, x_h.add(l + 96), *sc_h.add(is + 6) as i32);
-                acc = _mm256_add_epi32(acc, _mm256_add_epi32(_mm256_add_epi32(s0, s1), _mm256_add_epi32(s2, s3)));
+            let sc01 = _mm256_set_m128i(
+                _mm_set1_epi16(*sc_h.add(1) as i16),
+                _mm_set1_epi16(*sc_h as i16),
+            );
+            let sc23 = _mm256_set_m128i(
+                _mm_set1_epi16(*sc_h.add(3) as i16),
+                _mm_set1_epi16(*sc_h.add(2) as i16),
+            );
+            let sc45 = _mm256_set_m128i(
+                _mm_set1_epi16(*sc_h.add(5) as i16),
+                _mm_set1_epi16(*sc_h.add(4) as i16),
+            );
+            let sc67 = _mm256_set_m128i(
+                _mm_set1_epi16(*sc_h.add(7) as i16),
+                _mm_set1_epi16(*sc_h.add(6) as i16),
+            );
+
+            let x1 = _mm256_loadu_si256(x_h as *const __m256i);
+            let x2 = _mm256_loadu_si256(x_h.add(32) as *const __m256i);
+            let x3 = _mm256_loadu_si256(x_h.add(64) as *const __m256i);
+            let x4 = _mm256_loadu_si256(x_h.add(96) as *const __m256i);
+
+            let p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q1, x1), sc01);
+            let p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2, x2), sc23);
+            let p3 = _mm256_madd_epi16(_mm256_maddubs_epi16(q3, x3), sc45);
+            let p4 = _mm256_madd_epi16(_mm256_maddubs_epi16(q4, x4), sc67);
+
+            acc = _mm256_add_epi32(
+                acc,
+                _mm256_add_epi32(_mm256_add_epi32(p1, p2), _mm256_add_epi32(p3, p4)),
+            );
+        }
+
+        let isum = hsum256_epi32(acc) - 32 * hsum256_epi32(bias_v);
+        sumf += (dw * xb.d) * (isum as f32);
+    }
+    sumf
+}
+
+/// 2-row simultaneous 32-wide AVX2 W6A8 (`Q6_K × Q8_K`) decode kernel (accelerates 185 MB `lm_head`).
+#[target_feature(enable = "avx2")]
+pub unsafe fn dot_q6_k_q8_k_2row_avx2(raw0: &[u8], raw1: &[u8], x: &[BlockQ8_K]) -> [f32; 2] {
+    let nb = x.len();
+    let mask_low4 = _mm256_set1_epi8(0x0F);
+    let mask_low2 = _mm256_set1_epi8(0x03);
+    let mut sumf = [0.0f32; 2];
+
+    for b in 0..nb {
+        let off = b * 210;
+        let xb = x.get_unchecked(b);
+        let bs16 = _mm256_loadu_si256(xb.bsums.as_ptr() as *const __m256i);
+
+        let ql0_b = raw0.as_ptr().add(off);
+        let qh0_b = raw0.as_ptr().add(off + 128);
+        let sc0_b = raw0.as_ptr().add(off + 192) as *const i8;
+        let dw0 = f16_to_f32(u16::from_le_bytes([
+            *raw0.get_unchecked(off + 208),
+            *raw0.get_unchecked(off + 209),
+        ]));
+
+        let ql1_b = raw1.as_ptr().add(off);
+        let qh1_b = raw1.as_ptr().add(off + 128);
+        let sc1_b = raw1.as_ptr().add(off + 192) as *const i8;
+        let dw1 = f16_to_f32(u16::from_le_bytes([
+            *raw1.get_unchecked(off + 208),
+            *raw1.get_unchecked(off + 209),
+        ]));
+
+        let bias0 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128(sc0_b as *const __m128i)), bs16);
+        let bias1 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128(sc1_b as *const __m128i)), bs16);
+
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+
+        for half in 0..2 {
+            let x_h = xb.qs.as_ptr().add(half * 128);
+            let x1 = _mm256_loadu_si256(x_h as *const __m256i);
+            let x2 = _mm256_loadu_si256(x_h.add(32) as *const __m256i);
+            let x3 = _mm256_loadu_si256(x_h.add(64) as *const __m256i);
+            let x4 = _mm256_loadu_si256(x_h.add(96) as *const __m256i);
+
+            // Row 0
+            {
+                let ql_h = ql0_b.add(half * 64);
+                let qh_h = qh0_b.add(half * 32);
+                let sc_h = sc0_b.add(half * 8);
+                let ql0 = _mm256_loadu_si256(ql_h as *const __m256i);
+                let ql1 = _mm256_loadu_si256(ql_h.add(32) as *const __m256i);
+                let qh = _mm256_loadu_si256(qh_h as *const __m256i);
+
+                let q1 = _mm256_or_si256(_mm256_and_si256(ql0, mask_low4), _mm256_slli_epi16(_mm256_and_si256(qh, mask_low2), 4));
+                let q2 = _mm256_or_si256(_mm256_and_si256(ql1, mask_low4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2), mask_low2), 4));
+                let q3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql0, 4), mask_low4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 4), mask_low2), 4));
+                let q4 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql1, 4), mask_low4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 6), mask_low2), 4));
+
+                let p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q1, x1), _mm256_set_m128i(_mm_set1_epi16(*sc_h.add(1) as i16), _mm_set1_epi16(*sc_h as i16)));
+                let p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2, x2), _mm256_set_m128i(_mm_set1_epi16(*sc_h.add(3) as i16), _mm_set1_epi16(*sc_h.add(2) as i16)));
+                let p3 = _mm256_madd_epi16(_mm256_maddubs_epi16(q3, x3), _mm256_set_m128i(_mm_set1_epi16(*sc_h.add(5) as i16), _mm_set1_epi16(*sc_h.add(4) as i16)));
+                let p4 = _mm256_madd_epi16(_mm256_maddubs_epi16(q4, x4), _mm256_set_m128i(_mm_set1_epi16(*sc_h.add(7) as i16), _mm_set1_epi16(*sc_h.add(6) as i16)));
+                acc0 = _mm256_add_epi32(acc0, _mm256_add_epi32(_mm256_add_epi32(p1, p2), _mm256_add_epi32(p3, p4)));
+            }
+
+            // Row 1
+            {
+                let ql_h = ql1_b.add(half * 64);
+                let qh_h = qh1_b.add(half * 32);
+                let sc_h = sc1_b.add(half * 8);
+                let ql0 = _mm256_loadu_si256(ql_h as *const __m256i);
+                let ql1 = _mm256_loadu_si256(ql_h.add(32) as *const __m256i);
+                let qh = _mm256_loadu_si256(qh_h as *const __m256i);
+
+                let q1 = _mm256_or_si256(_mm256_and_si256(ql0, mask_low4), _mm256_slli_epi16(_mm256_and_si256(qh, mask_low2), 4));
+                let q2 = _mm256_or_si256(_mm256_and_si256(ql1, mask_low4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2), mask_low2), 4));
+                let q3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql0, 4), mask_low4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 4), mask_low2), 4));
+                let q4 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql1, 4), mask_low4), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 6), mask_low2), 4));
+
+                let p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q1, x1), _mm256_set_m128i(_mm_set1_epi16(*sc_h.add(1) as i16), _mm_set1_epi16(*sc_h as i16)));
+                let p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2, x2), _mm256_set_m128i(_mm_set1_epi16(*sc_h.add(3) as i16), _mm_set1_epi16(*sc_h.add(2) as i16)));
+                let p3 = _mm256_madd_epi16(_mm256_maddubs_epi16(q3, x3), _mm256_set_m128i(_mm_set1_epi16(*sc_h.add(5) as i16), _mm_set1_epi16(*sc_h.add(4) as i16)));
+                let p4 = _mm256_madd_epi16(_mm256_maddubs_epi16(q4, x4), _mm256_set_m128i(_mm_set1_epi16(*sc_h.add(7) as i16), _mm_set1_epi16(*sc_h.add(6) as i16)));
+                acc1 = _mm256_add_epi32(acc1, _mm256_add_epi32(_mm256_add_epi32(p1, p2), _mm256_add_epi32(p3, p4)));
             }
         }
-        sumf += (dw * xb.d) * (hsum256_epi32(acc) as f32);
+
+        let dx = xb.d;
+        sumf[0] += (dw0 * dx) * ((hsum256_epi32(acc0) - 32 * hsum256_epi32(bias0)) as f32);
+        sumf[1] += (dw1 * dx) * ((hsum256_epi32(acc1) - 32 * hsum256_epi32(bias1)) as f32);
     }
     sumf
 }
@@ -661,6 +772,147 @@ pub unsafe fn dot_q6_k_q8_k_batch4_avx2(
         }
         for t in 0..4 {
             sumf[t] += (dw * xbs[t].d) * (hsum256_epi32(acc[t]) as f32);
+        }
+    }
+    sumf
+}
+
+/// Exact AVX2 W5A8 (`Q5_K × Q8_K`) super-block dot product with fused scale multiply-add.
+#[target_feature(enable = "avx2")]
+pub unsafe fn dot_q5_k_q8_k_avx2(raw: &[u8], x: &[BlockQ8_K]) -> f32 {
+    let nb = x.len();
+    let mask_low = _mm256_set1_epi8(0x0F);
+    let zero = _mm256_setzero_si256();
+    let sixteen = _mm256_set1_epi8(16);
+    let mut sumf = 0.0f32;
+
+    for b in 0..nb {
+        let off = b * 176;
+        let dw = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off),
+            *raw.get_unchecked(off + 1),
+        ]));
+        let dmin_w = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off + 2),
+            *raw.get_unchecked(off + 3),
+        ]));
+        let scales = &raw[off + 4..off + 16];
+        let qh = _mm256_loadu_si256(raw.as_ptr().add(off + 16) as *const __m256i);
+        let qs_ptr = raw.as_ptr().add(off + 48);
+        let xb = x.get_unchecked(b);
+
+        let mut acc_q = _mm256_setzero_si256();
+        let mut sum_m = 0i32;
+
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+
+            sum_m += (m1 as i32)
+                * (*xb.bsums.get_unchecked(is * 2) as i32
+                    + *xb.bsums.get_unchecked(is * 2 + 1) as i32);
+            sum_m += (m2 as i32)
+                * (*xb.bsums.get_unchecked((is + 1) * 2) as i32
+                    + *xb.bsums.get_unchecked((is + 1) * 2 + 1) as i32);
+
+            let m1_mask = _mm256_set1_epi8((1u8 << (chunk * 2)) as i8);
+            let m2_mask = _mm256_set1_epi8((2u8 << (chunk * 2)) as i8);
+            let h_lo = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, m1_mask), zero), sixteen);
+            let h_hi = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, m2_mask), zero), sixteen);
+
+            let q_bytes = _mm256_loadu_si256(qs_ptr.add(chunk * 32) as *const __m256i);
+            let q_lo = _mm256_or_si256(_mm256_and_si256(q_bytes, mask_low), h_lo);
+            let q_hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q_bytes, 4), mask_low), h_hi);
+
+            let x_lo = _mm256_loadu_si256(xb.qs.as_ptr().add(chunk * 64) as *const __m256i);
+            let x_hi = _mm256_loadu_si256(xb.qs.as_ptr().add(chunk * 64 + 32) as *const __m256i);
+
+            let p_lo = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, x_lo), _mm256_set1_epi16(sc1 as i16));
+            let p_hi = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, x_hi), _mm256_set1_epi16(sc2 as i16));
+            acc_q = _mm256_add_epi32(acc_q, _mm256_add_epi32(p_lo, p_hi));
+        }
+
+        let sum_q = hsum256_epi32(acc_q);
+        sumf += (dw * xb.d) * (sum_q as f32) - (dmin_w * xb.d) * (sum_m as f32);
+    }
+    sumf
+}
+
+/// 4-token batched AVX2 W5A8 (`Q5_K × Q8_K`) prefill GEMM micro-kernel (unpacks weights once).
+#[target_feature(enable = "avx2")]
+pub unsafe fn dot_q5_k_q8_k_batch4_avx2(
+    raw: &[u8],
+    x0: &[BlockQ8_K],
+    x1: &[BlockQ8_K],
+    x2: &[BlockQ8_K],
+    x3: &[BlockQ8_K],
+) -> [f32; 4] {
+    let nb = x0.len();
+    let mask_low = _mm256_set1_epi8(0x0F);
+    let zero = _mm256_setzero_si256();
+    let sixteen = _mm256_set1_epi8(16);
+    let mut sumf = [0.0f32; 4];
+
+    for b in 0..nb {
+        let off = b * 176;
+        let dw = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off),
+            *raw.get_unchecked(off + 1),
+        ]));
+        let dmin_w = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off + 2),
+            *raw.get_unchecked(off + 3),
+        ]));
+        let scales = &raw[off + 4..off + 16];
+        let qh = _mm256_loadu_si256(raw.as_ptr().add(off + 16) as *const __m256i);
+        let qs_ptr = raw.as_ptr().add(off + 48);
+        let xbs = [
+            x0.get_unchecked(b),
+            x1.get_unchecked(b),
+            x2.get_unchecked(b),
+            x3.get_unchecked(b),
+        ];
+
+        let mut acc_q = [_mm256_setzero_si256(); 4];
+        let mut sum_m = [0i32; 4];
+
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let vsc1 = _mm256_set1_epi16(sc1 as i16);
+            let vsc2 = _mm256_set1_epi16(sc2 as i16);
+
+            let m1_mask = _mm256_set1_epi8((1u8 << (chunk * 2)) as i8);
+            let m2_mask = _mm256_set1_epi8((2u8 << (chunk * 2)) as i8);
+            let h_lo = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, m1_mask), zero), sixteen);
+            let h_hi = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, m2_mask), zero), sixteen);
+
+            let q_bytes = _mm256_loadu_si256(qs_ptr.add(chunk * 32) as *const __m256i);
+            let q_lo = _mm256_or_si256(_mm256_and_si256(q_bytes, mask_low), h_lo);
+            let q_hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q_bytes, 4), mask_low), h_hi);
+
+            for t in 0..4 {
+                let xb = xbs[t];
+                sum_m[t] += (m1 as i32)
+                    * (*xb.bsums.get_unchecked(is * 2) as i32
+                        + *xb.bsums.get_unchecked(is * 2 + 1) as i32);
+                sum_m[t] += (m2 as i32)
+                    * (*xb.bsums.get_unchecked((is + 1) * 2) as i32
+                        + *xb.bsums.get_unchecked((is + 1) * 2 + 1) as i32);
+
+                let x_lo = _mm256_loadu_si256(xb.qs.as_ptr().add(chunk * 64) as *const __m256i);
+                let x_hi = _mm256_loadu_si256(xb.qs.as_ptr().add(chunk * 64 + 32) as *const __m256i);
+                let p_lo = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, x_lo), vsc1);
+                let p_hi = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, x_hi), vsc2);
+                acc_q[t] = _mm256_add_epi32(acc_q[t], _mm256_add_epi32(p_lo, p_hi));
+            }
+        }
+
+        for t in 0..4 {
+            let dx = xbs[t].d;
+            sumf[t] += (dw * dx) * (hsum256_epi32(acc_q[t]) as f32) - (dmin_w * dx) * (sum_m[t] as f32);
         }
     }
     sumf

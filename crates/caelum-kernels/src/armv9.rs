@@ -549,3 +549,164 @@ pub unsafe fn dot_q6_k_q8_k_batch4_dotprod(
     }
     sumf
 }
+
+/// ARMv9 native W5A8 (`Q5_K × Q8_K`) super-block dot product using hardware `SDOT` (`vdotq_s32`).
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn dot_q5_k_q8_k_dotprod(raw: &[u8], x: &[BlockQ8_K]) -> f32 {
+    let nb = x.len();
+    let mask_low = vdupq_n_u8(0x0F);
+    let sixteen = vdupq_n_u8(16);
+    let mut sumf = 0.0f32;
+
+    for b in 0..nb {
+        let off = b * 176;
+        let dw = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off),
+            *raw.get_unchecked(off + 1),
+        ]));
+        let dmin_w = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off + 2),
+            *raw.get_unchecked(off + 3),
+        ]));
+        let scales = &raw[off + 4..off + 16];
+        let qh0 = vld1q_u8(raw.as_ptr().add(off + 16));
+        let qh1 = vld1q_u8(raw.as_ptr().add(off + 32));
+        let qs_ptr = raw.as_ptr().add(off + 48);
+        let xb = x.get_unchecked(b);
+
+        let mut sum_q = 0i32;
+        let mut sum_m = 0i32;
+
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+
+            sum_m += (m1 as i32)
+                * (*xb.bsums.get_unchecked(is * 2) as i32
+                    + *xb.bsums.get_unchecked(is * 2 + 1) as i32);
+            sum_m += (m2 as i32)
+                * (*xb.bsums.get_unchecked((is + 1) * 2) as i32
+                    + *xb.bsums.get_unchecked((is + 1) * 2 + 1) as i32);
+
+            let m1_mask = vdupq_n_u8(1u8 << (chunk * 2));
+            let m2_mask = vdupq_n_u8(2u8 << (chunk * 2));
+            let h_lo0 = vandq_u8(vtstq_u8(qh0, m1_mask), sixteen);
+            let h_lo1 = vandq_u8(vtstq_u8(qh1, m1_mask), sixteen);
+            let h_hi0 = vandq_u8(vtstq_u8(qh0, m2_mask), sixteen);
+            let h_hi1 = vandq_u8(vtstq_u8(qh1, m2_mask), sixteen);
+
+            let q0 = vld1q_u8(qs_ptr.add(chunk * 32));
+            let q1 = vld1q_u8(qs_ptr.add(chunk * 32 + 16));
+
+            let q_lo0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q0, mask_low), h_lo0));
+            let q_lo1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q1, mask_low), h_lo1));
+            let q_hi0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q0), h_hi0));
+            let q_hi1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q1), h_hi1));
+
+            let x_ptr = xb.qs.as_ptr().add(chunk * 64);
+            let x_lo0 = vld1q_s8(x_ptr);
+            let x_lo1 = vld1q_s8(x_ptr.add(16));
+            let x_hi0 = vld1q_s8(x_ptr.add(32));
+            let x_hi1 = vld1q_s8(x_ptr.add(48));
+
+            let acc_lo = vdotq_s32(vdotq_s32(vdupq_n_s32(0), q_lo0, x_lo0), q_lo1, x_lo1);
+            let acc_hi = vdotq_s32(vdotq_s32(vdupq_n_s32(0), q_hi0, x_hi0), q_hi1, x_hi1);
+
+            sum_q += (sc1 as i32) * vaddvq_s32(acc_lo) + (sc2 as i32) * vaddvq_s32(acc_hi);
+        }
+
+        sumf += (dw * xb.d) * (sum_q as f32) - (dmin_w * xb.d) * (sum_m as f32);
+    }
+    sumf
+}
+
+/// ARMv9 `dotprod` 4-token batched `Q5_K × Q8_K` prefill GEMM micro-kernel.
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn dot_q5_k_q8_k_batch4_dotprod(
+    raw: &[u8],
+    x0: &[BlockQ8_K],
+    x1: &[BlockQ8_K],
+    x2: &[BlockQ8_K],
+    x3: &[BlockQ8_K],
+) -> [f32; 4] {
+    let nb = x0.len();
+    let mask_low = vdupq_n_u8(0x0F);
+    let sixteen = vdupq_n_u8(16);
+    let mut sumf = [0.0f32; 4];
+
+    for b in 0..nb {
+        let off = b * 176;
+        let dw = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off),
+            *raw.get_unchecked(off + 1),
+        ]));
+        let dmin_w = f16_to_f32(u16::from_le_bytes([
+            *raw.get_unchecked(off + 2),
+            *raw.get_unchecked(off + 3),
+        ]));
+        let scales = &raw[off + 4..off + 16];
+        let qh0 = vld1q_u8(raw.as_ptr().add(off + 16));
+        let qh1 = vld1q_u8(raw.as_ptr().add(off + 32));
+        let qs_ptr = raw.as_ptr().add(off + 48);
+        let xbs = [
+            x0.get_unchecked(b),
+            x1.get_unchecked(b),
+            x2.get_unchecked(b),
+            x3.get_unchecked(b),
+        ];
+
+        let mut sum_q = [0i32; 4];
+        let mut sum_m = [0i32; 4];
+
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+
+            let m1_mask = vdupq_n_u8(1u8 << (chunk * 2));
+            let m2_mask = vdupq_n_u8(2u8 << (chunk * 2));
+            let h_lo0 = vandq_u8(vtstq_u8(qh0, m1_mask), sixteen);
+            let h_lo1 = vandq_u8(vtstq_u8(qh1, m1_mask), sixteen);
+            let h_hi0 = vandq_u8(vtstq_u8(qh0, m2_mask), sixteen);
+            let h_hi1 = vandq_u8(vtstq_u8(qh1, m2_mask), sixteen);
+
+            let q0 = vld1q_u8(qs_ptr.add(chunk * 32));
+            let q1 = vld1q_u8(qs_ptr.add(chunk * 32 + 16));
+
+            let q_lo0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q0, mask_low), h_lo0));
+            let q_lo1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(q1, mask_low), h_lo1));
+            let q_hi0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q0), h_hi0));
+            let q_hi1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(q1), h_hi1));
+
+            for t in 0..4 {
+                let xb = xbs[t];
+                sum_m[t] += (m1 as i32)
+                    * (*xb.bsums.get_unchecked(is * 2) as i32
+                        + *xb.bsums.get_unchecked(is * 2 + 1) as i32);
+                sum_m[t] += (m2 as i32)
+                    * (*xb.bsums.get_unchecked((is + 1) * 2) as i32
+                        + *xb.bsums.get_unchecked((is + 1) * 2 + 1) as i32);
+
+                let x_ptr = xb.qs.as_ptr().add(chunk * 64);
+                let acc_lo = vdotq_s32(
+                    vdotq_s32(vdupq_n_s32(0), q_lo0, vld1q_s8(x_ptr)),
+                    q_lo1,
+                    vld1q_s8(x_ptr.add(16)),
+                );
+                let acc_hi = vdotq_s32(
+                    vdotq_s32(vdupq_n_s32(0), q_hi0, vld1q_s8(x_ptr.add(32))),
+                    q_hi1,
+                    vld1q_s8(x_ptr.add(48)),
+                );
+                sum_q[t] += (sc1 as i32) * vaddvq_s32(acc_lo) + (sc2 as i32) * vaddvq_s32(acc_hi);
+            }
+        }
+
+        for t in 0..4 {
+            let dx = xbs[t].d;
+            sumf[t] += (dw * dx) * (sum_q[t] as f32) - (dmin_w * dx) * (sum_m[t] as f32);
+        }
+    }
+    sumf
+}

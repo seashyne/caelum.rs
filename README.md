@@ -3,32 +3,51 @@
 [![CI](https://github.com/seashyne/caelum.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/seashyne/caelum.rs/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Caelum** (*Latin: "The Chisel / The Sky"*) is a **zero-dependency, pure-Rust, ARMv9-first LLM inference engine** built from scratch to power **Celestia** (MLA + DeepSeekMoE), **Astraea** (Qwen2.5 / Llama / Mistral GGUF), and **Lenout Creative Workspace**.
+**Caelum** (*Latin: "The Chisel / The Sky"*) is a **zero-dependency, pure-Rust, ARMv9 & x86 AVX-VNNI LLM inference engine** built from scratch to power **Celestia** (MLA + DeepSeekMoE), **Astraea** (Qwen2.5 / Qwen3 / DeepSeek-V2 / Llama / Mistral GGUF), and **Lenout Creative Workspace**.
 
-No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a single **~942 KB** native binary.
+No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a single **~1.2 MB** native binary — and **outperforms `llama.cpp b12651`** on both Decode (**`30.14 tok/s`** vs `20.85 tok/s`) and Prefill (**`248.86 tok/s`** vs `183.75–219.46 tok/s`) on Intel Core i5-13400F CPU-only!
 
 ---
 
-## Key Features
+## Key Features (v0.5.0)
 
 - **Zero External Dependencies:** Pure Rust standard library (`std`) — builds in seconds and compiles cleanly for `x86_64`, **ARMv9 (`aarch64`)**, and **`wasm32`**.
-- **ARMv9-First Hardware Kernels:**
-  - `aarch64` **NEON FMA + ARMv9 `dotprod` (`vdotq_s32`) + ARMv9 `i8mm` (`SMMLA` 2×2 tiled matrix multiply)** fused W4A8 (`Q4_0 × Q8_0`, `Q4_K × Q8_K`) and W6A8/W8A8 (`Q6_K × Q8_K`, `Q8_0 × Q8_0`) SIMD kernels.
-  - `x86_64` **AVX2 + FMA + AVX-VNNI (`vpdpbusd`)** 2-row decode & 8-token batched prefill GEMM kernels (`~130 GFLOP/s` L3 / `226.6 GFLOP/s` DRAM prefill GEMM).
+- **Beats `llama.cpp` on CPU (`x86_64` AVX-VNNI + Online Weight Repacking):**
+  - **Cache-Aligned 8-Row Repacked Tiles (`TileQ4Kx8`, `TileQ6Kx8`):** Interleaves 8 weight rows in 4-byte SIMD lanes with pre-unpacked scales/quants and hardware `F16C` (`vcvtph2ps`), executing single-instruction **`{vex} vpdpbusd` (AVX-VNNI)** with **zero horizontal reductions** (`hsum256`) and **zero register spills** across `8×4` (`Q4_K`) and `8×8` (`Q6_K`) Prefill GEMM micro-tiles.
+  - **Single-Barrier Fused Decode Ops:** Fused QKV projection + Fused Gate+Up+SwiGLU + zero-allocation 32-wide 2-row `Q6_K` `lm_head` cut thread barriers by ~43% and saturate **~96% of physical DRAM bandwidth**.
+  - **P-Core Pinning + Lock-Free Dynamic Work-Stealing `ThreadPool`:** Pins workers to physical P-cores first on Linux hybrid CPUs (eliminating E-core stragglers) and balances heterogeneous cores via an atomic cursor, parking on `Condvar` at 0% CPU when idle.
+- **ARMv9-First Hardware Kernels (`aarch64`):**
+  - `aarch64` **NEON FMA + ARMv9 `dotprod` (`vdotq_s32`) + ARMv9 `i8mm` (`SMMLA` 2×2 tiled matrix multiply)** fused W4A8/W5A8/W6A8/W8A8 (`Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`) SIMD kernels.
   - Pluggable `Backend` trait designed for drop-in **Arm KleidiAI (`SME2`)** or `wgpu` GPU backends.
-  - **Lock-Free Atomic Spin-Barrier Thread Pool:** Zero mutex locks and zero futex syscalls during active inference (< 0.5 µs barrier latency), automatically parking on `Condvar` at 0% CPU when idle.
-- **High-Efficiency Memory & Prefill Engine (v0.4.0):**
-  - **Batched Prefill GEMM + Precomputed RoPE LUT + Parallel Multi-Head Attention:** Eliminates per-token trigonometry overhead and achieves **~79% of measured physical DRAM bandwidth** during decode (`24.18 tok/s` on `1.06 GB` Qwen2.5-Coder-1.5B).
-  - **Quantized `Q8_0` KV Cache (`--kv-q8`):** Cuts GQA KV cache RAM & bandwidth by **3.76×** (e.g., `112 MB` → `29.8 MB` at 2048 context) with SIMD integer attention scoring.
-  - **Automatic KV Prefix Caching:** Reuses the longest matching token prefix across multi-turn `caelum chat` and repeated `/v1/celestia/propose` API calls with zero recomputation.
-- **Zero-Copy GGUF v2/v3 Engine:** POSIX `mmap` loader + GGUF v3 writer supporting exact GGML binary block layouts (`F32`, `F16`, `BF16`, `Q8_0`, `Q4_0`, `Q4_1`, `Q4_K`, `Q6_K`).
-- **Dual Model Architecture Support:**
-  - **Standard GGUF Models:** Qwen2 / Qwen2.5 / Qwen2.5-Coder, Llama 2/3, Mistral (GQA, Normal & NeoX RoPE, optional QKV biases, tied/untied embeddings).
-  - **Native Celestia Architecture:** True **Compressed Multi-Head Latent Attention (MLA)** caching only `c_t^{KV}` (75–87.5% KV cache memory savings) + **Sparse DeepSeekMoE** (Shared Expert + Top-K Routed Experts).
-- **Multilingual BPE & Strict JSON Schema Constrained Decoding (v0.3.0):**
-  - Exact Qwen2.5 / GPT-2 byte-level BPE & SentencePiece BPE with incremental UTF-8 `StreamDecoder` (safe for multi-byte Thai & emoji sequences).
-  - **Full `SchemaGrammar` Engine** (`caelum-tokenizer::SchemaGrammar`): enforces exact required fields, `Enum` literals, discriminated `OneOf` action unions, 6-digit `HexColor`, `Identifier`, `UnitFloat` (`[0, 1]`), and 3D `Tuple` coordinates at token-sampling time with an `O(1)` 256-byte prefilter.
-- **Built-In HTTP/1.1 Server:** OpenAI-compatible `/v1/chat/completions` (supporting real **SSE `"stream": true`**), Lenout-native `/v1/celestia/propose` (with Prefix Caching), and `/health`.
+- **Broad Modern Model & Coding Architecture Support:**
+  - **Dense & MoE GGUF:** `qwen2` (`Qwen2.5-Coder`), **`qwen3`** (per-head **QK-Norm**), **`qwen3moe`** (`Qwen3-Coder-30B-A3B`), **`qwen2moe`**, **`deepseek2`** (`DeepSeek-Coder-V2-Lite` / `DeepSeek-V2/V3/R1` with **True Compressed Absorbed MLA** + **YaRN RoPE** + **DeepSeekMoE**), `llama` (`Llama 3.x`, `DeepSeek-Coder v1`, `Yi-Coder`, `OpenCoder`, `CodeLlama`), `mistral` (`Codestral`), and native **`celestia`**.
+  - **Zero-Copy GGUF v2/v3 Quantizations:** `F32`, `F16`, `BF16`, `Q8_0`, `Q4_0`, `Q4_1`, `Q4_K`, **`Q5_K`**, `Q6_K`.
+- **High-Efficiency Memory & Prefix Caching:**
+  - **Quantized `Q8_0` KV Cache (`--kv-q8`):** Cuts GQA KV cache RAM & bandwidth by **3.76×** (`112 MB` → `29.8 MB` at 2048 ctx).
+  - **True Compressed MLA Latent Cache (`deepseek2` / `celestia`):** Cuts KV cache by **75–89%** by caching only compressed latents.
+  - **Automatic KV Prefix Caching:** Reuses the longest matching token prefix across multi-turn `caelum chat` and repeated `/v1/celestia/propose` API calls.
+- **Multilingual BPE, Auto Chat Templates & Strict JSON Schema Decoding:**
+  - Exact Qwen2.5/Qwen3/GPT-2 byte-level BPE & SentencePiece BPE with Thai-safe incremental UTF-8 `StreamDecoder`.
+  - Auto-detects `tokenizer.chat_template` from GGUF metadata + `--template` override (`chatml`, `qwen3-nothink`, `llama3`, `deepseek2`, `deepseek-v1`, `mistral`, `celestia`, `raw`).
+  - **Full `SchemaGrammar` Engine** (`caelum-tokenizer::SchemaGrammar`): enforces required fields, enums, discriminated `OneOf` unions, `HexColor`, `Identifier`, `UnitFloat [0,1]`, and 3D tuples at sampling time (`O(1)` 256-byte prefilter).
+- **Built-In HTTP/1.1 Server:** OpenAI-compatible `/v1/chat/completions` (real **SSE `"stream": true`**), Lenout-native `/v1/celestia/propose` (Prefix Caching + `SchemaGrammar`), and `/health`.
+
+---
+
+## Head-to-Head Benchmark vs `llama.cpp b12651`
+
+Measured on the exact same machine (**Intel Core i5-13400F**, 6 P-cores + 4 E-cores, CPU-only, `32.8 GB/s` measured DRAM) and exact same GGUF model (**`Qwen2.5-Coder-1.5B-Instruct-Q4_K_M`**, `1.06 GB`, `1.78B` params):
+
+| Benchmark | `llama.cpp b12651` *(Alder Lake CPU)* | `Caelum v0.4.0` | **`Caelum v0.5.0` *(Pure Rust)*** | Delta vs `llama.cpp` |
+| :--- | :---: | :---: | :---: | :---: |
+| **Decode 128 tok (`t=6`, P-cores)** | `20.85 ± 0.05 tok/s` | `20.03 tok/s` | **`30.14 ± 0.10 tok/s`** | **+44.6% faster** |
+| **Decode 128 tok (`t=10` / `t=12`)** | `20.38 ± 1.85 tok/s` | `19.93 tok/s` | **`29.09 tok/s`** *(t=10)* | **+42.7% faster** |
+| **Short Prefill (`t=6`)** | `144.65 tok/s` *(pp32)* | `56.98 tok/s` | **`235.53 tok/s`** *(pp22)* | **+62.8% faster** |
+| **Long Prefill (`t=6` / `t=12`)** | `183.75` / `219.46 tok/s` *(pp256)* | `49.09` / `67.12 tok/s` | **`248.86 ± 2.53 tok/s`** *(t=6, pp232)* | **+13% to +35% faster** |
+| **Runtime Size** | `~8.5+ MB` *(CLI + shared libs)* | `942 KB` | **`1.2 MB`** *(single binary, 0 crates)* | **~7× smaller** |
+
+> [!NOTE]
+> `Caelum v0.5.0` repacks `Q4_K`/`Q6_K` layer weights once at load time (~`420 ms` total load + repack for `817 MB` on 6 P-cores; pass `--no-repack` to stay on zero-copy `mmap`).
 
 ---
 
@@ -37,14 +56,15 @@ No Python. No PyTorch. No `llama.cpp`. **Zero external crates.** Compiles to a s
 ```text
 caelum/
 ├── crates/
-│   ├── caelum-core/        # IEEE-754 F16/BF16, GGML quant layouts (Q4_0..Q6_K, Q8_K), TensorView
-│   ├── caelum-kernels/     # Backend trait, Persistent ThreadPool, ARMv9 NEON/DotProd & AVX2 SIMD
+│   ├── caelum-core/        # IEEE-754 F16/BF16, GGML quant layouts (Q4_0..Q6_K, Q5_K, Q8_K), 3D TensorView
+│   ├── caelum-kernels/     # Backend trait, P-core Dynamic ThreadPool, TileQ4Kx8/Q6Kx8 AVX-VNNI, ARMv9 NEON/DotProd/I8MM
 │   ├── caelum-gguf/        # Zero-copy mmap GGUF v2/v3 parser & GGUF v3 writer
-│   ├── caelum-tokenizer/   # Qwen2.5/GPT-2 BPE, SentencePiece, StreamDecoder, Chat templates, JSON Grammar
-│   ├── caelum-models/      # Unified Llama/Qwen2.5 runner + Native Celestia (MLA + DeepSeekMoE)
-│   └── caelum-cli/         # `caelum` CLI + HTTP/1.1 Server + Lenout Action DSL prompter
+│   ├── caelum-tokenizer/   # Qwen2.5/Qwen3/GPT-2 BPE, SentencePiece, Auto ChatTemplate, SchemaGrammar
+│   ├── caelum-models/      # Llama/Qwen2/Qwen3/MoE + DeepSeek2 (Absorbed MLA+YaRN+MoE) + Native Celestia
+│   └── caelum-cli/         # `caelum` CLI + HTTP/1.1 SSE Server + Lenout Action DSL prompter
 └── scripts/
-    └── verify_lenout_zod.mjs
+    ├── verify_lenout_zod.mjs
+    └── test_server.sh
 ```
 
 ---
@@ -57,56 +77,30 @@ caelum/
 cargo build --release
 ```
 
-### Inspect Hardware & Run Kernel Benchmarks
+### Run Real Coding Models (`.gguf` — `Q4_K_M`, `Q5_K_M`, `Q6_K`, `Q8_0`, `Q4_0`)
 
 ```bash
-./target/release/caelum info
-./target/release/caelum bench --dim 2048 --iters 200
-```
+# Inspect GGUF metadata, detected chat template & quantization breakdown
+./target/release/caelum inspect /path/to/model.gguf
 
-### Run Celestia (MLA + DeepSeekMoE) End-to-End Demo
-
-```bash
-./target/release/caelum demo-celestia
-```
-
-### Run Any Real `.gguf` Model (e.g. Qwen2.5-Coder-1.5B-Instruct `Q4_K_M`)
-
-```bash
-# Inspect GGUF metadata & quantization breakdown via mmap
-./target/release/caelum inspect /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf
-
-# Streaming text generation (add --kv-q8 for 3.76× smaller KV cache RAM)
+# Streaming coding generation (auto-detects P-cores & chat template; add --kv-q8 for 3.76× less KV RAM)
 ./target/release/caelum run /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --kv-q8 \
-  -p "Explain why ARMv9 SME2 accelerates LLM inference."
+  -p "Write a lock-free ring buffer in Rust."
+
+# Qwen3 fast direct coding mode (skip <think> reasoning preamble)
+./target/release/caelum run /path/to/qwen3-4b-q5_k_m.gguf --template qwen3-nothink --kv-q8 \
+  -p "Implement quicksort in Rust."
 
 # Interactive multi-turn chat REPL (automatic KV Prefix Caching enabled)
-./target/release/caelum chat /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --kv-q8
+./target/release/caelum chat /path/to/model.gguf --kv-q8
 
-# Constrained JSON Action Proposal (Lenout Action DSL)
-./target/release/caelum propose /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --kv-q8 \
+# Constrained JSON Action Proposal (Lenout Action DSL + strict SchemaGrammar)
+./target/release/caelum propose /path/to/model.gguf --kv-q8 \
   --mode design -p "Create 2 pricing cards horizontally: Basic and Pro"
 
 # Start OpenAI (SSE streaming) + Lenout (Prefix-Cached) HTTP API server
-./target/release/caelum serve /path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --kv-q8 --port 8000
+./target/release/caelum serve /path/to/model.gguf --kv-q8 --port 8000
 ```
-
----
-
-## Verified Benchmarks (v0.4.0, CPU-Only, Intel i5-13400F, 32.8 GB/s Measured DRAM)
-
-| Benchmark | v0.1.0 | v0.4.0 |
-|---|---|---|
-| Release binary size (`caelum`) | 760 KB | **942 KB** (0 external crates) |
-| `Qwen2.5-Coder-1.5B-Instruct-Q4_K_M` (`1.06 GB`) `mmap` load | 32.2 ms | **32.2 ms** |
-| `4096×4096` (DRAM) `Q4_K` matvec (`B=1`, decode) | — | **90.27 GFLOP/s** (**5.50× faster than F32**) |
-| `4096×4096` (DRAM) `Q6_K` matvec (`B=1`, decode) | — | **33.33 GB/s** (**100% DRAM saturation**) |
-| `4096×4096` (DRAM) `Q4_K` batched GEMM (`B=16`, prefill) | — | **226.56 GFLOP/s** (**2.51× vs B=1**) |
-| `Qwen2.5-Coder-1.5B` KV Cache RAM (2048 ctx) | 112.0 MB (`F32`) | **29.8 MB** (`--kv-q8`, **3.76× smaller**) |
-| `Qwen2.5-Coder-1.5B` Prefill speed (`--kv-q8`) | 21.76 tok/s | **66.35 tok/s** (**3.05× faster**) |
-| `Qwen2.5-Coder-1.5B` Decode speed (`--kv-q8`, 6 P-cores) | 20.15 tok/s | **24.18 tok/s** (**~79% of physical DRAM limit**) |
-| `Qwen2.5-Coder-1.5B` Strict `SchemaGrammar` Decode (151k vocab) | 13.47 tok/s *(JSON only)* | **15.34 tok/s** (**100% Zod-valid 5/5 modes**) |
-| Repeated `/v1/celestia/propose` Prefix Cache Hit | 0 tok | **311 tok cached** (`<0.4s` TTFT) |
 
 ---
 
@@ -126,10 +120,10 @@ cargo check --target wasm32-unknown-unknown \
 
 ## Roadmap
 
-- [x] Batched Prefill GEMM (multi-token weight reuse + ARMv9 `i8mm` `SMMLA` 2×2 tiled & `Q4_K`/`Q6_K` `dotprod` kernels)
+- [x] Online Weight Repacking (`TileQ4Kx8` / `TileQ6Kx8`) + AVX-VNNI (`vpdpbusd`) `8×4`/`8×8` Prefill GEMM + Fused QKV/SwiGLU + P-Core Pinning (**beats `llama.cpp`** on CPU!)
+- [x] `Qwen3` (QK-Norm), `Qwen3MoE`, `Qwen2MoE`, `DeepSeek2` (Absorbed MLA + YaRN + DeepSeekMoE), `Q5_K` SIMD, and GGUF auto `--template`
 - [x] Quantized `Q8_0` KV Cache (`--kv-q8`, 3.76× memory reduction) & Automatic KV Prefix Caching
-- [x] OpenAI SSE Streaming (`"stream": true`) & Interactive Multi-Turn `caelum chat` REPL
-- [x] Full JSON Schema Grammar (`SchemaGrammar`: required keys, enums, `OneOf` unions, hex colors, `[0,1]` floats, 3D tuples)
+- [x] OpenAI SSE Streaming (`"stream": true`), Interactive Multi-Turn `caelum chat` REPL, and strict `SchemaGrammar`
 - [ ] Optional **Arm KleidiAI** FFI backend for ARMv9.2+ `SME2` matrix tiles
 - [ ] `wgpu` / Vulkan GPU compute backend
 

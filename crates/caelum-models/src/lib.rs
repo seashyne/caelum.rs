@@ -3,7 +3,10 @@
 
 pub mod cache;
 pub mod celestia;
+pub mod deepseek2;
 pub mod llama_qwen;
+pub mod moe;
+pub mod rope;
 pub mod sampler;
 
 use caelum_core::{CaelumError, Result};
@@ -14,7 +17,10 @@ use std::time::Instant;
 
 pub use cache::{KvCache, KvPrecision, MlaLatentCache};
 pub use celestia::{write_synthetic_celestia_gguf, CelestiaConfig, CelestiaModel};
+pub use deepseek2::{DeepSeek2Config, DeepSeek2Model};
 pub use llama_qwen::{LlamaQwenConfig, LlamaQwenModel};
+pub use moe::{ExpertGating, MoeConfig};
+pub use rope::{RopeConfig, RopeScalingType, RopeTable};
 pub use sampler::{Sampler, SamplerConfig};
 
 #[derive(Debug, Clone)]
@@ -54,6 +60,7 @@ impl GenerationStats {
 
 enum ModelInner<'a> {
     LlamaQwen(LlamaQwenModel<'a>),
+    DeepSeek2(DeepSeek2Model<'a>),
     Celestia(CelestiaModel<'a>),
 }
 
@@ -76,7 +83,8 @@ impl<'a> CaelumModel<'a> {
         let arch = gguf.architecture().unwrap_or("llama");
         let inner = match arch {
             "celestia" => ModelInner::Celestia(CelestiaModel::from_gguf(gguf, max_seq_len)?),
-            "llama" | "qwen2" | "qwen3" | "mistral" => {
+            "deepseek2" => ModelInner::DeepSeek2(DeepSeek2Model::from_gguf(gguf, max_seq_len)?),
+            "llama" | "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "mistral" => {
                 ModelInner::LlamaQwen(LlamaQwenModel::from_gguf_with_kv(
                     gguf,
                     max_seq_len,
@@ -85,7 +93,7 @@ impl<'a> CaelumModel<'a> {
             }
             other => {
                 return Err(CaelumError::InvalidFormat(format!(
-                    "unsupported GGUF architecture '{other}' (supported: llama, qwen2, mistral, celestia)"
+                    "unsupported GGUF architecture '{other}' (supported: llama, qwen2, qwen2moe, qwen3, qwen3moe, deepseek2, mistral, celestia)"
                 )))
             }
         };
@@ -95,9 +103,28 @@ impl<'a> CaelumModel<'a> {
         })
     }
 
+    /// Repacks compatible `Q4_K`/`Q6_K` weights into cache-aligned 8-row SIMD tiles for
+    /// maximum AVX-VNNI / AVX2+FMA decode and prefill speed.
+    pub fn optimize_for_backend(&mut self, backend: &dyn Backend) {
+        match &mut self.inner {
+            ModelInner::LlamaQwen(m) => m.optimize_for_backend(backend),
+            ModelInner::DeepSeek2(m) => m.optimize_for_backend(backend),
+            ModelInner::Celestia(_) => {}
+        }
+    }
+
+    pub fn packed_bytes(&self) -> usize {
+        match &self.inner {
+            ModelInner::LlamaQwen(m) => m.packed_bytes(),
+            ModelInner::DeepSeek2(m) => m.packed_bytes(),
+            ModelInner::Celestia(_) => 0,
+        }
+    }
+
     pub fn architecture(&self) -> &str {
         match &self.inner {
             ModelInner::LlamaQwen(m) => &m.config.arch,
+            ModelInner::DeepSeek2(_) => "deepseek2",
             ModelInner::Celestia(_) => "celestia",
         }
     }
@@ -105,6 +132,7 @@ impl<'a> CaelumModel<'a> {
     pub fn vocab_size(&self) -> usize {
         match &self.inner {
             ModelInner::LlamaQwen(m) => m.config.vocab_size,
+            ModelInner::DeepSeek2(m) => m.config.vocab_size,
             ModelInner::Celestia(m) => m.config.vocab_size,
         }
     }
@@ -112,6 +140,7 @@ impl<'a> CaelumModel<'a> {
     pub fn max_seq_len(&self) -> usize {
         match &self.inner {
             ModelInner::LlamaQwen(m) => m.max_seq_len(),
+            ModelInner::DeepSeek2(m) => m.max_seq_len(),
             ModelInner::Celestia(m) => m.max_seq_len(),
         }
     }
@@ -119,6 +148,7 @@ impl<'a> CaelumModel<'a> {
     pub fn kv_cache_bytes(&self) -> usize {
         match &self.inner {
             ModelInner::LlamaQwen(m) => m.kv_cache_bytes(),
+            ModelInner::DeepSeek2(m) => m.kv_cache_bytes(),
             ModelInner::Celestia(m) => m.kv_cache_bytes(),
         }
     }
@@ -129,6 +159,7 @@ impl<'a> CaelumModel<'a> {
                 KvPrecision::F32 => "GQA-F32",
                 KvPrecision::Q8_0 => "GQA-Q8_0",
             },
+            ModelInner::DeepSeek2(_) => "MLA-Absorbed",
             ModelInner::Celestia(_) => "MLA-Latent",
         }
     }
@@ -137,6 +168,7 @@ impl<'a> CaelumModel<'a> {
         self.cached_tokens.clear();
         match &mut self.inner {
             ModelInner::LlamaQwen(m) => m.reset_cache(),
+            ModelInner::DeepSeek2(m) => m.reset_cache(),
             ModelInner::Celestia(m) => m.reset_cache(),
         }
     }
@@ -150,6 +182,7 @@ impl<'a> CaelumModel<'a> {
     ) -> Result<&[f32]> {
         match &mut self.inner {
             ModelInner::LlamaQwen(m) => m.forward_token(backend, token_id, pos, compute_logits),
+            ModelInner::DeepSeek2(m) => m.forward_token(backend, token_id, pos, compute_logits),
             ModelInner::Celestia(m) => m.forward_token(backend, token_id, pos, compute_logits),
         }
     }
@@ -165,15 +198,25 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => {
                 m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
+            ModelInner::DeepSeek2(m) => {
+                let n = tokens.len();
+                for (i, &tok) in tokens.iter().enumerate() {
+                    let is_last = i + 1 == n && compute_last_logits;
+                    m.forward_token(backend, tok, start_pos + i, is_last)?;
+                }
+                if n > 0 && compute_last_logits {
+                    m.forward_token(backend, tokens[n - 1], start_pos + n - 1, true)
+                } else {
+                    Ok(&[])
+                }
+            }
             ModelInner::Celestia(m) => {
                 let n = tokens.len();
                 for (i, &tok) in tokens.iter().enumerate() {
                     let is_last = i + 1 == n && compute_last_logits;
                     m.forward_token(backend, tok, start_pos + i, is_last)?;
                 }
-                // Re-borrow logits cleanly (already populated when is_last == true)
                 if n > 0 && compute_last_logits {
-                    // Already computed on the last iteration; return slice directly
                     m.forward_token(backend, tokens[n - 1], start_pos + n - 1, true)
                 } else {
                     Ok(&[])
@@ -259,6 +302,17 @@ impl<'a> CaelumModel<'a> {
         let mut last_logits_vec = match &mut self.inner {
             ModelInner::LlamaQwen(m) => {
                 m.forward_batch(backend, uncached, common, true)?.to_vec()
+            }
+            ModelInner::DeepSeek2(m) => {
+                let mut out = Vec::new();
+                for (i, &tok) in uncached.iter().enumerate() {
+                    let is_last = i + 1 == uncached.len();
+                    let logits = m.forward_token(backend, tok, common + i, is_last)?;
+                    if is_last {
+                        out = logits.to_vec();
+                    }
+                }
+                out
             }
             ModelInner::Celestia(m) => {
                 let mut out = Vec::new();

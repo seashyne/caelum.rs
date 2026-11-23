@@ -3,8 +3,8 @@
 use crate::dtype::{bf16_to_f32, f16_to_f32, DType};
 use crate::error::{CaelumError, Result};
 use crate::quant::{
-    dequantize_row_q4_0, dequantize_row_q4_1, dequantize_row_q4_k, dequantize_row_q6_k,
-    dequantize_row_q8_0,
+    dequantize_row_q4_0, dequantize_row_q4_1, dequantize_row_q4_k, dequantize_row_q5_k,
+    dequantize_row_q6_k, dequantize_row_q8_0,
 };
 
 /// A zero-copy read-only view over tensor bytes (typically borrowed from an `mmap`'d GGUF file).
@@ -70,6 +70,39 @@ impl<'a> TensorView<'a> {
             });
         }
         Ok((self.shape[0], self.shape[1]))
+    }
+
+    /// For a 3D stacked tensor `[outer, rows, cols]` (e.g., MoE expert stack or per-head MLA),
+    /// returns `(outer, rows, cols)`.
+    pub fn dims_3d(&self) -> Result<(usize, usize, usize)> {
+        if self.ndim != 3 {
+            return Err(CaelumError::ShapeMismatch {
+                expected: "3D tensor".into(),
+                actual: format!("{}D tensor {:?}", self.ndim, self.dims()),
+            });
+        }
+        Ok((self.shape[0], self.shape[1], self.shape[2]))
+    }
+
+    /// Zero-copy slices a 3D tensor `[outer, rows, cols]` along `outer` into a 2D `[rows, cols]` view.
+    #[inline]
+    pub fn slice_outer(&self, idx: usize) -> Result<TensorView<'a>> {
+        let (outer, rows, cols) = self.dims_3d()?;
+        if idx >= outer {
+            return Err(CaelumError::ShapeMismatch {
+                expected: format!("outer index < {outer}"),
+                actual: idx.to_string(),
+            });
+        }
+        let slice_elems = rows * cols;
+        let slice_bytes = self.dtype.byte_size_for(slice_elems)?;
+        let start = idx * slice_bytes;
+        Ok(TensorView {
+            data: &self.data[start..start + slice_bytes],
+            shape: [rows, cols, 1, 1],
+            ndim: 2,
+            dtype: self.dtype,
+        })
     }
 
     /// Returns the raw byte slice for row `row_idx` of a 2D `[rows, cols]` tensor.
@@ -163,6 +196,7 @@ pub fn dequantize_slice(raw: &[u8], dtype: DType, dst: &mut [f32]) -> Result<()>
         DType::Q4_1 => dequantize_row_q4_1(raw, dst),
         DType::Q8_0 => dequantize_row_q8_0(raw, dst),
         DType::Q4_K => dequantize_row_q4_k(raw, dst),
+        DType::Q5_K => dequantize_row_q5_k(raw, dst),
         DType::Q6_K => dequantize_row_q6_k(raw, dst),
     }
     Ok(())

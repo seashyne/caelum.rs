@@ -206,6 +206,56 @@ pub fn dot_q4_k_f32(raw: &[u8], x: &[f32]) -> f32 {
     sum
 }
 
+/// Fused Q5_K x F32 dot product (used in Q5_K_M / Q5_K_S GGUF models).
+pub fn dot_q5_k_f32(raw: &[u8], x: &[f32]) -> f32 {
+    let nb = x.len() / QK_K;
+    let mut sum = 0.0f32;
+    for b in 0..nb {
+        let off = b * 176;
+        let d = f16_to_f32(u16::from_le_bytes([raw[off], raw[off + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([raw[off + 2], raw[off + 3]]));
+        let scales = &raw[off + 4..off + 16];
+        let qh = &raw[off + 16..off + 48];
+        let qs = &raw[off + 48..off + 176];
+        let xb = &x[b * QK_K..(b + 1) * QK_K];
+
+        let mut is = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for chunk in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let d1 = d * sc1 as f32;
+            let min1 = dmin * m1 as f32;
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc2 as f32;
+            let min2 = dmin * m2 as f32;
+
+            let q = &qs[chunk * 32..(chunk + 1) * 32];
+            let x_lo = &xb[chunk * 64..chunk * 64 + 32];
+            let x_hi = &xb[chunk * 64 + 32..chunk * 64 + 64];
+
+            let mut acc_q1 = 0.0f32;
+            let mut acc_x1 = 0.0f32;
+            let mut acc_q2 = 0.0f32;
+            let mut acc_x2 = 0.0f32;
+            for l in 0..32 {
+                let byte = q[l];
+                let q1 = (byte & 0x0F) + if (qh[l] & u1) != 0 { 16 } else { 0 };
+                let q2 = (byte >> 4) + if (qh[l] & u2) != 0 { 16 } else { 0 };
+                acc_q1 += q1 as f32 * x_lo[l];
+                acc_x1 += x_lo[l];
+                acc_q2 += q2 as f32 * x_hi[l];
+                acc_x2 += x_hi[l];
+            }
+            sum += d1 * acc_q1 - min1 * acc_x1 + d2 * acc_q2 - min2 * acc_x2;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    sum
+}
+
 /// Fused Q6_K x F32 dot product (used in Q4_K_M & Q6_K GGUF models).
 pub fn dot_q6_k_f32(raw: &[u8], x: &[f32]) -> f32 {
     let nb = x.len() / QK_K;
@@ -279,6 +329,55 @@ pub fn dot_q4_k_q8_k(raw: &[u8], x: &[BlockQ8_K]) -> f32 {
                 acc_hi += ((byte >> 4) as i32) * (x_hi[l] as i32);
             }
             sum_q += (sc1 as i32) * acc_lo + (sc2 as i32) * acc_hi;
+        }
+        sumf += (dw * xb.d) * (sum_q as f32) - (dmin_w * xb.d) * (sum_m as f32);
+    }
+    sumf
+}
+
+/// Fused Q5_K x Q8_K integer dot product (W5A8 super-block reference).
+pub fn dot_q5_k_q8_k(raw: &[u8], x: &[BlockQ8_K]) -> f32 {
+    let nb = x.len();
+    let mut sumf = 0.0f32;
+    for b in 0..nb {
+        let off = b * 176;
+        let dw = f16_to_f32(u16::from_le_bytes([raw[off], raw[off + 1]]));
+        let dmin_w = f16_to_f32(u16::from_le_bytes([raw[off + 2], raw[off + 3]]));
+        let scales = &raw[off + 4..off + 16];
+        let qh = &raw[off + 16..off + 48];
+        let qs = &raw[off + 48..off + 176];
+        let xb = &x[b];
+
+        let mut sum_q = 0i32;
+        let mut sum_m = 0i32;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+
+            sum_m += (m1 as i32) * (xb.bsums[is * 2] as i32 + xb.bsums[is * 2 + 1] as i32);
+            sum_m +=
+                (m2 as i32) * (xb.bsums[(is + 1) * 2] as i32 + xb.bsums[(is + 1) * 2 + 1] as i32);
+
+            let q = &qs[chunk * 32..(chunk + 1) * 32];
+            let x_lo = &xb.qs[chunk * 64..chunk * 64 + 32];
+            let x_hi = &xb.qs[chunk * 64 + 32..chunk * 64 + 64];
+
+            let mut acc_lo = 0i32;
+            let mut acc_hi = 0i32;
+            for l in 0..32 {
+                let byte = q[l];
+                let q1 = (byte & 0x0F) + if (qh[l] & u1) != 0 { 16 } else { 0 };
+                let q2 = (byte >> 4) + if (qh[l] & u2) != 0 { 16 } else { 0 };
+                acc_lo += (q1 as i32) * (x_lo[l] as i32);
+                acc_hi += (q2 as i32) * (x_hi[l] as i32);
+            }
+            sum_q += (sc1 as i32) * acc_lo + (sc2 as i32) * acc_hi;
+            u1 <<= 2;
+            u2 <<= 2;
         }
         sumf += (dw * xb.d) * (sum_q as f32) - (dmin_w * xb.d) * (sum_m as f32);
     }
