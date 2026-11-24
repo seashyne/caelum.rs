@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Caelum &amp; mybot-cli — ระบบเอกสารและคู่มือการใช้งาน (Docs &amp; Tutorials)</title>
+  <link rel="stylesheet" href="../shared/theme.css">
+  <link rel="stylesheet" href="./docs.css">
+  <script src="./docs.js" defer></script>
+</head>
+<body>
+  <header>
+    <a href="#" class="brand-wrap">
+      <span class="brand-badge">Engine v0.8.0</span>
+      <div class="brand-title">Caelum <span>Docs</span></div>
+    </a>
+    <div class="header-actions">
+      <a href="/" class="theme-toggle-btn chat-nav-link">
+        <span>💬</span> <span>Web Chat</span>
+      </a>
+      <div class="live-status" id="server-status-pill">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Checking Caelum...</span>
+      </div>
+      <button type="button" class="theme-toggle-btn" id="theme-btn" aria-label="Toggle theme">
+        <span id="theme-icon">🌙</span> <span id="theme-text">Dark</span>
+      </button>
+    </div>
+  </header>
+
+  <section class="hero">
+    <h1>Caelum &amp; mybot-cli Architecture &amp; Tutorial</h1>
+    <p>ระบบเอกสารคู่มือการใช้งาน Caelum High-Performance Rust LLM Engine ร่วมกับ mybot-cli Coding Agent, Caelum Studio Desktop App, การเชื่อมต่อ IDE, Tool Calling และการรีดพลัง Intel Arc B580 GPU</p>
+    <div class="hero-tags">
+      <span class="hero-tag">⚡ Intel Arc B580 Turbo (128 tok/s)</span>
+      <span class="hero-tag">🦀 100% Pure Rust Engine</span>
+      <span class="hero-tag">🛠️ OpenAI Tool Calling &amp; SSE</span>
+      <span class="hero-tag">💻 mybot-cli TUI Coding Agent</span>
+      <span class="hero-tag">🖥️ Caelum Studio (Tauri 2)</span>
+    </div>
+  </section>
+
+  <main class="container">
+    <div class="tabs-wrapper">
+      <div role="tablist" aria-label="Documentation Navigation">
+        <button type="button" role="tab" id="tab-quickstart" aria-selected="true" focusgroupstart>🚀 1. คู่มือเริ่มต้น (Quickstart)</button>
+        <button type="button" role="tab" id="tab-mybot" aria-selected="false">🤖 2. เชื่อมต่อ mybot-cli Agent</button>
+        <button type="button" role="tab" id="tab-ides" aria-selected="false">🔌 3. เชื่อมต่อ IDE &amp; LM Studio</button>
+        <button type="button" role="tab" id="tab-api" aria-selected="false">📡 4. สเปก API &amp; Tool Calling</button>
+        <button type="button" role="tab" id="tab-gpu" aria-selected="false">⚡ 5. เทคนิค Intel Arc B580</button>
+        <button type="button" role="tab" id="tab-playground" aria-selected="false">🧪 6. Live API Playground</button>
+      </div>
+    </div>
+
+    <!-- Panel 1: Quickstart -->
+    <div role="tabpanel" id="panel-quickstart" aria-labelledby="tab-quickstart">
+      <div class="panel-inner">
+        <h2>🚀 เริ่มต้นใช้งาน Caelum ใน 1 นาที</h2>
+        <p class="lead-text">Caelum คือ LLM Inference Engine เขียนด้วย Pure Rust ที่เน้นความเร็วสูงสุด รองรับทั้ง Intel Arc GPU (Vulkan) และ Intel CPU (AVX-VNNI) โดยไม่ต้องพึ่ง Python หรือไดรเวอร์ภายนอกที่หนักเครื่อง</p>
+
+        <h3>สถาปัตยกรรมภาพรวมของระบบ</h3>
+        <div class="cards-grid">
+          <div class="card">
+            <div class="card-icon">⚡</div>
+            <div class="card-title">Caelum Engine (<code>caelum/</code>)</div>
+            <div class="card-desc">เอนจินหลัก ประมวลผล GGUF ด้วยความเร็ว 128 tok/s (1.5B) และ 43 tok/s (8B) บน Arc B580 พร้อม Web UI ในตัว</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">🖥️</div>
+            <div class="card-title">Caelum Studio (<code>apps/studio/</code>)</div>
+            <div class="card-desc">Desktop App ด้วย Tauri 2 + Rust สแกนโมเดล GGUF, กด Start/Stop Engine, ดู Logs และแชทในหน้าต่างเดียว</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">💻</div>
+            <div class="card-title">mybot-cli</div>
+            <div class="card-desc">AI Coding Agent TUI (Rust) สั่งรันคำสั่ง bash, อ่าน/แก้ไขไฟล์ และคุยกับ Caelum แบบสตรีมมิ่ง</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">📐</div>
+            <div class="card-title">Celestia &amp; Lenout (<code>ml/</code>)</div>
+            <div class="card-desc">โมเดลสร้าง Proposal สำหรับงานออกแบบสถาปัตยกรรมและ CAD ผ่าน Grammar Constrained Decoding</div>
+          </div>
+        </div>
+
+        <h3>ขั้นตอนที่ 1: ตรวจสอบสถานะฮาร์ดแวร์</h3>
+        <p>ใช้คำสั่ง <code>caelum info</code> เพื่อตรวจสอบว่าระบบตรวจพบการ์ดจอ Intel Arc B580 และคำสั่ง AVX-VNNI ของ CPU หรือไม่:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button type="button" class="copy-btn" data-code="cd caelum && ./target/release/caelum info">Copy</button>
+          </div>
+          <pre>cd caelum &amp;&amp; ./target/release/caelum info</pre>
+        </div>
+
+        <h3>ขั้นตอนที่ 2: ตรวจสอบโครงสร้างไฟล์โมเดล GGUF</h3>
+        <p>คุณสามารถใช้ <code>caelum inspect</code> เพื่ออ่านเมทาดาตา, ขนาดพารามิเตอร์, และประเภท Quantization ในเวลาเพียง 38 มิลลิวินาที:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button type="button" class="copy-btn" data-code="./target/release/caelum inspect &quot;../models/exported_gguf/llama-3.1-8b-instruct-q4_k_m.gguf&quot;">Copy</button>
+          </div>
+          <pre>./target/release/caelum inspect "../models/exported_gguf/llama-3.1-8b-instruct-q4_k_m.gguf"</pre>
+        </div>
+
+        <h3>ขั้นตอนที่ 3: เปิดเซิร์ฟเวอร์ Caelum บนการ์ดจอ Intel Arc B580</h3>
+        <p>สั่งรัน HTTP API Server (มาตรฐาน OpenAI) พร้อมเร่งความเร็วด้วย <code>--gpu</code>:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal (Server)</span>
+            <button type="button" class="copy-btn" data-code="./target/release/caelum serve &quot;../models/exported_gguf/llama-3.1-8b-instruct-q4_k_m.gguf&quot; --gpu --port 8000">Copy</button>
+          </div>
+          <pre>./target/release/caelum serve "../models/exported_gguf/llama-3.1-8b-instruct-q4_k_m.gguf" --gpu --port 8000</pre>
+        </div>
+        <div class="callout tip">
+          <div class="callout-title">💡 ทิปการประหยัดแรมบนโหมด CPU</div>
+          หากต้องการรันบน CPU ให้เอา <code>--gpu</code> ออก แล้วใส่ <code>--kv-q8</code> แทน เพื่อบีบอัด Key-Value Cache เป็น 8-bit ลดการกิน RAM ลงเกือบ 4 เท่า!
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 2: mybot-cli -->
+    <div role="tabpanel" id="panel-mybot" aria-labelledby="tab-mybot" hidden>
+      <div class="panel-inner">
+        <h2>🤖 การใช้งานร่วมกับ mybot-cli (Local AI Coding Agent)</h2>
+        <p class="lead-text">เมื่อจับคู่ <strong>Caelum Engine</strong> เข้ากับ <strong>mybot-cli</strong> คุณจะได้สแต็ก AI Coding Agent ที่เป็น <strong>100% Pure Rust</strong> ทั้งหมด ทำงานแบบออฟไลน์ 100% ไม่เสียค่า Token และปลอดภัยต่อข้อมูลของคุณ</p>
+
+        <h3>ขั้นตอนการเชื่อมต่อใน 2 สเต็ป</h3>
+        <ol>
+          <li><strong>ตั้งค่า Provider ใน <code>~/.mybot/config.toml</code>:</strong></li>
+        </ol>
+        <div class="code-box">
+          <div class="code-header">
+            <span>~/.mybot/config.toml</span>
+            <button type="button" class="copy-btn" data-code="[providers.caelum]
+kind = &quot;openai&quot;
+base_url = &quot;http://127.0.0.1:8000/v1&quot;
+model = &quot;llama-3.1-8b-instruct&quot;">Copy</button>
+          </div>
+          <pre>[providers.caelum]
+kind = "openai"
+base_url = "http://127.0.0.1:8000/v1"
+model = "llama-3.1-8b-instruct"</pre>
+        </div>
+
+        <ol start="2">
+          <li><strong>เปิดใช้งาน mybot ในโฟลเดอร์โปรเจกต์ของคุณ:</strong></li>
+        </ol>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button type="button" class="copy-btn" data-code="mybot --model caelum/llama-3.1-8b-instruct">Copy</button>
+          </div>
+          <pre>mybot --model caelum/llama-3.1-8b-instruct</pre>
+        </div>
+
+        <h3>ความสามารถเด่นเมื่อใช้งาน Caelum + mybot</h3>
+        <ul>
+          <li><strong>Agentic Tool Calling:</strong> Caelum รองรับ OpenAI Function Calling เต็มรูปแบบ ทำให้ <code>mybot</code> สามารถสั่ง <code>read</code>, <code>write</code>, <code>edit</code>, และ <code>bash</code> ในเครื่องได้แบบอัตโนมัติ</li>
+          <li><strong>Interactive TUI:</strong> หน้าจอเทอร์มินัลสวยงามด้วย Ratatui พร้อม Syntax Highlighting สำหรับบล็อกโค้ด</li>
+          <li><strong>Context Compaction:</strong> พิมพ์ <code>/compact</code> เมื่อคุยยาว เพื่อให้โมเดลสรุปบริบทและลดขนาด Session</li>
+          <li><strong>MCP Protocol:</strong> รองรับการเชื่อมต่อกับ Model Context Protocol Servers ภายนอกได้ทันที</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Panel 3: IDEs & LM Studio -->
+    <div role="tabpanel" id="panel-ides" aria-labelledby="tab-ides" hidden>
+      <div class="panel-inner">
+        <h2>🔌 การเชื่อมต่อ IDEs, Cline, WebUI และ LM Studio</h2>
+        <p class="lead-text">Caelum ปฏิบัติตามมาตรฐาน OpenAI API Specification 100% จึงสามารถนำไปเชื่อมต่อกับโปรแกรมหรือเครื่องมือพัฒนาซอฟต์แวร์ได้ทันที</p>
+
+        <h3>1. เชื่อมต่อกับ Cline / Roo Code / OpenCode / Continue.dev</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ฟิลด์ตั้งค่า</th>
+                <th>ค่าที่ต้องระบุ</th>
+                <th>คำอธิบาย</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>API Provider</strong></td>
+                <td><code>OpenAI Compatible</code></td>
+                <td>เลือกโหมดมาตรฐาน OpenAI</td>
+              </tr>
+              <tr>
+                <td><strong>Base URL</strong></td>
+                <td><code>http://127.0.0.1:8000/v1</code></td>
+                <td>ที่อยู่เซิร์ฟเวอร์ Caelum (หรือพอร์ตที่คุณตั้ง)</td>
+              </tr>
+              <tr>
+                <td><strong>API Key</strong></td>
+                <td><code>not-needed</code></td>
+                <td>ใส่อะไรก็ได้ Caelum ไม่บังคับคีย์ภายในเครื่อง</td>
+              </tr>
+              <tr>
+                <td><strong>Model ID</strong></td>
+                <td><code>llama-3.1-8b</code></td>
+                <td>ระบุชื่อโมเดลที่ต้องการ</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>2. ใช้งานแทน LM Studio Local Server (พอร์ต 1234)</h3>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button type="button" class="copy-btn" data-code="./target/release/caelum serve &quot;/run/media/seashyne/Project/My Artificial Intelligence/Chat AI/LM Studio/Models/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf&quot; --gpu --port 1234">Copy</button>
+          </div>
+          <pre>./target/release/caelum serve "/run/media/seashyne/Project/My Artificial Intelligence/Chat AI/LM Studio/Models/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf" --gpu --port 1234</pre>
+        </div>
+
+        <h3>3. เชื่อมต่อผ่าน Python (OpenAI Official SDK)</h3>
+        <div class="code-box">
+          <div class="code-header">
+            <span>python_client.py</span>
+            <button type="button" class="copy-btn" data-code="from openai import OpenAI
+
+client = OpenAI(base_url=&quot;http://127.0.0.1:8000/v1&quot;, api_key=&quot;not-needed&quot;)
+
+stream = client.chat.completions.create(
+    model=&quot;llama-3.1-8b&quot;,
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;เขียนตัวอย่างโค้ด Rust สำหรับ Multi-threading&quot;}],
+    stream=True,
+)
+
+for chunk in stream:
+    print(chunk.choices[0].delta.content or &quot;&quot;, end=&quot;&quot;, flush=True)">Copy</button>
+          </div>
+          <pre>from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed")
+
+stream = client.chat.completions.create(
+    model="llama-3.1-8b",
+    messages=[{"role": "user", "content": "เขียนตัวอย่างโค้ด Rust สำหรับ Multi-threading"}],
+    stream=True,
+)
+
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 4: API Specification -->
+    <div role="tabpanel" id="panel-api" aria-labelledby="tab-api" hidden>
+      <div class="panel-inner">
+        <h2>📡 สเปก API Endpoints &amp; Tool Calling</h2>
+        <p class="lead-text">รายละเอียด Endpoint ทั้งหมดที่ Caelum ให้บริการ พร้อมโครงสร้าง Request / Response ตามมาตรฐานสากล</p>
+
+        <h3>1. GET <code>/health</code></h3>
+        <div class="code-box">
+          <div class="code-header"><span>Response JSON</span></div>
+          <pre>{
+  "status": "healthy",
+  "engine": "caelum-rs",
+  "version": "0.8.0",
+  "model": "Meta-Llama-3.1-8B-Instruct",
+  "architecture": "llama",
+  "template": "llama3",
+  "kernel": "wgpu Intel(R) Arc(tm) B580 Graphics (BMG G21) (Vulkan, DiscreteGpu)",
+  "kv_mode": "F16",
+  "threads": 6,
+  "timestamp": 1732426300
+}</pre>
+        </div>
+
+        <h3>2. POST <code>/v1/chat/completions</code> (พร้อม Tool Calling)</h3>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Request JSON</span>
+            <button type="button" class="copy-btn" data-code="{
+  &quot;model&quot;: &quot;llama-3.1-8b&quot;,
+  &quot;messages&quot;: [
+    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;เช็คสภาพอากาศที่กรุงเทพฯ ตอนนี้ให้หน่อย&quot;}
+  ],
+  &quot;tools&quot;: [
+    {
+      &quot;type&quot;: &quot;function&quot;,
+      &quot;function&quot;: {
+        &quot;name&quot;: &quot;get_weather&quot;,
+        &quot;description&quot;: &quot;Get current weather for location&quot;,
+        &quot;parameters&quot;: {
+          &quot;type&quot;: &quot;object&quot;,
+          &quot;properties&quot;: {
+            &quot;location&quot;: {&quot;type&quot;: &quot;string&quot;}
+          },
+          &quot;required&quot;: [&quot;location&quot;]
+        }
+      }
+    }
+  ],
+  &quot;stream&quot;: true
+}">Copy</button>
+          </div>
+          <pre>{
+  "model": "llama-3.1-8b",
+  "messages": [
+    {"role": "user", "content": "เช็คสภาพอากาศที่กรุงเทพฯ ตอนนี้ให้หน่อย"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string"}
+          },
+          "required": ["location"]
+        }
+      }
+    }
+  ],
+  "stream": true
+}</pre>
+        </div>
+
+        <h3>3. POST <code>/v1/celestia/propose</code> (Strict JSON Proposals)</h3>
+        <div class="code-box">
+          <div class="code-header">
+            <span>curl</span>
+            <button type="button" class="copy-btn" data-code="curl http://127.0.0.1:8000/v1/celestia/propose \
+  -H &quot;Content-Type: application/json&quot; \
+  -d '{&quot;mode&quot;: &quot;scene3d&quot;, &quot;prompt&quot;: &quot;สร้างห้องนั่งเล่นขนาด 4x5 เมตร มีโซฟาและโต๊ะกลาง&quot;}'">Copy</button>
+          </div>
+          <pre>curl http://127.0.0.1:8000/v1/celestia/propose \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "scene3d", "prompt": "สร้างห้องนั่งเล่นขนาด 4x5 เมตร มีโซฟาและโต๊ะกลาง"}'</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 5: GPU Turbo -->
+    <div role="tabpanel" id="panel-gpu" aria-labelledby="tab-gpu" hidden>
+      <div class="panel-inner">
+        <h2>⚡ เบื้องหลังความเร็วระดับ Turbo บน Intel Arc B580</h2>
+        <p class="lead-text">ใน Caelum v0.8.0 มีการปรับจูน Kernel และสถาปัตยกรรมระดับฮาร์ดแวร์เพื่อรีดประสิทธิภาพการ์ดจอ Intel Arc B580 (Battlemage G21 12GB) ให้ทำงานได้เต็มขีดจำกัด</p>
+
+        <div class="cards-grid">
+          <div class="card">
+            <div class="card-title">1. Subgroup Hardware Ops</div>
+            <div class="card-desc">ใช้คำสั่ง <code>subgroupAdd</code> และ <code>subgroupMax</code> ของฮาร์ดแวร์ Intel BMG ตัดรอบ <code>workgroupBarrier()</code> ช่วยลด Latency ระดับไมโครวินาที</div>
+          </div>
+          <div class="card">
+            <div class="card-title">2. 4-byte-aligned Q6_K</div>
+            <div class="card-desc">จัดระเบียบบล็อก GGML 210B เป็น 212B (53 <code>u32</code>) ทำให้ GPU โหลด Memory ได้ 100% Coalesced วิ่งเต็มแบนด์วิดท์ <strong>306.4 GB/s</strong> (เร็วขึ้น 2.5×)</div>
+          </div>
+          <div class="card">
+            <div class="card-title">3. Fused Kernels (-53%)</div>
+            <div class="card-desc">ฟิวส์ QKV+Bias, SwiGLU FFN, และ Residual+RMSNorm รวมเป็นคำสั่งเดียว ลด GPU Command Dispatches จาก 478 เหลือเพียง 226 ครั้งต่อโทเคน</div>
+          </div>
+          <div class="card">
+            <div class="card-title">4. Packed F16 KV Cache</div>
+            <div class="card-desc">บีบอัด Key-Value Cache บน VRAM ให้เป็น Half-Precision F16 ประหยัดแรมการ์ดจอลง 50% และลด Memory Traffic ขณะ Decode</div>
+          </div>
+          <div class="card">
+            <div class="card-title">5. Streaming DMA Uploads</div>
+            <div class="card-desc">ทยอยส่งข้อมูลเข้าการ์ดจอทีละ 16 MiB พร้อม Per-layer Flush โหลด Llama-3.1 8B เสร็จใน 12.5 วินาที โดยไม่ทำให้ Host RAM บวมหรือแตะ Swap</div>
+          </div>
+        </div>
+
+        <h3>ตารางเปรียบเทียบประสิทธิภาพบนเครื่องนี้</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>โมเดลและขนาด</th>
+                <th>Caelum v0.8.0 (Arc B580)</th>
+                <th>llama.cpp Vulkan (LM Studio)</th>
+                <th>การปรับปรุง</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Qwen2.5-Coder-1.5B (Q4_K_M)</strong></td>
+                <td><span class="badge-pill green">128.5 tok/s</span></td>
+                <td>~45.0 tok/s</td>
+                <td><strong>2.85× เร็วกว่า</strong></td>
+              </tr>
+              <tr>
+                <td><strong>Llama-3.1-8B-Instruct (Q4_K_M)</strong></td>
+                <td><span class="badge-pill green">42.88 tok/s</span></td>
+                <td>~20.5 tok/s</td>
+                <td><strong>2.09× เร็วกว่า</strong></td>
+              </tr>
+              <tr>
+                <td><strong>เวลาโหลดโมเดล 8B (Cold Load)</strong></td>
+                <td><span class="badge-pill green">12.5 วินาที</span></td>
+                <td>~35.0 วินาที</td>
+                <td><strong>เร็วขึ้นเกือบ 3 เท่า</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 6: Live Playground -->
+    <div role="tabpanel" id="panel-playground" aria-labelledby="tab-playground" hidden>
+      <div class="panel-inner">
+        <h2>🧪 Live API Playground</h2>
+        <p class="lead-text">ทดสอบส่งคำขอ Prompt ไปยัง Caelum API Server ที่กำลังรันอยู่บนเครื่องของคุณแบบเรียลไทม์</p>
+
+        <div class="playground-box">
+          <div class="pg-form">
+            <div>
+              <label class="pg-label" for="pg-endpoint">API Server Endpoint</label>
+              <input type="text" id="pg-endpoint" class="pg-input" value="http://127.0.0.1:8000/v1/chat/completions">
+            </div>
+
+            <div>
+              <label class="pg-label" for="pg-prompt">User Prompt</label>
+              <textarea id="pg-prompt" class="pg-textarea">เขียนฟังก์ชัน Rust ตรวจสอบข้อความ Palindrome สั้นๆ และรวดเร็ว</textarea>
+            </div>
+
+            <div class="pg-row">
+              <div class="pg-col">
+                <label class="pg-label" for="pg-temp">Temperature (0.0 - 1.0)</label>
+                <input type="number" id="pg-temp" class="pg-input" value="0.7" step="0.1" min="0" max="2">
+              </div>
+              <div class="pg-col">
+                <label class="pg-label" for="pg-max-tokens">Max Tokens</label>
+                <input type="number" id="pg-max-tokens" class="pg-input" value="256" step="64" min="16" max="2048">
+              </div>
+            </div>
+
+            <button type="button" class="pg-btn" id="pg-send-btn">
+              <span>⚡ ส่งคำขอไปยัง Caelum Engine</span>
+            </button>
+          </div>
+
+          <div>
+            <div class="pg-output-header">
+              <span class="pg-label">Output &amp; Streaming Response</span>
+              <span id="pg-stats" class="pg-stats"></span>
+            </div>
+            <div class="pg-output" id="pg-output-box">// กดส่งคำขอเพื่อทดสอบการตอบกลับแบบเรียลไทม์...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <p><strong>Caelum Engine &amp; mybot-cli</strong> — High-Performance Zero-Dependency LLM Platform for Intel Arc GPU &amp; ARMv9/x86 CPUs.</p>
+    <p class="footer-sub">Part of the Cetia, Celestia &amp; Lenout Ecosystem by @seashyne</p>
+  </footer>
+</body>
+</html>

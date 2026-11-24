@@ -40,9 +40,13 @@ try {
 
 const normalized = stripNullFields(parsed);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const zodDistPath = path.resolve(__dirname, "../../dist/index.js");
+const zodDistCandidates = [
+  path.resolve(__dirname, "../../packages/celestia-ts/dist/index.js"),
+  path.resolve(__dirname, "../../dist/index.js"),
+];
+const zodDistPath = zodDistCandidates.find((p) => fs.existsSync(p));
 
-if (fs.existsSync(zodDistPath)) {
+if (zodDistPath) {
   const { validateProposal, sanitizeProposal } = await import(pathToFileURL(zodDistPath).href);
   const result = validateProposal(normalized);
   if (!result.ok) {

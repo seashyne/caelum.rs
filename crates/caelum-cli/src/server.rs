@@ -182,13 +182,13 @@ fn handle_connection(
         return write_response(stream, "204 No Content", "");
     }
 
+    if method == "GET" || method == "HEAD" {
+        if let Some((content_type, body)) = crate::web_assets::resolve(path) {
+            return write_static_response(stream, "200 OK", content_type, body, method == "HEAD");
+        }
+    }
+
     match (method, path) {
-        ("GET", "/") | ("GET", "/chat") | ("HEAD", "/") | ("HEAD", "/chat") => {
-            write_html_response(stream, "200 OK", crate::chat_html::CHAT_HTML)
-        }
-        ("GET", "/docs") | ("HEAD", "/docs") => {
-            write_html_response(stream, "200 OK", crate::docs_html::DOCS_HTML)
-        }
         ("GET", "/health") => {
             let now = unix_ts();
             let resp = format!(
@@ -669,13 +669,21 @@ fn write_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()
     Ok(())
 }
 
-fn write_html_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
+fn write_static_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+    head_only: bool,
+) -> Result<()> {
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
+    if !head_only {
+        stream.write_all(body.as_bytes())?;
+    }
     stream.flush()?;
     Ok(())
 }

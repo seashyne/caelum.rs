@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Caelum AI Chat — Intel Arc B580 Turbo Engine</title>
+  <link rel="stylesheet" href="../shared/theme.css">
+  <link rel="stylesheet" href="./chat.css">
+  <script src="./chat.js" defer></script>
+</head>
+<body>
+  <div id="app-container">
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <a href="#" class="app-brand">
+          <span>✦ Caelum</span>
+          <span class="app-brand-badge">Arc B580</span>
+        </a>
+        <button type="button" class="sidebar-toggle-btn" id="close-sidebar-btn" aria-label="Close sidebar">✕</button>
+      </div>
+
+      <button type="button" class="new-chat-btn" id="new-chat-btn">
+        <span>＋ New Chat</span>
+      </button>
+
+      <div class="chat-history-list" id="chat-history-list"></div>
+
+      <div class="sidebar-footer">
+        <button type="button" class="footer-link-btn" id="open-settings-btn">
+          <span>⚙️</span>
+          <span>Engine Settings</span>
+        </button>
+        <a href="/docs" class="footer-link-btn" target="_blank">
+          <span>📖</span>
+          <span>Documentation &amp; API</span>
+        </a>
+      </div>
+    </aside>
+
+    <main id="chat-view">
+      <div class="chat-topbar">
+        <div class="topbar-left">
+          <button type="button" class="sidebar-toggle-btn" id="open-sidebar-btn" aria-label="Open sidebar">☰</button>
+          <div class="model-badge">
+            <span class="status-dot" id="topbar-status-dot"></span>
+            <span id="topbar-model-name">Loading Caelum Engine...</span>
+          </div>
+        </div>
+
+        <div class="topbar-right">
+          <select id="persona-select" class="persona-select" aria-label="Select Assistant Persona">
+            <option value="general">🌟 ผู้ช่วยทั่วไป (General)</option>
+            <option value="rust">🦀 วิศวกรอาวุโส Rust</option>
+            <option value="cad">📐 Lenout CAD Copilot</option>
+            <option value="hardware">⚡ ผู้เชี่ยวชาญ Arc GPU</option>
+          </select>
+
+          <button type="button" class="icon-btn" id="theme-toggle-btn" aria-label="Toggle Dark/Light Mode">
+            <span id="theme-icon">🌙</span>
+          </button>
+        </div>
+      </div>
+
+      <div id="messages-container">
+        <div class="welcome-hero" id="welcome-hero">
+          <h2>สวัสดีครับ วันนี้มีอะไรให้ Caelum ช่วยไหมครับ?</h2>
+          <p>ระบบประมวลผลบนการ์ดจอ <strong>Intel Arc B580 (Vulkan wgpu)</strong> ความเร็วสูงถึง 128 tok/s ในเครื่องของคุณ 100%</p>
+
+          <div class="starter-cards">
+            <button type="button" class="starter-card" data-prompt="เขียนฟังก์ชันคำนวณ Fibonacci ในภาษา Rust แบบ Zero-copy และ Benchmark เปรียบเทียบ">
+              <div class="starter-card-title">🦀 เขียนโค้ด Rust ความเร็วสูง</div>
+              <div class="starter-card-desc">อัลกอริทึม Zero-copy และ SIMD</div>
+            </button>
+            <button type="button" class="starter-card" data-prompt="อธิบายเทคนิค Subgroups 16-32 และ 4-byte Aligned Q6_K บนสถาปัตยกรรม Intel Battlemage G21">
+              <div class="starter-card-title">⚡ วิเคราะห์สถาปัตยกรรม Arc GPU</div>
+              <div class="starter-card-desc">เทคนิคการเร่ง VRAM แบนด์วิดท์ 306 GB/s</div>
+            </button>
+            <button type="button" class="starter-card" data-prompt="ช่วยออกแบบโครงสร้างข้อมูลห้องสี่เหลี่ยม 3 มิติ สำหรับโปรแกรม Lenout CAD ในรูปแบบ JSON">
+              <div class="starter-card-title">📐 ออกแบบโครงสร้าง CAD / Lenout</div>
+              <div class="starter-card-desc">Schema Proposals และ 3D Layout</div>
+            </button>
+            <button type="button" class="starter-card" data-prompt="สรุปแนวทางการเชื่อมต่อ mybot-cli เข้ากับ Caelum ผ่าน OpenAI Tool Calling">
+              <div class="starter-card-title">🤖 เชื่อมต่อ mybot-cli Agent</div>
+              <div class="starter-card-desc">สร้าง Local Agent ออฟไลน์ 100%</div>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="input-dock">
+        <div class="input-wrapper">
+          <textarea id="user-prompt" rows="1" placeholder="พิมพ์คำสั่งหรือข้อความที่นี่... (Enter ส่ง, Shift+Enter ขึ้นบรรทัดใหม่)" autofocus></textarea>
+
+          <div class="input-toolbar">
+            <div class="toolbar-left">
+              <span id="active-persona-tag">Persona: ผู้ช่วยทั่วไป</span>
+            </div>
+            <div class="toolbar-actions">
+              <button type="button" class="stop-btn" id="stop-btn" aria-label="Stop generation">■</button>
+              <button type="button" class="send-btn" id="send-btn" aria-label="Send message">↑</button>
+            </div>
+          </div>
+        </div>
+        <div class="input-hint">Caelum Engine v0.8.0 · Intel Arc B580 (BMG G21 12GB) · 100% Private Local Inference</div>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog" aria-labelledby="settings-dialog-title">
+    <div class="dialog-header">
+      <h2 class="dialog-title" id="settings-dialog-title">⚙️ Engine Settings</h2>
+      <button type="button" class="icon-btn" id="close-settings-x" aria-label="Close settings">✕</button>
+    </div>
+
+    <form method="dialog" id="settings-form">
+      <div class="form-group">
+        <label class="form-label" for="setting-endpoint">API Server Endpoint</label>
+        <input type="text" id="setting-endpoint" class="form-input" value="/v1/chat/completions" autofocus>
+      </div>
+
+      <div class="form-group">
+        <div class="form-label">
+          <span>Temperature (ความสร้างสรรค์)</span>
+          <span id="val-temp">0.7</span>
+        </div>
+        <input type="range" id="setting-temp" class="form-range" min="0" max="1.5" step="0.05" value="0.7">
+      </div>
+
+      <div class="form-group">
+        <div class="form-label">
+          <span>Max Completion Tokens</span>
+          <span id="val-max-tokens">512</span>
+        </div>
+        <input type="range" id="setting-max-tokens" class="form-range" min="64" max="4096" step="64" value="512">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="setting-custom-system">Custom System Prompt (Override)</label>
+        <textarea id="setting-custom-system" class="form-textarea" rows="3" placeholder="ระบุ System prompt เจาะจงตามต้องการ..."></textarea>
+      </div>
+
+      <div class="dialog-footer">
+        <button type="button" class="btn-secondary" id="clear-history-btn">ล้างประวัติแชททั้งหมด</button>
+        <button type="submit" class="btn-primary">บันทึกการตั้งค่า</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
