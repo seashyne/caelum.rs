@@ -7,7 +7,7 @@
 //!   directly over raw GGUF bytes (zero VRAM expansion).
 
 use crate::wgpu_shaders;
-use caelum_core::{CaelumError, DType, Result, TensorView};
+use caelum_core::{f16_to_f32, CaelumError, DType, Result, TensorView};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -90,13 +90,19 @@ impl UniformArena {
 
 pub struct GpuPipelines {
     pub bgl_matmul: wgpu::BindGroupLayout,
+    pub bgl_qkv: wgpu::BindGroupLayout,
+    pub bgl_gate_up: wgpu::BindGroupLayout,
     pub bgl_rms_norm: wgpu::BindGroupLayout,
+    pub bgl_res_rms: wgpu::BindGroupLayout,
     pub bgl_rw_r_u: wgpu::BindGroupLayout,
     pub bgl_rope_kv: wgpu::BindGroupLayout,
     pub bgl_gqa: wgpu::BindGroupLayout,
 
     pub matmul_q4_k: wgpu::ComputePipeline,
     pub matmul_q4_k_b4: wgpu::ComputePipeline,
+    pub matmul_q4_k_qkv: wgpu::ComputePipeline,
+    pub matmul_q4_k_qkv_b4: wgpu::ComputePipeline,
+    pub matmul_q4_k_gate_up_swiglu: wgpu::ComputePipeline,
     pub matmul_q5_k: wgpu::ComputePipeline,
     pub matmul_q6_k: wgpu::ComputePipeline,
     pub matmul_q6_k_b4: wgpu::ComputePipeline,
@@ -106,6 +112,7 @@ pub struct GpuPipelines {
     pub matmul_f32: wgpu::ComputePipeline,
 
     pub rms_norm: wgpu::ComputePipeline,
+    pub residual_rms_norm: wgpu::ComputePipeline,
     pub rms_norm_inplace: wgpu::ComputePipeline,
     pub add_bias: wgpu::ComputePipeline,
     pub rope_kv_store: wgpu::ComputePipeline,
@@ -120,6 +127,7 @@ pub struct GpuContext {
     pub queue: Arc<wgpu::Queue>,
     pub adapter_info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
+    pub use_subgroups: bool,
     pub pipelines: GpuPipelines,
 }
 
@@ -138,6 +146,16 @@ impl GpuContext {
 
         let adapter_info = adapter.get_info();
         let adapter_limits = adapter.limits();
+        let adapter_features = adapter.features();
+        let use_subgroups = adapter_features.contains(wgpu::Features::SUBGROUP)
+            && adapter_info.subgroup_min_size >= 8
+            && adapter_info.subgroup_max_size <= 32;
+
+        let mut req_features = wgpu::Features::empty();
+        if use_subgroups {
+            req_features |= wgpu::Features::SUBGROUP;
+        }
+
         let mut req_limits = wgpu::Limits::default();
         req_limits.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
         req_limits.max_buffer_size = adapter_limits.max_buffer_size;
@@ -150,7 +168,7 @@ impl GpuContext {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("caelum-wgpu-device"),
-            required_features: wgpu::Features::empty(),
+            required_features: req_features,
             required_limits: req_limits.clone(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -158,20 +176,29 @@ impl GpuContext {
         }))
         .map_err(|e| CaelumError::Runtime(format!("failed to create wgpu device: {e}")))?;
 
-        let pipelines = build_pipelines(&device);
+        let pipelines = build_pipelines(&device, use_subgroups);
 
         Ok(Self {
             device: Arc::new(device),
             queue: Arc::new(queue),
             adapter_info,
             limits: req_limits,
+            use_subgroups,
             pipelines,
         })
     }
 
     pub fn device_summary(&self) -> String {
+        let sg = if self.use_subgroups {
+            format!(
+                "subgroups={}-{}",
+                self.adapter_info.subgroup_min_size, self.adapter_info.subgroup_max_size
+            )
+        } else {
+            "subgroups=off".to_string()
+        };
         format!(
-            "{} ({:?}, {:?}) | max_buf={:.1} GB",
+            "{} ({:?}, {:?}) | {sg} | max_buf={:.1} GB",
             self.adapter_info.name,
             self.adapter_info.backend,
             self.adapter_info.device_type,
@@ -199,6 +226,44 @@ impl GpuContext {
         }
         buf.unmap();
         buf
+    }
+
+    /// Repacks GGML `Q6_K` (`210` bytes/block) into 4-byte-aligned GPU blocks (`212` bytes = `53 u32`/block)
+    /// with pre-decoded `f32` block scale `d`, enabling 100% coalesced `u32` GPU loads (+0.95% VRAM).
+    pub fn upload_q6k_aligned(&self, label: &str, raw: &[u8]) -> wgpu::Buffer {
+        debug_assert_eq!(raw.len() % 210, 0);
+        let n_blocks = raw.len() / 210;
+        let out_bytes = (n_blocks * 212).max(4);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: out_bytes as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let mut view = buf.get_mapped_range_mut(..).expect("mapped Q6_K GPU buffer");
+            let mut tmp = [0u8; 212];
+            for b in 0..n_blocks {
+                let src = &raw[b * 210..(b + 1) * 210];
+                tmp[0..208].copy_from_slice(&src[0..208]);
+                let d_f16 = u16::from_le_bytes([src[208], src[209]]);
+                let d_f32 = f16_to_f32(d_f16);
+                tmp[208..212].copy_from_slice(&d_f32.to_le_bytes());
+                view.slice(b * 212..(b + 1) * 212).copy_from_slice(&tmp);
+            }
+        }
+        buf.unmap();
+        buf
+    }
+
+    /// Uploads any `TensorView` weight matrix in its optimal VRAM format (aligned `Q6_K` or raw).
+    pub fn upload_weight(&self, label: &str, view: &TensorView<'_>) -> (wgpu::Buffer, usize) {
+        if view.dtype == DType::Q6_K {
+            let aligned_bytes = (view.data.len() / 210) * 212;
+            (self.upload_q6k_aligned(label, view.data), aligned_bytes)
+        } else {
+            (self.upload_raw_padded(label, view.data), view.data.len())
+        }
     }
 
     /// Uploads an `f32` slice directly into GPU VRAM (`STORAGE`).
@@ -435,6 +500,95 @@ impl GpuContext {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_qkv(
+        &self,
+        w_qkv: &wgpu::Buffer,
+        b_qkv: &wgpu::Buffer,
+        x: &wgpu::Buffer,
+        q: &wgpu::Buffer,
+        k: &wgpu::Buffer,
+        v: &wgpu::Buffer,
+        arena: &UniformArena,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines.bgl_qkv,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w_qkv.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b_qkv.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: q.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: k.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: v.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &arena.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(32),
+                    }),
+                },
+            ],
+        })
+    }
+
+    pub fn bind_gate_up(
+        &self,
+        w_gate: &wgpu::Buffer,
+        w_up: &wgpu::Buffer,
+        x: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        arena: &UniformArena,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines.bgl_gate_up,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: w_gate.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: w_up.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: x.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &arena.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(16),
+                    }),
+                },
+            ],
+        })
+    }
+
+    pub fn bind_res_rms(
+        &self,
+        x_rw: &wgpu::Buffer,
+        dx: &wgpu::Buffer,
+        w: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        arena: &UniformArena,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines.bgl_res_rms,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x_rw.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dx.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &arena.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(16),
+                    }),
+                },
+            ],
+        })
+    }
+
     /// Standalone GPU benchmark helper: uploads `w` and `x_batch` once to VRAM, runs `iters`
     /// dispatches in a single GPU submission, and returns `(elapsed_secs, out_sample)`.
     pub fn bench_matmul(
@@ -446,7 +600,7 @@ impl GpuContext {
     ) -> Result<(f64, Vec<f32>)> {
         let (rows, cols) = w.dims_2d()?;
         let (pipeline, is_b4) = self.matmul_pipeline(w.dtype, batch)?;
-        let w_buf = self.upload_raw_padded("bench-w", w.data);
+        let (w_buf, _) = self.upload_weight("bench-w", w);
         let x_buf = self.upload_f32("bench-x", x_batch);
         let out_bytes = (batch * rows * 4) as u64;
         let out_buf = self.alloc_storage("bench-out", out_bytes);
@@ -550,7 +704,7 @@ fn compile_pipeline(
     })
 }
 
-fn build_pipelines(device: &wgpu::Device) -> GpuPipelines {
+fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
     let bgl_matmul = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bgl-matmul"),
         entries: &[
@@ -560,6 +714,28 @@ fn build_pipelines(device: &wgpu::Device) -> GpuPipelines {
             uniform_entry(3, 16),
         ],
     });
+    let bgl_qkv = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgl-qkv"),
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            storage_entry(4, false),
+            storage_entry(5, false),
+            uniform_entry(6, 32),
+        ],
+    });
+    let bgl_gate_up = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgl-gate-up"),
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            uniform_entry(4, 16),
+        ],
+    });
     let bgl_rms_norm = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bgl-rms-norm"),
         entries: &[
@@ -567,6 +743,16 @@ fn build_pipelines(device: &wgpu::Device) -> GpuPipelines {
             storage_entry(1, true),
             storage_entry(2, false),
             uniform_entry(3, 16),
+        ],
+    });
+    let bgl_res_rms = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgl-res-rms"),
+        entries: &[
+            storage_entry(0, false),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            uniform_entry(4, 16),
         ],
     });
     let bgl_rw_r_u = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -600,32 +786,73 @@ fn build_pipelines(device: &wgpu::Device) -> GpuPipelines {
         ],
     });
 
-    let matmul_q4_k = compile_pipeline(device, "matmul_q4_k", wgpu_shaders::SHADER_MATMUL_Q4_K, &bgl_matmul);
-    let matmul_q4_k_b4 = compile_pipeline(device, "matmul_q4_k_b4", wgpu_shaders::SHADER_MATMUL_Q4_K_B4, &bgl_matmul);
-    let matmul_q5_k = compile_pipeline(device, "matmul_q5_k", wgpu_shaders::SHADER_MATMUL_Q5_K, &bgl_matmul);
-    let matmul_q6_k = compile_pipeline(device, "matmul_q6_k", wgpu_shaders::SHADER_MATMUL_Q6_K, &bgl_matmul);
-    let matmul_q6_k_b4 = compile_pipeline(device, "matmul_q6_k_b4", wgpu_shaders::SHADER_MATMUL_Q6_K_B4, &bgl_matmul);
-    let matmul_q4_0 = compile_pipeline(device, "matmul_q4_0", wgpu_shaders::SHADER_MATMUL_Q4_0, &bgl_matmul);
-    let matmul_q8_0 = compile_pipeline(device, "matmul_q8_0", wgpu_shaders::SHADER_MATMUL_Q8_0, &bgl_matmul);
-    let matmul_f16 = compile_pipeline(device, "matmul_f16", wgpu_shaders::SHADER_MATMUL_F16, &bgl_matmul);
-    let matmul_f32 = compile_pipeline(device, "matmul_f32", wgpu_shaders::SHADER_MATMUL_F32, &bgl_matmul);
+    let comp = |label: &str, src: &str, bgl: &wgpu::BindGroupLayout| {
+        let specialized = wgpu_shaders::specialize_wgsl(src, use_subgroups);
+        compile_pipeline(device, label, &specialized, bgl)
+    };
 
-    let rms_norm = compile_pipeline(device, "rms_norm", wgpu_shaders::SHADER_RMS_NORM, &bgl_rms_norm);
-    let rms_norm_inplace = compile_pipeline(device, "rms_norm_inplace", wgpu_shaders::SHADER_RMS_NORM_INPLACE, &bgl_rw_r_u);
+    let matmul_q4_k = comp("matmul_q4_k", wgpu_shaders::SHADER_MATMUL_Q4_K, &bgl_matmul);
+    let matmul_q4_k_b4 = comp("matmul_q4_k_b4", wgpu_shaders::SHADER_MATMUL_Q4_K_B4, &bgl_matmul);
+    let matmul_q4_k_qkv = comp("matmul_q4_k_qkv", wgpu_shaders::SHADER_MATMUL_Q4_K_QKV, &bgl_qkv);
+    let matmul_q4_k_qkv_b4 = comp("matmul_q4_k_qkv_b4", wgpu_shaders::SHADER_MATMUL_Q4_K_QKV_B4, &bgl_qkv);
+    let matmul_q4_k_gate_up_swiglu = comp(
+        "matmul_q4_k_gate_up_swiglu",
+        wgpu_shaders::SHADER_MATMUL_Q4_K_GATE_UP_SWIGLU,
+        &bgl_gate_up,
+    );
+    let matmul_q5_k = comp("matmul_q5_k", wgpu_shaders::SHADER_MATMUL_Q5_K, &bgl_matmul);
+    let matmul_q6_k = comp("matmul_q6_k", wgpu_shaders::SHADER_MATMUL_Q6_K, &bgl_matmul);
+    let matmul_q6_k_b4 = comp("matmul_q6_k_b4", wgpu_shaders::SHADER_MATMUL_Q6_K_B4, &bgl_matmul);
+    let matmul_q4_0 = comp("matmul_q4_0", wgpu_shaders::SHADER_MATMUL_Q4_0, &bgl_matmul);
+    let matmul_q8_0 = comp("matmul_q8_0", wgpu_shaders::SHADER_MATMUL_Q8_0, &bgl_matmul);
+    let matmul_f16 = comp("matmul_f16", wgpu_shaders::SHADER_MATMUL_F16, &bgl_matmul);
+    let matmul_f32 = comp("matmul_f32", wgpu_shaders::SHADER_MATMUL_F32, &bgl_matmul);
+
+    let rms_norm = comp("rms_norm", wgpu_shaders::SHADER_RMS_NORM, &bgl_rms_norm);
+    let residual_rms_norm = comp(
+        "residual_rms_norm",
+        wgpu_shaders::SHADER_RESIDUAL_RMS_NORM,
+        &bgl_res_rms,
+    );
+    let rms_norm_inplace = comp(
+        "rms_norm_inplace",
+        wgpu_shaders::SHADER_RMS_NORM_INPLACE,
+        &bgl_rw_r_u,
+    );
     let add_bias = compile_pipeline(device, "add_bias", wgpu_shaders::SHADER_ADD_BIAS, &bgl_rw_r_u);
-    let rope_kv_store = compile_pipeline(device, "rope_kv_store", wgpu_shaders::SHADER_ROPE_KV_STORE, &bgl_rope_kv);
-    let gqa_flash_attn = compile_pipeline(device, "gqa_flash_attn", wgpu_shaders::SHADER_GQA_FLASH_ATTN, &bgl_gqa);
+    let rope_kv_store = compile_pipeline(
+        device,
+        "rope_kv_store_f16",
+        wgpu_shaders::SHADER_ROPE_KV_STORE_F16,
+        &bgl_rope_kv,
+    );
+    let gqa_flash_attn = comp(
+        "gqa_flash_attn_f16",
+        wgpu_shaders::SHADER_GQA_FLASH_ATTN_F16,
+        &bgl_gqa,
+    );
     let swiglu = compile_pipeline(device, "swiglu", wgpu_shaders::SHADER_SWIGLU, &bgl_rw_r_u);
-    let residual_add = compile_pipeline(device, "residual_add", wgpu_shaders::SHADER_RESIDUAL_ADD, &bgl_rw_r_u);
+    let residual_add = compile_pipeline(
+        device,
+        "residual_add",
+        wgpu_shaders::SHADER_RESIDUAL_ADD,
+        &bgl_rw_r_u,
+    );
 
     GpuPipelines {
         bgl_matmul,
+        bgl_qkv,
+        bgl_gate_up,
         bgl_rms_norm,
+        bgl_res_rms,
         bgl_rw_r_u,
         bgl_rope_kv,
         bgl_gqa,
         matmul_q4_k,
         matmul_q4_k_b4,
+        matmul_q4_k_qkv,
+        matmul_q4_k_qkv_b4,
+        matmul_q4_k_gate_up_swiglu,
         matmul_q5_k,
         matmul_q6_k,
         matmul_q6_k_b4,
@@ -634,6 +861,7 @@ fn build_pipelines(device: &wgpu::Device) -> GpuPipelines {
         matmul_f16,
         matmul_f32,
         rms_norm,
+        residual_rms_norm,
         rms_norm_inplace,
         add_bias,
         rope_kv_store,

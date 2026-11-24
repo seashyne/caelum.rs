@@ -5,16 +5,16 @@
 
 **Caelum** (*Latin: "The Chisel / The Sky"*) is a **zero-dependency-by-default, pure-Rust, ARMv9, x86 AVX-VNNI & optional `wgpu` Vulkan/Metal/DX12 GPU LLM inference engine** built from scratch to power **Celestia** (MLA + DeepSeekMoE), **Astraea** (Qwen2.5 / Qwen3 / Gemma-2/3 / Phi-3/4 / StarCoder2 / DeepSeek-V2 / Llama / Mistral GGUF), **Cline / OpenCode** coding agents, and **Lenout Creative Workspace**.
 
-No Python. No PyTorch. No `llama.cpp`. Default build has **zero external crates** in a single **1.3 MB** native binary (outperforming `llama.cpp b12651` on CPU by **+44.6%** decode / **+35–63%** prefill) — plus an optional **`--features gpu`** `wgpu` Vulkan/Metal/DX12 compute backend hitting **`61.15 tok/s` decode** and **`383.18 tok/s` prefill** on an **Intel Arc B580**!
+No Python. No PyTorch. No `llama.cpp`. Default build has **zero external crates** in a single **1.3 MB** native binary (outperforming `llama.cpp b12651` on CPU by **+44.6%** decode / **+35–63%** prefill) — plus an optional **`--features gpu`** `wgpu` Vulkan/Metal/DX12 Turbo backend hitting **`128.5 tok/s` decode** (**6.16× faster than `llama.cpp` CPU**), **`535–567 tok/s` prefill**, and **`2.03 TFLOP/s` (`Q6_K`)** on an **Intel Arc B580**!
 
 ---
 
-## Key Features (v0.7.0)
+## Key Features (v0.8.0)
 
 - **Zero External Dependencies by Default:** Pure Rust standard library (`std`) — builds in ~6s to a **1.3 MB** binary and compiles cleanly for `x86_64`, **ARMv9 (`aarch64`)**, and **`wasm32`**.
-- **Optional `wgpu` GPU Compute Backend (`--features gpu`, `--gpu`):**
-  - 100% VRAM-resident Transformer runner (Vulkan / Metal / DX12) executing quantized `Q4_K`, `Q5_K`, `Q6_K`, `Q4_0`, `Q8_0`, `F16`, and `F32` WGSL compute shaders directly over raw GGUF bytes with **single-pass single-submission decode** and **online tiled Flash-Attention GQA**.
-  - Verified on **Intel Arc B580 (BMG G21, Vulkan 1.4)**: **`276.2 GB/s`** (`F32`), **`221.8 GB/s` / `788.6 GFLOP/s`** (`Q4_K B=1`), **`1.02–1.22 TFLOP/s`** (`Q4_K`/`Q6_K B=16`), **`61.15 tok/s` decode** & **`383.18 tok/s` prefill** on `Qwen2.5-Coder-1.5B-Instruct-Q4_K_M` (**2.93× faster decode** than `llama.cpp` CPU), with `< 1e-4` F32 parity vs CPU.
+- **Optional `wgpu` GPU Turbo Backend (`--features gpu`, `--gpu`):**
+  - 100% VRAM-resident Transformer runner (Vulkan / Metal / DX12) with **hardware `wgpu::Features::SUBGROUP` (`subgroupAdd`/`subgroupMax`)**, **Fused `Q4_K` QKV+Bias**, **Fused `Q4_K` Gate+Up+SwiGLU**, **Fused Residual+RMSNorm** (cutting per-token dispatches from 478 → 226!), **4-byte-aligned `Q6_K` VRAM blocks** (`53 u32`, hardware `extractBits`), and **Packed F16 VRAM KV Cache** (2× less VRAM & 2× KV bandwidth!).
+  - Verified on **Intel Arc B580 (BMG G21, Vulkan 1.4, `subgroups=16-32`)**: **`306.4 GB/s` / `746.9 GFLOP/s`** (`Q6_K B=1`), **`2.03 TFLOP/s`** (`Q6_K B=16`), **`240.9 GB/s` / `856.4 GFLOP/s`** (`Q4_K B=1`), **`1.64 TFLOP/s`** (`Q4_K B=16`), **`128.5 tok/s` decode (`tg128`)** & **`535–567 tok/s` prefill** on `Qwen2.5-Coder-1.5B-Instruct-Q4_K_M` (**6.16× faster decode** than `llama.cpp` CPU).
 - **Beats `llama.cpp` on CPU (`x86_64` AVX-VNNI + Online Weight Repacking):**
   - **Cache-Aligned 8-Row Repacked Tiles (`TileQ4Kx8`, `TileQ5Kx8`, `TileQ6Kx8`):** Interleaves 8 weight rows in 4-byte SIMD lanes with pre-unpacked scales/quants and hardware `F16C` (`vcvtph2ps`), executing single-instruction **`{vex} vpdpbusd` (AVX-VNNI)** with **zero horizontal reductions** (`hsum256`) — hitting **`1.465 TFLOP/s`** (`Q4_Kx8`), **`1.112 TFLOP/s`** (`Q5_Kx8`), and **`1.401 TFLOP/s`** (`Q6_Kx8`) on 6 P-cores!
   - **Single-Barrier Fused Decode Ops:** Fused QKV + Fused Gate+Up+SwiGLU + 32-wide 2-row `Q6_K` `lm_head` + P-Core pinning & lock-free dynamic work-stealing `ThreadPool`.
@@ -36,11 +36,12 @@ No Python. No PyTorch. No `llama.cpp`. Default build has **zero external crates*
 
 Measured on the exact same machine (**Intel Core i5-13400F** 6 P-cores + **Intel Arc B580** 12 GB GDDR6 Vulkan 1.4):
 
-| Benchmark | `llama.cpp b12651` *(CPU)* | `Caelum CPU` *(Pure Rust, 0 crates)* | **`Caelum --gpu` *(Arc B580 Vulkan)*** | Speedup vs `llama.cpp` |
+| Benchmark | `llama.cpp b12651` *(CPU)* | `Caelum CPU` *(Pure Rust, 0 crates)* | **`Caelum v0.8 --gpu` *(Arc B580 Turbo)*** | Speedup vs `llama.cpp` |
 | :--- | :---: | :---: | :---: | :---: |
-| **Decode 128 tok** | `20.85 ± 0.05 tok/s` | **`30.14 ± 0.10 tok/s`** *(+44.6%)* | **`61.15 tok/s`** | **2.93× faster** |
-| **Long Prefill** | `183.75` / `219.46 tok/s` *(pp256)* | **`248.86 ± 2.53 tok/s`** *(pp232)* | **`383.18 tok/s`** *(pp161)* | **+75% to +108% faster** |
-| **IDE FIM Autocomplete** | — | `41.02 tok/s` | **`105–123 tok/s`** | — |
+| **Decode 128 tok** | `20.85 ± 0.05 tok/s` | **`30.14 ± 0.10 tok/s`** *(+44.6%)* | **`128.51 tok/s`** *(2.1× vs v0.7)* | **6.16× faster** |
+| **Long Prefill** | `183.75` / `219.46 tok/s` *(pp256)* | **`248.86 ± 2.53 tok/s`** *(pp232)* | **`535–567 tok/s`** *(pp161–169)* | **2.4×–3.1× faster** |
+| **IDE FIM Autocomplete** | — | `41.02 tok/s` | **`199.56 tok/s`** | — |
+| **GPU KV Cache (2048 ctx)** | — | `29.8 MB` *(`--kv-q8`)* | **`112.0 MB`** *(Packed F16, 2× smaller)* | — |
 | **Runtime Binary Size** | `~8.5+ MB` *(CLI + shared libs)* | **`1.3 MB`** *(0 external crates)* | **`5.4 MB`** *(`--features gpu`)* | **~6.5× smaller (CPU)** |
 
 ---
@@ -112,9 +113,9 @@ cargo check --target wasm32-unknown-unknown \
 
 - [x] Online Weight Repacking (`TileQ4Kx8` / `TileQ5Kx8` / `TileQ6Kx8`) + AVX-VNNI (`vpdpbusd`) `8×4`/`8×8` Prefill GEMM + Fused QKV/SwiGLU + P-Core Pinning (**beats `llama.cpp`** on CPU!)
 - [x] 11 Model Architectures: `Qwen2/2.5`, `Qwen3` (QK-Norm), `Qwen2/3MoE`, `DeepSeek2` (Absorbed MLA + YaRN + MoE), **`Gemma-2/3`**, **`Phi-3/4`**, **`StarCoder2`**, `Llama`, `Mistral`, `Celestia`
-- [x] Optional **`wgpu` GPU Compute Backend** (`--features gpu` / `--gpu`, Vulkan / Metal / DX12, 100% VRAM-resident)
+- [x] Optional **`wgpu` GPU Turbo Backend** (`--features gpu` / `--gpu`, Vulkan/Metal/DX12, `subgroupAdd`/`subgroupMax`, Fused QKV+Bias, Fused Gate+Up+SwiGLU, Fused Residual+RMSNorm, Aligned `Q6_K`, Packed F16 VRAM KV Cache)
 - [x] **OpenAI Tool Calling / Function Calling** (`tools`, `tool_choice`, `role: "tool"`, SSE `delta.tool_calls` for **Cline / OpenCode**) + IDE FIM (`/v1/completions`) + Automatic KV Prefix Caching
-- [ ] WGSL `subgroupAdd` + Fused QKV/Bias GPU kernels & Gemma-2/3 / MoE GPU runner
+- [ ] Gemma-2/3, StarCoder2 & MoE GPU runner + Flash-Decoding Split-K for ultra-long contexts
 - [ ] Optional **Arm KleidiAI** FFI backend for ARMv9.2+ `SME2` matrix tiles
 
 ---

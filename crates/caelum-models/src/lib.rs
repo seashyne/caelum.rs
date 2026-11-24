@@ -216,7 +216,7 @@ impl<'a> CaelumModel<'a> {
                 KvPrecision::Q8_0 => "GQA-Q8_0",
             },
             #[cfg(feature = "gpu")]
-            ModelInner::WgpuLlamaQwen(_) => "VRAM-GQA-F32",
+            ModelInner::WgpuLlamaQwen(_) => "VRAM-GQA-F16",
             ModelInner::DeepSeek2(_) => "MLA-Absorbed",
             ModelInner::Celestia(_) => "MLA-Latent",
         }

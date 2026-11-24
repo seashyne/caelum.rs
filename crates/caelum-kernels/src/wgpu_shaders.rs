@@ -1,23 +1,216 @@
-//! WGSL Compute Shaders for Caelum's `wgpu` GPU Backend (Vulkan / Metal / DX12 / WebGPU).
+//! High-Performance WGSL Compute Shaders for Caelum's `wgpu` GPU Backend (`--features gpu`).
 //!
-//! Includes:
-//! - Coalesced 32-thread-per-row quantized GEMV & 4-token GEMM for `Q4_K`, `Q5_K`, `Q6_K`,
-//!   `Q4_0`, `Q8_0`, `F16`, and `F32` (exact GGML bit layouts, zero dequantization to VRAM)
-//! - On-GPU embedding lookup (`Q4_K`/`Q5_K`/`Q6_K`/`Q4_0`/`Q8_0`/`F16`/`F32`)
-//! - Tree-reduction RMSNorm (full hidden + in-place Qwen3 per-head QK-Norm)
-//! - Fused QKV bias + RoPE (Normal/NeoX/YaRN LUT) + VRAM KV Cache store
-//! - Online Tiled Flash-Attention GQA (zero global scratch buffer, any context length)
-//! - SwiGLU & Residual Add
+//! Optimized for discrete & integrated Vulkan / Metal / DX12 GPUs (verified on Intel Arc B580):
+//! - Hardware `enable subgroups;` (`subgroupAdd` / `subgroupMax`) with automatic portable fallback
+//! - 4-byte-aligned `Q6_K` VRAM layout (`53 u32` = 212B/block, pre-decoded `f32` `d`, hardware `extractBits`)
+//! - Fused `Q4_K` **QKV + Optional Bias** (1 dispatch instead of 6!)
+//! - Fused `Q4_K` **Gate + Up + SwiGLU** (1 dispatch, reads `X` once, 0 `hb2` VRAM traffic!)
+//! - Fused **Residual Add + RMSNorm** (1 dispatch instead of 2, halves `X` traffic!)
+//! - Packed **F16 VRAM KV Cache** (`pack2x16float` / `unpack2x16float`, 2× less VRAM & 2× KV bandwidth!)
+//! - Online Tiled Flash-Attention GQA with subgroup reductions
+
+/// Specializes a WGSL shader template for either hardware `subgroups` (`subgroupAdd`/`subgroupMax`)
+/// or portable `workgroup` shared-memory tree reductions.
+pub fn specialize_wgsl(template: &str, use_subgroups: bool) -> String {
+    // Note: Naga 30 exposes `subgroupAdd`/`subgroupMax` & subgroup builtins directly when
+    // `wgpu::Features::SUBGROUP` is enabled on the device (rejecting `enable subgroups;`).
+    let sg_enable = "";
+    let sg_args = if use_subgroups {
+        ", @builtin(subgroup_size) sg_size: u32, @builtin(subgroup_invocation_id) sg_inv: u32"
+    } else {
+        ""
+    };
+
+    let reduce_row_f32 = if use_subgroups {
+        r#"
+    let sg_sum = subgroupAdd(acc);
+    if (sg_inv == 0u) {
+        smem[r_local * 4u + (tid / sg_size)] = sg_sum;
+    }
+    workgroupBarrier();
+    var row_sum = 0.0;
+    if (tid == 0u) {
+        let n_sg = 32u / sg_size;
+        for (var k = 0u; k < n_sg; k++) {
+            row_sum += smem[r_local * 4u + k];
+        }
+    }"#
+    } else {
+        r#"
+    let sidx = r_local * 32u + tid;
+    smem[sidx] = acc;
+    workgroupBarrier();
+    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
+    workgroupBarrier();
+    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
+    workgroupBarrier();
+    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
+    workgroupBarrier();
+    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
+    workgroupBarrier();
+    var row_sum = 0.0;
+    if (tid == 0u) {
+        row_sum = smem[sidx] + smem[sidx + 1u];
+    }"#
+    };
+
+    let reduce_row_vec2 = if use_subgroups {
+        r#"
+    let sg_sum = subgroupAdd(vec2<f32>(acc_g, acc_u));
+    if (sg_inv == 0u) {
+        smem2[r_local * 4u + (tid / sg_size)] = sg_sum;
+    }
+    workgroupBarrier();
+    var row_sum2 = vec2<f32>(0.0);
+    if (tid == 0u) {
+        let n_sg = 32u / sg_size;
+        for (var k = 0u; k < n_sg; k++) {
+            row_sum2 += smem2[r_local * 4u + k];
+        }
+    }"#
+    } else {
+        r#"
+    let sidx = r_local * 32u + tid;
+    smem2[sidx] = vec2<f32>(acc_g, acc_u);
+    workgroupBarrier();
+    if (tid < 16u) { smem2[sidx] += smem2[sidx + 16u]; }
+    workgroupBarrier();
+    if (tid < 8u) { smem2[sidx] += smem2[sidx + 8u]; }
+    workgroupBarrier();
+    if (tid < 4u) { smem2[sidx] += smem2[sidx + 4u]; }
+    workgroupBarrier();
+    if (tid < 2u) { smem2[sidx] += smem2[sidx + 2u]; }
+    workgroupBarrier();
+    var row_sum2 = vec2<f32>(0.0);
+    if (tid == 0u) {
+        row_sum2 = smem2[sidx] + smem2[sidx + 1u];
+    }"#
+    };
+
+    let reduce_row_vec4 = if use_subgroups {
+        r#"
+    let sg_sum = subgroupAdd(vec4<f32>(a0, a1, a2, a3));
+    if (sg_inv == 0u) {
+        smem4[r_local * 4u + (tid / sg_size)] = sg_sum;
+    }
+    workgroupBarrier();
+    var row_sum4 = vec4<f32>(0.0);
+    if (tid == 0u) {
+        let n_sg = 32u / sg_size;
+        for (var k = 0u; k < n_sg; k++) {
+            row_sum4 += smem4[r_local * 4u + k];
+        }
+    }"#
+    } else {
+        r#"
+    let sidx = r_local * 32u + tid;
+    smem4[sidx] = vec4<f32>(a0, a1, a2, a3);
+    workgroupBarrier();
+    if (tid < 16u) { smem4[sidx] += smem4[sidx + 16u]; }
+    workgroupBarrier();
+    if (tid < 8u) { smem4[sidx] += smem4[sidx + 8u]; }
+    workgroupBarrier();
+    if (tid < 4u) { smem4[sidx] += smem4[sidx + 4u]; }
+    workgroupBarrier();
+    if (tid < 2u) { smem4[sidx] += smem4[sidx + 2u]; }
+    workgroupBarrier();
+    var row_sum4 = vec4<f32>(0.0);
+    if (tid == 0u) {
+        row_sum4 = smem4[sidx] + smem4[sidx + 1u];
+    }"#
+    };
+
+    let reduce_wg64_sum = if use_subgroups {
+        r#"
+    let sg_ss = subgroupAdd(ss);
+    if (sg_inv == 0u) { smem[tid / sg_size] = sg_ss; }
+    workgroupBarrier();
+    var wg_sum = 0.0;
+    let n_sg = 64u / sg_size;
+    for (var k = 0u; k < n_sg; k++) { wg_sum += smem[k]; }"#
+    } else {
+        r#"
+    smem[tid] = ss;
+    workgroupBarrier();
+    if (tid < 32u) { smem[tid] += smem[tid + 32u]; }
+    workgroupBarrier();
+    if (tid < 16u) { smem[tid] += smem[tid + 16u]; }
+    workgroupBarrier();
+    if (tid < 8u) { smem[tid] += smem[tid + 8u]; }
+    workgroupBarrier();
+    if (tid < 4u) { smem[tid] += smem[tid + 4u]; }
+    workgroupBarrier();
+    if (tid < 2u) { smem[tid] += smem[tid + 2u]; }
+    workgroupBarrier();
+    let wg_sum = smem[0] + smem[1];"#
+    };
+
+    let reduce_wg64_max = if use_subgroups {
+        r#"
+    let sg_mx = subgroupMax(sc);
+    if (sg_inv == 0u) { red[tid / sg_size] = sg_mx; }
+    workgroupBarrier();
+    var tile_max = -1e30;
+    let n_sg_m = 64u / sg_size;
+    for (var k = 0u; k < n_sg_m; k++) { tile_max = max(tile_max, red[k]); }
+    workgroupBarrier();"#
+    } else {
+        r#"
+    red[tid] = sc;
+    workgroupBarrier();
+    if (tid < 32u) { red[tid] = max(red[tid], red[tid + 32u]); }
+    workgroupBarrier();
+    if (tid < 16u) { red[tid] = max(red[tid], red[tid + 16u]); }
+    workgroupBarrier();
+    if (tid < 8u) { red[tid] = max(red[tid], red[tid + 8u]); }
+    workgroupBarrier();
+    if (tid < 4u) { red[tid] = max(red[tid], red[tid + 4u]); }
+    workgroupBarrier();
+    if (tid < 2u) { red[tid] = max(red[tid], red[tid + 2u]); }
+    workgroupBarrier();
+    let tile_max = max(red[0], red[1]);
+    workgroupBarrier();"#
+    };
+
+    let reduce_wg64_wsum = if use_subgroups {
+        r#"
+    let sg_ws = subgroupAdd(w);
+    if (sg_inv == 0u) { red[tid / sg_size] = sg_ws; }
+    workgroupBarrier();
+    var tile_sum = 0.0;
+    let n_sg_s = 64u / sg_size;
+    for (var k = 0u; k < n_sg_s; k++) { tile_sum += red[k]; }"#
+    } else {
+        r#"
+    red[tid] = w;
+    workgroupBarrier();
+    if (tid < 32u) { red[tid] += red[tid + 32u]; }
+    workgroupBarrier();
+    if (tid < 16u) { red[tid] += red[tid + 16u]; }
+    workgroupBarrier();
+    if (tid < 8u) { red[tid] += red[tid + 8u]; }
+    workgroupBarrier();
+    if (tid < 4u) { red[tid] += red[tid + 4u]; }
+    workgroupBarrier();
+    if (tid < 2u) { red[tid] += red[tid + 2u]; }
+    workgroupBarrier();
+    let tile_sum = red[0] + red[1];"#
+    };
+
+    template
+        .replace("/*SG_ENABLE*/", sg_enable)
+        .replace("/*SG_ARGS*/", sg_args)
+        .replace("/*REDUCE_ROW_F32*/", reduce_row_f32)
+        .replace("/*REDUCE_ROW_VEC2*/", reduce_row_vec2)
+        .replace("/*REDUCE_ROW_VEC4*/", reduce_row_vec4)
+        .replace("/*REDUCE_WG64_SUM*/", reduce_wg64_sum)
+        .replace("/*REDUCE_WG64_MAX*/", reduce_wg64_max)
+        .replace("/*REDUCE_WG64_WSUM*/", reduce_wg64_wsum)
+}
 
 /// Quantized `Q4_K × F32` GEMV/GEMM (`36 u32` = `144` bytes per 256-elem super-block).
-/// Dispatch: `workgroups = (ceil(rows / 4), batch, 1)` for B=1..3, or `matmul_q4_k_b4` for B>=4.
-pub const SHADER_MATMUL_Q4_K: &str = r#"
-struct Params {
-    rows: u32,
-    cols: u32,
-    batch: u32,
-    _pad: u32,
-}
+pub const SHADER_MATMUL_Q4_K: &str = r#"/*SG_ENABLE*/
+struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
@@ -36,19 +229,17 @@ fn scale_min_k4(j: u32, s0: u32, s1: u32, s2: u32) -> vec2<u32> {
         let q8 = (s2 >> sh) & 0xFFu;
         let q0 = (s0 >> sh) & 0xFFu;
         let q4 = (s1 >> sh) & 0xFFu;
-        let sc = (q8 & 0xFu) | ((q0 >> 6u) << 4u);
-        let mn = (q8 >> 4u) | ((q4 >> 6u) << 4u);
-        return vec2<u32>(sc, mn);
+        return vec2<u32>((q8 & 0xFu) | ((q0 >> 6u) << 4u), (q8 >> 4u) | ((q4 >> 6u) << 4u));
     }
 }
 
-@compute @workgroup_size(32, 4, 1)
+@compute @workgroup_size(128, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
 ) {
-    let tid = lid.x;
-    let r_local = lid.y;
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 8u;
@@ -74,11 +265,6 @@ fn main(
             let qw = W[blk + 4u + tid];
             let xb = x_tok + b * 256u + x_chunk_off;
 
-            var sq1 = 0.0;
-            var sx1 = 0.0;
-            var sq2 = 0.0;
-            var sx2 = 0.0;
-
             let b0 = qw & 0xFFu;
             let b1 = (qw >> 8u) & 0xFFu;
             let b2 = (qw >> 16u) & 0xFFu;
@@ -89,48 +275,45 @@ fn main(
             let xl2 = X[xb + 2u]; let xh2 = X[xb + 34u];
             let xl3 = X[xb + 3u]; let xh3 = X[xb + 35u];
 
-            sq1 = f32(b0 & 0xFu) * xl0 + f32(b1 & 0xFu) * xl1 + f32(b2 & 0xFu) * xl2 + f32(b3 & 0xFu) * xl3;
-            sx1 = xl0 + xl1 + xl2 + xl3;
-            sq2 = f32(b0 >> 4u) * xh0 + f32(b1 >> 4u) * xh1 + f32(b2 >> 4u) * xh2 + f32(b3 >> 4u) * xh3;
-            sx2 = xh0 + xh1 + xh2 + xh3;
+            let sq1 = f32(b0 & 0xFu) * xl0 + f32(b1 & 0xFu) * xl1 + f32(b2 & 0xFu) * xl2 + f32(b3 & 0xFu) * xl3;
+            let sx1 = xl0 + xl1 + xl2 + xl3;
+            let sq2 = f32(b0 >> 4u) * xh0 + f32(b1 >> 4u) * xh1 + f32(b2 >> 4u) * xh2 + f32(b3 >> 4u) * xh3;
+            let sx2 = xh0 + xh1 + xh2 + xh3;
 
             acc += (dm.x * f32(sm1.x)) * sq1 - (dm.y * f32(sm1.y)) * sx1
                  + (dm.x * f32(sm2.x)) * sq2 - (dm.y * f32(sm2.y)) * sx2;
         }
     }
-
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = acc;
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_F32*/
     if (tid == 0u && row < P.rows && tok < P.batch) {
-        OUT[tok * P.rows + row] = smem[sidx] + smem[sidx + 1u];
+        OUT[tok * P.rows + row] = row_sum;
     }
 }
 "#;
 
-/// 4-token weight-reuse `Q4_K × F32` Prefill GEMM (`workgroups = (ceil(rows/4), ceil(batch/4), 1)`).
-pub const SHADER_MATMUL_Q4_K_B4: &str = r#"
+/// Fused `Q4_K` **Q + K + V + Optional Bias** projection (1 dispatch instead of 6!).
+/// `W_QKV` is concatenated `[wq; wk; wv]` (`q_dim + 2*kv_dim` rows).
+pub const SHADER_MATMUL_Q4_K_QKV: &str = r#"/*SG_ENABLE*/
 struct Params {
-    rows: u32,
+    q_dim: u32,
+    kv_dim: u32,
     cols: u32,
     batch: u32,
-    _pad: u32,
+    has_bias: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> W: array<u32>;
-@group(0) @binding(1) var<storage, read> X: array<f32>;
-@group(0) @binding(2) var<storage, read_write> OUT: array<f32>;
-@group(0) @binding(3) var<uniform> P: Params;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Q: array<f32>;
+@group(0) @binding(4) var<storage, read_write> K: array<f32>;
+@group(0) @binding(5) var<storage, read_write> V: array<f32>;
+@group(0) @binding(6) var<uniform> P: Params;
 
-var<workgroup> smem: array<vec4<f32>, 128>;
+var<workgroup> smem: array<f32, 128>;
 
 fn scale_min_k4(j: u32, s0: u32, s1: u32, s2: u32) -> vec2<u32> {
     if (j < 4u) {
@@ -146,13 +329,330 @@ fn scale_min_k4(j: u32, s0: u32, s1: u32, s2: u32) -> vec2<u32> {
     }
 }
 
-@compute @workgroup_size(32, 4, 1)
+@compute @workgroup_size(128, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
 ) {
-    let tid = lid.x;
-    let r_local = lid.y;
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
+    let row = wid.x * 4u + r_local;
+    let tok = wid.y;
+    let total_rows = P.q_dim + 2u * P.kv_dim;
+    let nb = P.cols >> 8u;
+    let chunk = tid >> 3u;
+    let k4 = tid & 7u;
+
+    var acc = 0.0;
+    if (row < total_rows && tok < P.batch) {
+        let row_base = row * nb * 36u;
+        let x_tok = tok * P.cols;
+        let is_base = chunk * 2u;
+        let x_chunk_off = chunk * 64u + k4 * 4u;
+
+        for (var b = 0u; b < nb; b++) {
+            let blk = row_base + b * 36u;
+            let dm = unpack2x16float(W[blk]);
+            let s0 = W[blk + 1u];
+            let s1 = W[blk + 2u];
+            let s2 = W[blk + 3u];
+            let sm1 = scale_min_k4(is_base, s0, s1, s2);
+            let sm2 = scale_min_k4(is_base + 1u, s0, s1, s2);
+
+            let qw = W[blk + 4u + tid];
+            let xb = x_tok + b * 256u + x_chunk_off;
+
+            let b0 = qw & 0xFFu;
+            let b1 = (qw >> 8u) & 0xFFu;
+            let b2 = (qw >> 16u) & 0xFFu;
+            let b3 = (qw >> 24u) & 0xFFu;
+
+            let xl0 = X[xb];      let xh0 = X[xb + 32u];
+            let xl1 = X[xb + 1u]; let xh1 = X[xb + 33u];
+            let xl2 = X[xb + 2u]; let xh2 = X[xb + 34u];
+            let xl3 = X[xb + 3u]; let xh3 = X[xb + 35u];
+
+            let sq1 = f32(b0 & 0xFu) * xl0 + f32(b1 & 0xFu) * xl1 + f32(b2 & 0xFu) * xl2 + f32(b3 & 0xFu) * xl3;
+            let sx1 = xl0 + xl1 + xl2 + xl3;
+            let sq2 = f32(b0 >> 4u) * xh0 + f32(b1 >> 4u) * xh1 + f32(b2 >> 4u) * xh2 + f32(b3 >> 4u) * xh3;
+            let sx2 = xh0 + xh1 + xh2 + xh3;
+
+            acc += (dm.x * f32(sm1.x)) * sq1 - (dm.y * f32(sm1.y)) * sx1
+                 + (dm.x * f32(sm2.x)) * sq2 - (dm.y * f32(sm2.y)) * sx2;
+        }
+    }
+    /*REDUCE_ROW_F32*/
+    if (tid == 0u && row < total_rows && tok < P.batch) {
+        var val = row_sum;
+        if (P.has_bias != 0u) {
+            val += B[row];
+        }
+        if (row < P.q_dim) {
+            Q[tok * P.q_dim + row] = val;
+        } else if (row < P.q_dim + P.kv_dim) {
+            K[tok * P.kv_dim + (row - P.q_dim)] = val;
+        } else {
+            V[tok * P.kv_dim + (row - P.q_dim - P.kv_dim)] = val;
+        }
+    }
+}
+"#;
+
+/// Fused 4-token `Q4_K` **Q + K + V + Optional Bias** Prefill GEMM.
+pub const SHADER_MATMUL_Q4_K_QKV_B4: &str = r#"/*SG_ENABLE*/
+struct Params {
+    q_dim: u32,
+    kv_dim: u32,
+    cols: u32,
+    batch: u32,
+    has_bias: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> W: array<u32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Q: array<f32>;
+@group(0) @binding(4) var<storage, read_write> K: array<f32>;
+@group(0) @binding(5) var<storage, read_write> V: array<f32>;
+@group(0) @binding(6) var<uniform> P: Params;
+
+var<workgroup> smem4: array<vec4<f32>, 128>;
+
+fn scale_min_k4(j: u32, s0: u32, s1: u32, s2: u32) -> vec2<u32> {
+    if (j < 4u) {
+        let sh = j * 8u;
+        return vec2<u32>((s0 >> sh) & 63u, (s1 >> sh) & 63u);
+    } else {
+        let k = j - 4u;
+        let sh = k * 8u;
+        let q8 = (s2 >> sh) & 0xFFu;
+        let q0 = (s0 >> sh) & 0xFFu;
+        let q4 = (s1 >> sh) & 0xFFu;
+        return vec2<u32>((q8 & 0xFu) | ((q0 >> 6u) << 4u), (q8 >> 4u) | ((q4 >> 6u) << 4u));
+    }
+}
+
+@compute @workgroup_size(128, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
+    let row = wid.x * 4u + r_local;
+    let t_base = wid.y * 4u;
+    let total_rows = P.q_dim + 2u * P.kv_dim;
+    let nb = P.cols >> 8u;
+    let chunk = tid >> 3u;
+    let k4 = tid & 7u;
+
+    var a0 = 0.0;
+    var a1 = 0.0;
+    var a2 = 0.0;
+    var a3 = 0.0;
+    if (row < total_rows && t_base < P.batch) {
+        let row_base = row * nb * 36u;
+        let is_base = chunk * 2u;
+        let x_chunk_off = chunk * 64u + k4 * 4u;
+        let t0 = t_base * P.cols;
+        let t1 = min(t_base + 1u, P.batch - 1u) * P.cols;
+        let t2 = min(t_base + 2u, P.batch - 1u) * P.cols;
+        let t3 = min(t_base + 3u, P.batch - 1u) * P.cols;
+
+        for (var b = 0u; b < nb; b++) {
+            let blk = row_base + b * 36u;
+            let dm = unpack2x16float(W[blk]);
+            let s0 = W[blk + 1u];
+            let s1 = W[blk + 2u];
+            let s2 = W[blk + 3u];
+            let sm1 = scale_min_k4(is_base, s0, s1, s2);
+            let sm2 = scale_min_k4(is_base + 1u, s0, s1, s2);
+            let d1 = dm.x * f32(sm1.x);
+            let m1 = dm.y * f32(sm1.y);
+            let d2 = dm.x * f32(sm2.x);
+            let m2 = dm.y * f32(sm2.y);
+
+            let qw = W[blk + 4u + tid];
+            let q0l = f32(qw & 0xFu) * d1 - m1;
+            let q1l = f32((qw >> 8u) & 0xFu) * d1 - m1;
+            let q2l = f32((qw >> 16u) & 0xFu) * d1 - m1;
+            let q3l = f32((qw >> 24u) & 0xFu) * d1 - m1;
+            let q0h = f32((qw >> 4u) & 0xFu) * d2 - m2;
+            let q1h = f32((qw >> 12u) & 0xFu) * d2 - m2;
+            let q2h = f32((qw >> 20u) & 0xFu) * d2 - m2;
+            let q3h = f32((qw >> 28u) & 0xFu) * d2 - m2;
+
+            let off = b * 256u + x_chunk_off;
+            let b0 = t0 + off;
+            a0 += q0l * X[b0] + q1l * X[b0+1u] + q2l * X[b0+2u] + q3l * X[b0+3u]
+                + q0h * X[b0+32u] + q1h * X[b0+33u] + q2h * X[b0+34u] + q3h * X[b0+35u];
+            let b1 = t1 + off;
+            a1 += q0l * X[b1] + q1l * X[b1+1u] + q2l * X[b1+2u] + q3l * X[b1+3u]
+                + q0h * X[b1+32u] + q1h * X[b1+33u] + q2h * X[b1+34u] + q3h * X[b1+35u];
+            let b2 = t2 + off;
+            a2 += q0l * X[b2] + q1l * X[b2+1u] + q2l * X[b2+2u] + q3l * X[b2+3u]
+                + q0h * X[b2+32u] + q1h * X[b2+33u] + q2h * X[b2+34u] + q3h * X[b2+35u];
+            let b3 = t3 + off;
+            a3 += q0l * X[b3] + q1l * X[b3+1u] + q2l * X[b3+2u] + q3l * X[b3+3u]
+                + q0h * X[b3+32u] + q1h * X[b3+33u] + q2h * X[b3+34u] + q3h * X[b3+35u];
+        }
+    }
+    /*REDUCE_ROW_VEC4*/
+    if (tid == 0u && row < total_rows) {
+        let bv = select(0.0, B[row], P.has_bias != 0u);
+        let res = row_sum4 + vec4<f32>(bv);
+        if (row < P.q_dim) {
+            if (t_base < P.batch) { Q[t_base * P.q_dim + row] = res.x; }
+            if (t_base + 1u < P.batch) { Q[(t_base + 1u) * P.q_dim + row] = res.y; }
+            if (t_base + 2u < P.batch) { Q[(t_base + 2u) * P.q_dim + row] = res.z; }
+            if (t_base + 3u < P.batch) { Q[(t_base + 3u) * P.q_dim + row] = res.w; }
+        } else if (row < P.q_dim + P.kv_dim) {
+            let kr = row - P.q_dim;
+            if (t_base < P.batch) { K[t_base * P.kv_dim + kr] = res.x; }
+            if (t_base + 1u < P.batch) { K[(t_base + 1u) * P.kv_dim + kr] = res.y; }
+            if (t_base + 2u < P.batch) { K[(t_base + 2u) * P.kv_dim + kr] = res.z; }
+            if (t_base + 3u < P.batch) { K[(t_base + 3u) * P.kv_dim + kr] = res.w; }
+        } else {
+            let vr = row - P.q_dim - P.kv_dim;
+            if (t_base < P.batch) { V[t_base * P.kv_dim + vr] = res.x; }
+            if (t_base + 1u < P.batch) { V[(t_base + 1u) * P.kv_dim + vr] = res.y; }
+            if (t_base + 2u < P.batch) { V[(t_base + 2u) * P.kv_dim + vr] = res.z; }
+            if (t_base + 3u < P.batch) { V[(t_base + 3u) * P.kv_dim + vr] = res.w; }
+        }
+    }
+}
+"#;
+
+/// Fused `Q4_K` **Gate + Up + SwiGLU** (1 dispatch instead of 3, reads `X` once, 0 `hb2` traffic!).
+pub const SHADER_MATMUL_Q4_K_GATE_UP_SWIGLU: &str = r#"/*SG_ENABLE*/
+struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
+
+@group(0) @binding(0) var<storage, read> WG: array<u32>;
+@group(0) @binding(1) var<storage, read> WU: array<u32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read_write> OUT: array<f32>;
+@group(0) @binding(4) var<uniform> P: Params;
+
+var<workgroup> smem2: array<vec2<f32>, 128>;
+
+fn scale_min_k4(j: u32, s0: u32, s1: u32, s2: u32) -> vec2<u32> {
+    if (j < 4u) {
+        let sh = j * 8u;
+        return vec2<u32>((s0 >> sh) & 63u, (s1 >> sh) & 63u);
+    } else {
+        let k = j - 4u;
+        let sh = k * 8u;
+        let q8 = (s2 >> sh) & 0xFFu;
+        let q0 = (s0 >> sh) & 0xFFu;
+        let q4 = (s1 >> sh) & 0xFFu;
+        return vec2<u32>((q8 & 0xFu) | ((q0 >> 6u) << 4u), (q8 >> 4u) | ((q4 >> 6u) << 4u));
+    }
+}
+
+@compute @workgroup_size(128, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
+    let row = wid.x * 4u + r_local;
+    let tok = wid.y;
+    let nb = P.cols >> 8u;
+    let chunk = tid >> 3u;
+    let k4 = tid & 7u;
+
+    var acc_g = 0.0;
+    var acc_u = 0.0;
+    if (row < P.rows && tok < P.batch) {
+        let row_base = row * nb * 36u;
+        let x_tok = tok * P.cols;
+        let is_base = chunk * 2u;
+        let x_chunk_off = chunk * 64u + k4 * 4u;
+
+        for (var b = 0u; b < nb; b++) {
+            let blk = row_base + b * 36u;
+            let xb = x_tok + b * 256u + x_chunk_off;
+
+            // Load X ONCE into registers and reuse for both Gate and Up!
+            let xl0 = X[xb];      let xh0 = X[xb + 32u];
+            let xl1 = X[xb + 1u]; let xh1 = X[xb + 33u];
+            let xl2 = X[xb + 2u]; let xh2 = X[xb + 34u];
+            let xl3 = X[xb + 3u]; let xh3 = X[xb + 35u];
+            let sx1 = xl0 + xl1 + xl2 + xl3;
+            let sx2 = xh0 + xh1 + xh2 + xh3;
+
+            // Gate projection
+            let dmg = unpack2x16float(WG[blk]);
+            let sg0 = WG[blk + 1u]; let sg1 = WG[blk + 2u]; let sg2 = WG[blk + 3u];
+            let smg1 = scale_min_k4(is_base, sg0, sg1, sg2);
+            let smg2 = scale_min_k4(is_base + 1u, sg0, sg1, sg2);
+            let qg = WG[blk + 4u + tid];
+            let gb0 = qg & 0xFFu; let gb1 = (qg >> 8u) & 0xFFu;
+            let gb2 = (qg >> 16u) & 0xFFu; let gb3 = (qg >> 24u) & 0xFFu;
+            let gsq1 = f32(gb0 & 0xFu) * xl0 + f32(gb1 & 0xFu) * xl1 + f32(gb2 & 0xFu) * xl2 + f32(gb3 & 0xFu) * xl3;
+            let gsq2 = f32(gb0 >> 4u) * xh0 + f32(gb1 >> 4u) * xh1 + f32(gb2 >> 4u) * xh2 + f32(gb3 >> 4u) * xh3;
+            acc_g += (dmg.x * f32(smg1.x)) * gsq1 - (dmg.y * f32(smg1.y)) * sx1
+                   + (dmg.x * f32(smg2.x)) * gsq2 - (dmg.y * f32(smg2.y)) * sx2;
+
+            // Up projection
+            let dmu = unpack2x16float(WU[blk]);
+            let su0 = WU[blk + 1u]; let su1 = WU[blk + 2u]; let su2 = WU[blk + 3u];
+            let smu1 = scale_min_k4(is_base, su0, su1, su2);
+            let smu2 = scale_min_k4(is_base + 1u, su0, su1, su2);
+            let qu = WU[blk + 4u + tid];
+            let ub0 = qu & 0xFFu; let ub1 = (qu >> 8u) & 0xFFu;
+            let ub2 = (qu >> 16u) & 0xFFu; let ub3 = (qu >> 24u) & 0xFFu;
+            let usq1 = f32(ub0 & 0xFu) * xl0 + f32(ub1 & 0xFu) * xl1 + f32(ub2 & 0xFu) * xl2 + f32(ub3 & 0xFu) * xl3;
+            let usq2 = f32(ub0 >> 4u) * xh0 + f32(ub1 >> 4u) * xh1 + f32(ub2 >> 4u) * xh2 + f32(ub3 >> 4u) * xh3;
+            acc_u += (dmu.x * f32(smu1.x)) * usq1 - (dmu.y * f32(smu1.y)) * sx1
+                   + (dmu.x * f32(smu2.x)) * usq2 - (dmu.y * f32(smu2.y)) * sx2;
+        }
+    }
+    /*REDUCE_ROW_VEC2*/
+    if (tid == 0u && row < P.rows && tok < P.batch) {
+        let g = row_sum2.x;
+        let u = row_sum2.y;
+        OUT[tok * P.rows + row] = (g / (1.0 + exp(-g))) * u;
+    }
+}
+"#;
+
+/// 4-token weight-reuse `Q4_K × F32` Prefill GEMM.
+pub const SHADER_MATMUL_Q4_K_B4: &str = r#"/*SG_ENABLE*/
+struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
+
+@group(0) @binding(0) var<storage, read> W: array<u32>;
+@group(0) @binding(1) var<storage, read> X: array<f32>;
+@group(0) @binding(2) var<storage, read_write> OUT: array<f32>;
+@group(0) @binding(3) var<uniform> P: Params;
+
+var<workgroup> smem4: array<vec4<f32>, 128>;
+
+fn scale_min_k4(j: u32, s0: u32, s1: u32, s2: u32) -> vec2<u32> {
+    if (j < 4u) {
+        let sh = j * 8u;
+        return vec2<u32>((s0 >> sh) & 63u, (s1 >> sh) & 63u);
+    } else {
+        let k = j - 4u;
+        let sh = k * 8u;
+        let q8 = (s2 >> sh) & 0xFFu;
+        let q0 = (s0 >> sh) & 0xFFu;
+        let q4 = (s1 >> sh) & 0xFFu;
+        return vec2<u32>((q8 & 0xFu) | ((q0 >> 6u) << 4u), (q8 >> 4u) | ((q4 >> 6u) << 4u));
+    }
+}
+
+@compute @workgroup_size(128, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let t_base = wid.y * 4u;
     let nb = P.cols >> 8u;
@@ -196,7 +696,6 @@ fn main(
             let q3h = f32((qw >> 28u) & 0xFu) * d2 - m2;
 
             let off = b * 256u + x_chunk_off;
-
             let b0 = t0 + off;
             a0 += q0l * X[b0] + q1l * X[b0+1u] + q2l * X[b0+2u] + q3l * X[b0+3u]
                 + q0h * X[b0+32u] + q1h * X[b0+33u] + q2h * X[b0+34u] + q3h * X[b0+35u];
@@ -211,36 +710,19 @@ fn main(
                 + q0h * X[b3+32u] + q1h * X[b3+33u] + q2h * X[b3+34u] + q3h * X[b3+35u];
         }
     }
-
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = vec4<f32>(a0, a1, a2, a3);
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_VEC4*/
     if (tid == 0u && row < P.rows) {
-        let res = smem[sidx] + smem[sidx + 1u];
-        if (t_base < P.batch) { OUT[t_base * P.rows + row] = res.x; }
-        if (t_base + 1u < P.batch) { OUT[(t_base + 1u) * P.rows + row] = res.y; }
-        if (t_base + 2u < P.batch) { OUT[(t_base + 2u) * P.rows + row] = res.z; }
-        if (t_base + 3u < P.batch) { OUT[(t_base + 3u) * P.rows + row] = res.w; }
+        if (t_base < P.batch) { OUT[t_base * P.rows + row] = row_sum4.x; }
+        if (t_base + 1u < P.batch) { OUT[(t_base + 1u) * P.rows + row] = row_sum4.y; }
+        if (t_base + 2u < P.batch) { OUT[(t_base + 2u) * P.rows + row] = row_sum4.z; }
+        if (t_base + 3u < P.batch) { OUT[(t_base + 3u) * P.rows + row] = row_sum4.w; }
     }
 }
 "#;
 
 /// Quantized `Q5_K × F32` GEMV/GEMM (`44 u32` = `176` bytes per 256-elem super-block).
-pub const SHADER_MATMUL_Q5_K: &str = r#"
-struct Params {
-    rows: u32,
-    cols: u32,
-    batch: u32,
-    _pad: u32,
-}
+pub const SHADER_MATMUL_Q5_K: &str = r#"/*SG_ENABLE*/
+struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
@@ -263,26 +745,26 @@ fn scale_min_k4(j: u32, s0: u32, s1: u32, s2: u32) -> vec2<u32> {
     }
 }
 
-@compute @workgroup_size(32, 4, 1)
+@compute @workgroup_size(128, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
 ) {
-    let tid = lid.x;
-    let r_local = lid.y;
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 8u;
     let chunk = tid >> 3u;
     let k4 = tid & 7u;
-    let u1 = 1u << (chunk * 2u);
-    let u2 = 2u << (chunk * 2u);
 
     var acc = 0.0;
     if (row < P.rows && tok < P.batch) {
         let row_base = row * nb * 44u;
         let x_tok = tok * P.cols;
         let is_base = chunk * 2u;
+        let u1 = 1u << (chunk * 2u);
+        let u2 = u1 << 1u;
         let x_chunk_off = chunk * 64u + k4 * 4u;
 
         for (var b = 0u; b < nb; b++) {
@@ -302,51 +784,36 @@ fn main(
             var sx1 = 0.0;
             var sq2 = 0.0;
             var sx2 = 0.0;
-
-            for (var i = 0u; i < 4u; i++) {
-                let sh = i * 8u;
-                let qb = (qw >> sh) & 0xFFu;
-                let hb = (qhw >> sh) & 0xFFu;
-                let q1 = (qb & 0xFu) + select(0u, 16u, (hb & u1) != 0u);
-                let q2 = (qb >> 4u) + select(0u, 16u, (hb & u2) != 0u);
-                let xl = X[xb + i];
-                let xh = X[xb + 32u + i];
-                sq1 += f32(q1) * xl;
+            for (var j = 0u; j < 4u; j++) {
+                let qb = (qw >> (j * 8u)) & 0xFFu;
+                let hb = (qhw >> (j * 8u)) & 0xFFu;
+                let hi1 = select(0u, 16u, (hb & u1) != 0u);
+                let hi2 = select(0u, 16u, (hb & u2) != 0u);
+                let xl = X[xb + j];
+                let xh = X[xb + 32u + j];
+                sq1 += f32((qb & 0xFu) + hi1) * xl;
                 sx1 += xl;
-                sq2 += f32(q2) * xh;
+                sq2 += f32((qb >> 4u) + hi2) * xh;
                 sx2 += xh;
             }
-
             acc += (dm.x * f32(sm1.x)) * sq1 - (dm.y * f32(sm1.y)) * sx1
                  + (dm.x * f32(sm2.x)) * sq2 - (dm.y * f32(sm2.y)) * sx2;
         }
     }
-
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = acc;
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_F32*/
     if (tid == 0u && row < P.rows && tok < P.batch) {
-        OUT[tok * P.rows + row] = smem[sidx] + smem[sidx + 1u];
+        OUT[tok * P.rows + row] = row_sum;
     }
 }
 "#;
 
-/// Quantized `Q6_K × F32` GEMV/GEMM (`210` bytes per 256-elem super-block, raw byte layout).
-pub const SHADER_MATMUL_Q6_K: &str = r#"
-struct Params {
-    rows: u32,
-    cols: u32,
-    batch: u32,
-    _pad: u32,
-}
+/// **4-Byte-Aligned `Q6_K × F32` GEMV** (`53 u32` = `212` bytes per 256-elem block).
+/// Layout per block: `[0..32]` = `ql[128]`, `[32..48]` = `qh[64]`, `[48..52]` = `scales[16]`,
+/// `[52]` = `bitcast<u32>(d_f32)`.
+/// Each of 32 threads handles 8 weights with 100% aligned `u32` loads, zero `half` loop,
+/// hardware `extractBits` signed scale decode, and `subgroupAdd` reduction!
+pub const SHADER_MATMUL_Q6_K: &str = r#"/*SG_ENABLE*/
+struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
@@ -355,192 +822,178 @@ struct Params {
 
 var<workgroup> smem: array<f32, 128>;
 
-fn load_u8(byte_off: u32) -> u32 {
-    return (W[byte_off >> 2u] >> ((byte_off & 3u) * 8u)) & 0xFFu;
-}
-
-fn load_i8(byte_off: u32) -> f32 {
-    let v = load_u8(byte_off);
-    return f32(select(i32(v), i32(v) - 256, v >= 128u));
-}
-
-fn load_f16_even(byte_off: u32) -> f32 {
-    let w = W[byte_off >> 2u];
-    let u = select(w & 0xFFFFu, w >> 16u, (byte_off & 2u) != 0u);
-    return unpack2x16float(u).x;
-}
-
-@compute @workgroup_size(32, 4, 1)
+@compute @workgroup_size(128, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
 ) {
-    let tid = lid.x;
-    let r_local = lid.y;
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 8u;
-    let is_idx = tid >> 4u;
+
+    let half = tid >> 4u;          // 0 or 1
+    let t16 = tid & 15u;           // 0..15
+    let l_base = t16 * 2u;         // 0, 2, ..., 30
+    let w_idx = t16 >> 1u;         // 0..7
+    let b_sh = (t16 & 1u) * 16u;   // 0 or 16
+    let is_sh = (t16 >> 3u) * 8u;  // 0 (l=0..15) or 8 (l=16..31)
 
     var acc = 0.0;
     if (row < P.rows && tok < P.batch) {
-        let x_tok = tok * P.cols;
-        let row_byte = row * nb * 210u;
+        let row_base = row * nb * 53u;
+        let x_tok = tok * P.cols + half * 128u + l_base;
+        let ql0_off = half * 16u + w_idx;
+        let ql1_off = ql0_off + 8u;
+        let qh_off = 32u + half * 8u + w_idx;
+        let sc0_off = 48u + half * 2u;
 
         for (var b = 0u; b < nb; b++) {
-            let off = row_byte + b * 210u;
-            let d = load_f16_even(off + 208u);
-            var bsum = 0.0;
+            let blk = row_base + b * 53u;
+            let d = bitcast<f32>(W[blk + 52u]);
+            let sc_w0 = i32(W[blk + sc0_off]);
+            let sc_w1 = i32(W[blk + sc0_off + 1u]);
+            let s0 = f32(extractBits(sc_w0, is_sh, 8u));
+            let s2 = f32(extractBits(sc_w0, is_sh + 16u, 8u));
+            let s4 = f32(extractBits(sc_w1, is_sh, 8u));
+            let s6 = f32(extractBits(sc_w1, is_sh + 16u, 8u));
 
-            for (var half = 0u; half < 2u; half++) {
-                let ql_h = off + half * 64u;
-                let qh_h = off + 128u + half * 32u;
-                let sc_h = off + 192u + half * 8u;
-                let x_h = x_tok + b * 256u + half * 128u + tid;
+            let ql0_p = (W[blk + ql0_off] >> b_sh) & 0xFFFFu;
+            let ql1_p = (W[blk + ql1_off] >> b_sh) & 0xFFFFu;
+            let qh_p = (W[blk + qh_off] >> b_sh) & 0xFFFFu;
 
-                let ql0 = load_u8(ql_h + tid);
-                let ql1 = load_u8(ql_h + 32u + tid);
-                let qh = load_u8(qh_h + tid);
+            let ql0a = ql0_p & 0xFFu; let ql0b = ql0_p >> 8u;
+            let ql1a = ql1_p & 0xFFu; let ql1b = ql1_p >> 8u;
+            let qha = qh_p & 0xFFu;   let qhb = qh_p >> 8u;
 
-                let q1 = f32(i32((ql0 & 0xFu) | ((qh & 3u) << 4u)) - 32);
-                let q2 = f32(i32((ql1 & 0xFu) | (((qh >> 2u) & 3u) << 4u)) - 32);
-                let q3 = f32(i32((ql0 >> 4u) | (((qh >> 4u) & 3u) << 4u)) - 32);
-                let q4 = f32(i32((ql1 >> 4u) | (((qh >> 6u) & 3u) << 4u)) - 32);
+            let xb = x_tok + b * 256u;
 
-                bsum += load_i8(sc_h + is_idx) * q1 * X[x_h]
-                      + load_i8(sc_h + is_idx + 2u) * q2 * X[x_h + 32u]
-                      + load_i8(sc_h + is_idx + 4u) * q3 * X[x_h + 64u]
-                      + load_i8(sc_h + is_idx + 6u) * q4 * X[x_h + 96u];
-            }
+            let q1a = f32(i32((ql0a & 0xFu) | ((qha & 3u) << 4u)) - 32);
+            let q2a = f32(i32((ql1a & 0xFu) | (((qha >> 2u) & 3u) << 4u)) - 32);
+            let q3a = f32(i32((ql0a >> 4u) | (((qha >> 4u) & 3u) << 4u)) - 32);
+            let q4a = f32(i32((ql1a >> 4u) | (((qha >> 6u) & 3u) << 4u)) - 32);
+
+            let q1b = f32(i32((ql0b & 0xFu) | ((qhb & 3u) << 4u)) - 32);
+            let q2b = f32(i32((ql1b & 0xFu) | (((qhb >> 2u) & 3u) << 4u)) - 32);
+            let q3b = f32(i32((ql0b >> 4u) | (((qhb >> 4u) & 3u) << 4u)) - 32);
+            let q4b = f32(i32((ql1b >> 4u) | (((qhb >> 6u) & 3u) << 4u)) - 32);
+
+            let bsum = s0 * (q1a * X[xb] + q1b * X[xb + 1u])
+                     + s2 * (q2a * X[xb + 32u] + q2b * X[xb + 33u])
+                     + s4 * (q3a * X[xb + 64u] + q3b * X[xb + 65u])
+                     + s6 * (q4a * X[xb + 96u] + q4b * X[xb + 97u]);
             acc += d * bsum;
         }
     }
-
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = acc;
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_F32*/
     if (tid == 0u && row < P.rows && tok < P.batch) {
-        OUT[tok * P.rows + row] = smem[sidx] + smem[sidx + 1u];
+        OUT[tok * P.rows + row] = row_sum;
     }
 }
 "#;
 
-/// 4-token weight-reuse `Q6_K × F32` Prefill GEMM (`workgroups = (ceil(rows/4), ceil(batch/4), 1)`).
-pub const SHADER_MATMUL_Q6_K_B4: &str = r#"
-struct Params {
-    rows: u32,
-    cols: u32,
-    batch: u32,
-    _pad: u32,
-}
+/// 4-token weight-reuse **4-Byte-Aligned `Q6_K × F32` Prefill GEMM** (`53 u32`/block).
+pub const SHADER_MATMUL_Q6_K_B4: &str = r#"/*SG_ENABLE*/
+struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
 @group(0) @binding(2) var<storage, read_write> OUT: array<f32>;
 @group(0) @binding(3) var<uniform> P: Params;
 
-var<workgroup> smem: array<vec4<f32>, 128>;
+var<workgroup> smem4: array<vec4<f32>, 128>;
 
-fn load_u8(byte_off: u32) -> u32 {
-    return (W[byte_off >> 2u] >> ((byte_off & 3u) * 8u)) & 0xFFu;
-}
-
-fn load_i8(byte_off: u32) -> f32 {
-    let v = load_u8(byte_off);
-    return f32(select(i32(v), i32(v) - 256, v >= 128u));
-}
-
-fn load_f16_even(byte_off: u32) -> f32 {
-    let w = W[byte_off >> 2u];
-    let u = select(w & 0xFFFFu, w >> 16u, (byte_off & 2u) != 0u);
-    return unpack2x16float(u).x;
-}
-
-@compute @workgroup_size(32, 4, 1)
+@compute @workgroup_size(128, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
 ) {
-    let tid = lid.x;
-    let r_local = lid.y;
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let t_base = wid.y * 4u;
     let nb = P.cols >> 8u;
-    let is_idx = tid >> 4u;
 
-    var acc = vec4<f32>(0.0);
+    let half = tid >> 4u;
+    let t16 = tid & 15u;
+    let l_base = t16 * 2u;
+    let w_idx = t16 >> 1u;
+    let b_sh = (t16 & 1u) * 16u;
+    let is_sh = (t16 >> 3u) * 8u;
+
+    var a0 = 0.0;
+    var a1 = 0.0;
+    var a2 = 0.0;
+    var a3 = 0.0;
     if (row < P.rows && t_base < P.batch) {
-        let row_byte = row * nb * 210u;
-        let t0 = t_base;
-        let t1 = min(t_base + 1u, P.batch - 1u);
-        let t2 = min(t_base + 2u, P.batch - 1u);
-        let t3 = min(t_base + 3u, P.batch - 1u);
+        let row_base = row * nb * 53u;
+        let x_half = half * 128u + l_base;
+        let t0 = t_base * P.cols + x_half;
+        let t1 = min(t_base + 1u, P.batch - 1u) * P.cols + x_half;
+        let t2 = min(t_base + 2u, P.batch - 1u) * P.cols + x_half;
+        let t3 = min(t_base + 3u, P.batch - 1u) * P.cols + x_half;
+
+        let ql0_off = half * 16u + w_idx;
+        let ql1_off = ql0_off + 8u;
+        let qh_off = 32u + half * 8u + w_idx;
+        let sc0_off = 48u + half * 2u;
 
         for (var b = 0u; b < nb; b++) {
-            let off = row_byte + b * 210u;
-            let d = load_f16_even(off + 208u);
-            var bsum = vec4<f32>(0.0);
+            let blk = row_base + b * 53u;
+            let d = bitcast<f32>(W[blk + 52u]);
+            let sc_w0 = i32(W[blk + sc0_off]);
+            let sc_w1 = i32(W[blk + sc0_off + 1u]);
+            let s0 = d * f32(extractBits(sc_w0, is_sh, 8u));
+            let s2 = d * f32(extractBits(sc_w0, is_sh + 16u, 8u));
+            let s4 = d * f32(extractBits(sc_w1, is_sh, 8u));
+            let s6 = d * f32(extractBits(sc_w1, is_sh + 16u, 8u));
 
-            for (var half = 0u; half < 2u; half++) {
-                let ql_h = off + half * 64u;
-                let qh_h = off + 128u + half * 32u;
-                let sc_h = off + 192u + half * 8u;
+            let ql0_p = (W[blk + ql0_off] >> b_sh) & 0xFFFFu;
+            let ql1_p = (W[blk + ql1_off] >> b_sh) & 0xFFFFu;
+            let qh_p = (W[blk + qh_off] >> b_sh) & 0xFFFFu;
 
-                let ql0 = load_u8(ql_h + tid);
-                let ql1 = load_u8(ql_h + 32u + tid);
-                let qh = load_u8(qh_h + tid);
+            let ql0a = ql0_p & 0xFFu; let ql0b = ql0_p >> 8u;
+            let ql1a = ql1_p & 0xFFu; let ql1b = ql1_p >> 8u;
+            let qha = qh_p & 0xFFu;   let qhb = qh_p >> 8u;
 
-                let w1 = load_i8(sc_h + is_idx) * f32(i32((ql0 & 0xFu) | ((qh & 3u) << 4u)) - 32);
-                let w2 = load_i8(sc_h + is_idx + 2u) * f32(i32((ql1 & 0xFu) | (((qh >> 2u) & 3u) << 4u)) - 32);
-                let w3 = load_i8(sc_h + is_idx + 4u) * f32(i32((ql0 >> 4u) | (((qh >> 4u) & 3u) << 4u)) - 32);
-                let w4 = load_i8(sc_h + is_idx + 6u) * f32(i32((ql1 >> 4u) | (((qh >> 6u) & 3u) << 4u)) - 32);
-                let wv = vec4<f32>(w1, w2, w3, w4);
+            let w1a = s0 * f32(i32((ql0a & 0xFu) | ((qha & 3u) << 4u)) - 32);
+            let w2a = s2 * f32(i32((ql1a & 0xFu) | (((qha >> 2u) & 3u) << 4u)) - 32);
+            let w3a = s4 * f32(i32((ql0a >> 4u) | (((qha >> 4u) & 3u) << 4u)) - 32);
+            let w4a = s6 * f32(i32((ql1a >> 4u) | (((qha >> 6u) & 3u) << 4u)) - 32);
 
-                let xoff = b * 256u + half * 128u + tid;
-                let x0 = t0 * P.cols + xoff;
-                bsum.x += dot(wv, vec4<f32>(X[x0], X[x0+32u], X[x0+64u], X[x0+96u]));
-                let x1 = t1 * P.cols + xoff;
-                bsum.y += dot(wv, vec4<f32>(X[x1], X[x1+32u], X[x1+64u], X[x1+96u]));
-                let x2 = t2 * P.cols + xoff;
-                bsum.z += dot(wv, vec4<f32>(X[x2], X[x2+32u], X[x2+64u], X[x2+96u]));
-                let x3 = t3 * P.cols + xoff;
-                bsum.w += dot(wv, vec4<f32>(X[x3], X[x3+32u], X[x3+64u], X[x3+96u]));
-            }
-            acc += d * bsum;
+            let w1b = s0 * f32(i32((ql0b & 0xFu) | ((qhb & 3u) << 4u)) - 32);
+            let w2b = s2 * f32(i32((ql1b & 0xFu) | (((qhb >> 2u) & 3u) << 4u)) - 32);
+            let w3b = s4 * f32(i32((ql0b >> 4u) | (((qhb >> 4u) & 3u) << 4u)) - 32);
+            let w4b = s6 * f32(i32((ql1b >> 4u) | (((qhb >> 6u) & 3u) << 4u)) - 32);
+
+            let boff = b * 256u;
+            let x0 = t0 + boff;
+            a0 += w1a * X[x0] + w1b * X[x0+1u] + w2a * X[x0+32u] + w2b * X[x0+33u]
+                + w3a * X[x0+64u] + w3b * X[x0+65u] + w4a * X[x0+96u] + w4b * X[x0+97u];
+            let x1 = t1 + boff;
+            a1 += w1a * X[x1] + w1b * X[x1+1u] + w2a * X[x1+32u] + w2b * X[x1+33u]
+                + w3a * X[x1+64u] + w3b * X[x1+65u] + w4a * X[x1+96u] + w4b * X[x1+97u];
+            let x2 = t2 + boff;
+            a2 += w1a * X[x2] + w1b * X[x2+1u] + w2a * X[x2+32u] + w2b * X[x2+33u]
+                + w3a * X[x2+64u] + w3b * X[x2+65u] + w4a * X[x2+96u] + w4b * X[x2+97u];
+            let x3 = t3 + boff;
+            a3 += w1a * X[x3] + w1b * X[x3+1u] + w2a * X[x3+32u] + w2b * X[x3+33u]
+                + w3a * X[x3+64u] + w3b * X[x3+65u] + w4a * X[x3+96u] + w4b * X[x3+97u];
         }
     }
-
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = acc;
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_VEC4*/
     if (tid == 0u && row < P.rows) {
-        let res = smem[sidx] + smem[sidx + 1u];
-        if (t_base < P.batch) { OUT[t_base * P.rows + row] = res.x; }
-        if (t_base + 1u < P.batch) { OUT[(t_base + 1u) * P.rows + row] = res.y; }
-        if (t_base + 2u < P.batch) { OUT[(t_base + 2u) * P.rows + row] = res.z; }
-        if (t_base + 3u < P.batch) { OUT[(t_base + 3u) * P.rows + row] = res.w; }
+        if (t_base < P.batch) { OUT[t_base * P.rows + row] = row_sum4.x; }
+        if (t_base + 1u < P.batch) { OUT[(t_base + 1u) * P.rows + row] = row_sum4.y; }
+        if (t_base + 2u < P.batch) { OUT[(t_base + 2u) * P.rows + row] = row_sum4.z; }
+        if (t_base + 3u < P.batch) { OUT[(t_base + 3u) * P.rows + row] = row_sum4.w; }
     }
 }
 "#;
 
 /// Quantized `Q4_0 × F32` GEMV/GEMM (`18` bytes per 32-elem block).
-pub const SHADER_MATMUL_Q4_0: &str = r#"
+pub const SHADER_MATMUL_Q4_0: &str = r#"/*SG_ENABLE*/
 struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
@@ -554,10 +1007,13 @@ fn load_f16_even(off: u32) -> f32 {
     return unpack2x16float(select(w & 0xFFFFu, w >> 16u, (off & 2u) != 0u)).x;
 }
 
-@compute @workgroup_size(32, 4, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
-    let tid = lid.x;
-    let r_local = lid.y;
+@compute @workgroup_size(128, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 5u;
@@ -579,25 +1035,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
             acc += d * s;
         }
     }
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = acc;
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_F32*/
     if (tid == 0u && row < P.rows && tok < P.batch) {
-        OUT[tok * P.rows + row] = smem[sidx] + smem[sidx + 1u];
+        OUT[tok * P.rows + row] = row_sum;
     }
 }
 "#;
 
 /// Quantized `Q8_0 × F32` GEMV/GEMM (`34` bytes per 32-elem block).
-pub const SHADER_MATMUL_Q8_0: &str = r#"
+pub const SHADER_MATMUL_Q8_0: &str = r#"/*SG_ENABLE*/
 struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
@@ -614,10 +1060,13 @@ fn load_f16_even(off: u32) -> f32 {
     return unpack2x16float(select(w & 0xFFFFu, w >> 16u, (off & 2u) != 0u)).x;
 }
 
-@compute @workgroup_size(32, 4, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
-    let tid = lid.x;
-    let r_local = lid.y;
+@compute @workgroup_size(128, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 5u;
@@ -637,25 +1086,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
             acc += d * s;
         }
     }
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = acc;
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_F32*/
     if (tid == 0u && row < P.rows && tok < P.batch) {
-        OUT[tok * P.rows + row] = smem[sidx] + smem[sidx + 1u];
+        OUT[tok * P.rows + row] = row_sum;
     }
 }
 "#;
 
 /// Unquantized `F32 × F32` GEMV/GEMM.
-pub const SHADER_MATMUL_F32: &str = r#"
+pub const SHADER_MATMUL_F32: &str = r#"/*SG_ENABLE*/
 struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(0) var<storage, read> W: array<f32>;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
@@ -663,10 +1102,13 @@ struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(3) var<uniform> P: Params;
 var<workgroup> smem: array<f32, 128>;
 
-@compute @workgroup_size(32, 4, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
-    let tid = lid.x;
-    let r_local = lid.y;
+@compute @workgroup_size(128, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let tok = wid.y;
     var acc = 0.0;
@@ -677,25 +1119,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
             acc += W[w_off + c] * X[x_off + c];
         }
     }
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = acc;
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_F32*/
     if (tid == 0u && row < P.rows && tok < P.batch) {
-        OUT[tok * P.rows + row] = smem[sidx] + smem[sidx + 1u];
+        OUT[tok * P.rows + row] = row_sum;
     }
 }
 "#;
 
 /// Unquantized `F16 × F32` GEMV/GEMM.
-pub const SHADER_MATMUL_F16: &str = r#"
+pub const SHADER_MATMUL_F16: &str = r#"/*SG_ENABLE*/
 struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(0) var<storage, read> W: array<u32>;
 @group(0) @binding(1) var<storage, read> X: array<f32>;
@@ -703,10 +1135,13 @@ struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(3) var<uniform> P: Params;
 var<workgroup> smem: array<f32, 128>;
 
-@compute @workgroup_size(32, 4, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
-    let tid = lid.x;
-    let r_local = lid.y;
+@compute @workgroup_size(128, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x & 31u;
+    let r_local = lid.x >> 5u;
     let row = wid.x * 4u + r_local;
     let tok = wid.y;
     var acc = 0.0;
@@ -719,31 +1154,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
             acc += v.x * X[x_off + c * 2u] + v.y * X[x_off + c * 2u + 1u];
         }
     }
-    let sidx = r_local * 32u + tid;
-    smem[sidx] = acc;
-    workgroupBarrier();
-    if (tid < 16u) { smem[sidx] += smem[sidx + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[sidx] += smem[sidx + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[sidx] += smem[sidx + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[sidx] += smem[sidx + 2u]; }
-    workgroupBarrier();
+    /*REDUCE_ROW_F32*/
     if (tid == 0u && row < P.rows && tok < P.batch) {
-        OUT[tok * P.rows + row] = smem[sidx] + smem[sidx + 1u];
+        OUT[tok * P.rows + row] = row_sum;
     }
 }
 "#;
 
-/// Parallel tree-reduction RMSNorm (`out = rms_norm(x, weight, eps)`), 1 workgroup per token.
-pub const SHADER_RMS_NORM: &str = r#"
-struct Params {
-    dim: u32,
-    count: u32,
-    eps: f32,
-    _pad: u32,
-}
+/// Parallel RMSNorm (`out = rms_norm(x, weight, eps)`), 1 workgroup per token.
+pub const SHADER_RMS_NORM: &str = r#"/*SG_ENABLE*/
+struct Params { dim: u32, count: u32, eps: f32, _pad: u32 }
 
 @group(0) @binding(0) var<storage, read> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
@@ -755,7 +1175,7 @@ var<workgroup> smem: array<f32, 64>;
 @compute @workgroup_size(64, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
 ) {
     let tid = lid.x;
     let row = wid.x;
@@ -767,33 +1187,54 @@ fn main(
         let v = X[base + i];
         ss += v * v;
     }
-    smem[tid] = ss;
-    workgroupBarrier();
-    if (tid < 32u) { smem[tid] += smem[tid + 32u]; }
-    workgroupBarrier();
-    if (tid < 16u) { smem[tid] += smem[tid + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[tid] += smem[tid + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[tid] += smem[tid + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[tid] += smem[tid + 2u]; }
-    workgroupBarrier();
-    let inv = inverseSqrt((smem[0] + smem[1]) / f32(P.dim) + P.eps);
+    /*REDUCE_WG64_SUM*/
+    let inv = inverseSqrt(wg_sum / f32(P.dim) + P.eps);
     for (var i = tid; i < P.dim; i += 64u) {
         OUT[base + i] = X[base + i] * inv * W[i];
     }
 }
 "#;
 
-/// In-place per-head RMSNorm (used for `Qwen3` / `Qwen3MoE` QK-Norm without buffer aliasing).
-pub const SHADER_RMS_NORM_INPLACE: &str = r#"
-struct Params {
-    dim: u32,
-    count: u32,
-    eps: f32,
-    _pad: u32,
+/// Fused **Residual Add + Next RMSNorm** (`X += DX; OUT = rms_norm(X, W, eps)`).
+/// Eliminates 2 dispatches & 2 barriers per Transformer layer and halves `X` VRAM traffic!
+pub const SHADER_RESIDUAL_RMS_NORM: &str = r#"/*SG_ENABLE*/
+struct Params { dim: u32, count: u32, eps: f32, _pad: u32 }
+
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> DX: array<f32>;
+@group(0) @binding(2) var<storage, read> W: array<f32>;
+@group(0) @binding(3) var<storage, read_write> OUT: array<f32>;
+@group(0) @binding(4) var<uniform> P: Params;
+
+var<workgroup> smem: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x;
+    let row = wid.x;
+    if (row >= P.count) { return; }
+    let base = row * P.dim;
+
+    var ss = 0.0;
+    for (var i = tid; i < P.dim; i += 64u) {
+        let v = X[base + i] + DX[base + i];
+        X[base + i] = v;
+        ss += v * v;
+    }
+    /*REDUCE_WG64_SUM*/
+    let inv = inverseSqrt(wg_sum / f32(P.dim) + P.eps);
+    for (var i = tid; i < P.dim; i += 64u) {
+        OUT[base + i] = X[base + i] * inv * W[i];
+    }
 }
+"#;
+
+/// In-place per-head RMSNorm (`Qwen3` QK-Norm without buffer aliasing).
+pub const SHADER_RMS_NORM_INPLACE: &str = r#"/*SG_ENABLE*/
+struct Params { dim: u32, count: u32, eps: f32, _pad: u32 }
 
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
@@ -804,7 +1245,7 @@ var<workgroup> smem: array<f32, 64>;
 @compute @workgroup_size(64, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
 ) {
     let tid = lid.x;
     let row = wid.x;
@@ -816,26 +1257,15 @@ fn main(
         let v = X[base + i];
         ss += v * v;
     }
-    smem[tid] = ss;
-    workgroupBarrier();
-    if (tid < 32u) { smem[tid] += smem[tid + 32u]; }
-    workgroupBarrier();
-    if (tid < 16u) { smem[tid] += smem[tid + 16u]; }
-    workgroupBarrier();
-    if (tid < 8u) { smem[tid] += smem[tid + 8u]; }
-    workgroupBarrier();
-    if (tid < 4u) { smem[tid] += smem[tid + 4u]; }
-    workgroupBarrier();
-    if (tid < 2u) { smem[tid] += smem[tid + 2u]; }
-    workgroupBarrier();
-    let inv = inverseSqrt((smem[0] + smem[1]) / f32(P.dim) + P.eps);
+    /*REDUCE_WG64_SUM*/
+    let inv = inverseSqrt(wg_sum / f32(P.dim) + P.eps);
     for (var i = tid; i < P.dim; i += 64u) {
         X[base + i] = X[base + i] * inv * W[i];
     }
 }
 "#;
 
-/// In-place bias addition `X[t * dim + i] += B[i]`.
+/// In-place bias addition `X[t * dim + i] += B[i]` (fallback when QKV is not fused Q4_K).
 pub const SHADER_ADD_BIAS: &str = r#"
 struct Params { dim: u32, batch: u32, _p0: u32, _p1: u32 }
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
@@ -852,9 +1282,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Fused Normal/NeoX RoPE (using precomputed LUT matching CPU YaRN/Linear/Standard RoPE)
-/// + KV Cache store directly in VRAM.
-pub const SHADER_ROPE_KV_STORE: &str = r#"
+/// Fused Normal/NeoX RoPE (using precomputed LUT) + **Packed F16 VRAM KV Cache Store**
+/// (`K_CACHE` / `V_CACHE` stored as `array<u32>` with `pack2x16float` — 2× less VRAM & bandwidth!).
+pub const SHADER_ROPE_KV_STORE_F16: &str = r#"
 struct Params {
     num_heads: u32,
     num_kv_heads: u32,
@@ -862,7 +1292,7 @@ struct Params {
     half_rope: u32,
     start_pos: u32,
     batch: u32,
-    layer_kv_offset: u32,
+    layer_kv_u32_offset: u32,
     is_neox: u32,
 }
 
@@ -870,8 +1300,8 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> K: array<f32>;
 @group(0) @binding(2) var<storage, read> V: array<f32>;
 @group(0) @binding(3) var<storage, read> COS_SIN: array<f32>;
-@group(0) @binding(4) var<storage, read_write> K_CACHE: array<f32>;
-@group(0) @binding(5) var<storage, read_write> V_CACHE: array<f32>;
+@group(0) @binding(4) var<storage, read_write> K_CACHE: array<u32>;
+@group(0) @binding(5) var<storage, read_write> V_CACHE: array<u32>;
 @group(0) @binding(6) var<uniform> P: Params;
 
 @compute @workgroup_size(64, 1, 1)
@@ -883,10 +1313,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pos = P.start_pos + tok;
     let q_dim = P.num_heads * P.head_dim;
     let kv_dim = P.num_kv_heads * P.head_dim;
+    let hd_u32 = P.head_dim >> 1u;
+    let kv_dim_u32 = kv_dim >> 1u;
     let lut_stride = P.half_rope * 2u;
     let lut_base = pos * lut_stride;
 
-    // 1. Apply RoPE to Q heads
+    // 1. Apply RoPE to Q heads (F32)
     let q_pairs = P.num_heads * P.half_rope;
     if (tid < q_pairs) {
         let h = tid / P.half_rope;
@@ -907,72 +1339,89 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // 2. Apply RoPE to K heads and write K & V into VRAM KV cache slot `pos`
-    let k_pairs = P.num_kv_heads * P.half_rope;
-    if (tid < k_pairs) {
-        let kh = tid / P.half_rope;
-        let i = tid % P.half_rope;
-        let c = COS_SIN[lut_base + i];
-        let s = COS_SIN[lut_base + P.half_rope + i];
-        let kh_off = tok * kv_dim + kh * P.head_dim;
-        let cache_off = P.layer_kv_offset + pos * kv_dim + kh * P.head_dim;
-        if (P.is_neox != 0u) {
-            let x0 = K[kh_off + i];
-            let x1 = K[kh_off + i + P.half_rope];
-            let r0 = x0 * c - x1 * s;
-            let r1 = x0 * s + x1 * c;
-            K[kh_off + i] = r0;
-            K[kh_off + i + P.half_rope] = r1;
-            K_CACHE[cache_off + i] = r0;
-            K_CACHE[cache_off + i + P.half_rope] = r1;
-            V_CACHE[cache_off + i] = V[kh_off + i];
-            V_CACHE[cache_off + i + P.half_rope] = V[kh_off + i + P.half_rope];
-        } else {
+    // 2. Apply RoPE to K heads & store packed F16 K, V into VRAM KV cache (100% race-free!)
+    if (P.is_neox != 0u) {
+        let half_rope_u32 = P.half_rope >> 1u;
+        let k_u32_jobs = P.num_kv_heads * half_rope_u32;
+        if (tid < k_u32_jobs) {
+            let kh = tid / half_rope_u32;
+            let p = tid % half_rope_u32;
+            let i0 = p * 2u;
+            let i1 = i0 + 1u;
+            let c0 = COS_SIN[lut_base + i0];
+            let s0 = COS_SIN[lut_base + P.half_rope + i0];
+            let c1 = COS_SIN[lut_base + i1];
+            let s1 = COS_SIN[lut_base + P.half_rope + i1];
+
+            let kh_off = tok * kv_dim + kh * P.head_dim;
+            let x0a = K[kh_off + i0];
+            let x1a = K[kh_off + i0 + P.half_rope];
+            let r0a = x0a * c0 - x1a * s0;
+            let r1a = x0a * s0 + x1a * c0;
+
+            let x0b = K[kh_off + i1];
+            let x1b = K[kh_off + i1 + P.half_rope];
+            let r0b = x0b * c1 - x1b * s1;
+            let r1b = x0b * s1 + x1b * c1;
+
+            let cache_u32 = P.layer_kv_u32_offset + pos * kv_dim_u32 + kh * hd_u32;
+            K_CACHE[cache_u32 + p] = pack2x16float(vec2<f32>(r0a, r0b));
+            K_CACHE[cache_u32 + p + half_rope_u32] = pack2x16float(vec2<f32>(r1a, r1b));
+            V_CACHE[cache_u32 + p] = pack2x16float(vec2<f32>(V[kh_off + i0], V[kh_off + i1]));
+            V_CACHE[cache_u32 + p + half_rope_u32] = pack2x16float(vec2<f32>(
+                V[kh_off + i0 + P.half_rope],
+                V[kh_off + i1 + P.half_rope],
+            ));
+        }
+    } else {
+        let k_pairs = P.num_kv_heads * P.half_rope;
+        if (tid < k_pairs) {
+            let kh = tid / P.half_rope;
+            let i = tid % P.half_rope;
+            let c = COS_SIN[lut_base + i];
+            let s = COS_SIN[lut_base + P.half_rope + i];
+            let kh_off = tok * kv_dim + kh * P.head_dim;
             let x0 = K[kh_off + 2u * i];
             let x1 = K[kh_off + 2u * i + 1u];
             let r0 = x0 * c - x1 * s;
             let r1 = x0 * s + x1 * c;
-            K[kh_off + 2u * i] = r0;
-            K[kh_off + 2u * i + 1u] = r1;
-            K_CACHE[cache_off + 2u * i] = r0;
-            K_CACHE[cache_off + 2u * i + 1u] = r1;
-            V_CACHE[cache_off + 2u * i] = V[kh_off + 2u * i];
-            V_CACHE[cache_off + 2u * i + 1u] = V[kh_off + 2u * i + 1u];
+            let cache_u32 = P.layer_kv_u32_offset + pos * kv_dim_u32 + kh * hd_u32;
+            K_CACHE[cache_u32 + i] = pack2x16float(vec2<f32>(r0, r1));
+            V_CACHE[cache_u32 + i] = pack2x16float(vec2<f32>(V[kh_off + 2u * i], V[kh_off + 2u * i + 1u]));
         }
     }
 
-    // Copy any non-RoPE trailing head dims into K/V cache (partial RoPE safety)
+    // 3. Copy any non-RoPE trailing head dims into packed F16 K/V cache
     let rope_dim = P.half_rope * 2u;
-    if (rope_dim < P.head_dim && tid < kv_dim) {
-        let kh = tid / P.head_dim;
-        let d = tid % P.head_dim;
-        if (d >= rope_dim) {
-            let src = tok * kv_dim + kh * P.head_dim + d;
-            let dst = P.layer_kv_offset + pos * kv_dim + kh * P.head_dim + d;
-            K_CACHE[dst] = K[src];
-            V_CACHE[dst] = V[src];
+    if (rope_dim < P.head_dim && tid < kv_dim_u32) {
+        let kh = tid / hd_u32;
+        let d2 = tid % hd_u32;
+        if (d2 >= P.half_rope) {
+            let src = tok * kv_dim + kh * P.head_dim + d2 * 2u;
+            let dst = P.layer_kv_u32_offset + pos * kv_dim_u32 + kh * hd_u32 + d2;
+            K_CACHE[dst] = pack2x16float(vec2<f32>(K[src], K[src + 1u]));
+            V_CACHE[dst] = pack2x16float(vec2<f32>(V[src], V[src + 1u]));
         }
     }
 }
 "#;
 
-/// Online Tiled Flash-Attention GQA on VRAM (0 bytes global scratch, exact causal softmax).
-/// Dispatch: `workgroups = (num_heads, batch, 1)`.
-pub const SHADER_GQA_FLASH_ATTN: &str = r#"
+/// Online Tiled Flash-Attention GQA over **Packed F16 VRAM KV Cache** with Subgroup Reductions!
+pub const SHADER_GQA_FLASH_ATTN_F16: &str = r#"/*SG_ENABLE*/
 struct Params {
     num_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
     start_pos: u32,
     batch: u32,
-    layer_kv_offset: u32,
+    layer_kv_u32_offset: u32,
     inv_sqrt_hd: f32,
     _pad: u32,
 }
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> K_CACHE: array<f32>;
-@group(0) @binding(2) var<storage, read> V_CACHE: array<f32>;
+@group(0) @binding(1) var<storage, read> K_CACHE: array<u32>;
+@group(0) @binding(2) var<storage, read> V_CACHE: array<u32>;
 @group(0) @binding(3) var<storage, read_write> OUT: array<f32>;
 @group(0) @binding(4) var<uniform> P: Params;
 
@@ -984,7 +1433,7 @@ var<workgroup> red: array<f32, 64>;
 @compute @workgroup_size(64, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
 ) {
     let tid = lid.x;
     let h = wid.x;
@@ -992,8 +1441,9 @@ fn main(
     if (h >= P.num_heads || tok >= P.batch) { return; }
 
     let hd = P.head_dim;
+    let hd_u32 = hd >> 1u;
     let q_dim = P.num_heads * hd;
-    let kv_dim = P.num_kv_heads * hd;
+    let kv_dim_u32 = (P.num_kv_heads * hd) >> 1u;
     let kv_mul = P.num_heads / P.num_kv_heads;
     let kv_h = h / kv_mul;
     let pos = P.start_pos + tok;
@@ -1010,62 +1460,38 @@ fn main(
     var running_sum = 0.0;
 
     for (var tile_start = 0u; tile_start < seq_len; tile_start += 64u) {
+        let tile_end = min(64u, seq_len - tile_start);
         let s = tile_start + tid;
         var sc = -1e30;
         if (s < seq_len) {
-            let k_off = P.layer_kv_offset + s * kv_dim + kv_h * hd;
+            let k_off = P.layer_kv_u32_offset + s * kv_dim_u32 + kv_h * hd_u32;
             var dot_v = 0.0;
-            for (var d = 0u; d < hd; d++) {
-                dot_v += q_sh[d] * K_CACHE[k_off + d];
+            for (var d2 = 0u; d2 < hd_u32; d2++) {
+                let kp = unpack2x16float(K_CACHE[k_off + d2]);
+                dot_v += q_sh[d2 * 2u] * kp.x + q_sh[d2 * 2u + 1u] * kp.y;
             }
             sc = dot_v * P.inv_sqrt_hd;
         }
-        scores[tid] = sc;
-        red[tid] = sc;
-        workgroupBarrier();
+        /*REDUCE_WG64_MAX*/
 
-        // Parallel max over 64 keys
-        if (tid < 32u) { red[tid] = max(red[tid], red[tid + 32u]); }
-        workgroupBarrier();
-        if (tid < 16u) { red[tid] = max(red[tid], red[tid + 16u]); }
-        workgroupBarrier();
-        if (tid < 8u) { red[tid] = max(red[tid], red[tid + 8u]); }
-        workgroupBarrier();
-        if (tid < 4u) { red[tid] = max(red[tid], red[tid + 4u]); }
-        workgroupBarrier();
-        if (tid < 2u) { red[tid] = max(red[tid], red[tid + 2u]); }
-        workgroupBarrier();
-        let tile_max = max(red[0], red[1]);
         let new_max = max(running_max, tile_max);
         let rescale = select(1.0, exp(running_max - new_max), tile_start > 0u);
-        workgroupBarrier();
-
-        let w = select(0.0, exp(scores[tid] - new_max), s < seq_len);
+        let w = select(0.0, exp(sc - new_max), tid < tile_end);
         scores[tid] = w;
-        red[tid] = w;
-        workgroupBarrier();
+        /*REDUCE_WG64_WSUM*/
 
-        // Parallel sum of weights
-        if (tid < 32u) { red[tid] += red[tid + 32u]; }
-        workgroupBarrier();
-        if (tid < 16u) { red[tid] += red[tid + 16u]; }
-        workgroupBarrier();
-        if (tid < 8u) { red[tid] += red[tid + 8u]; }
-        workgroupBarrier();
-        if (tid < 4u) { red[tid] += red[tid + 4u]; }
-        workgroupBarrier();
-        if (tid < 2u) { red[tid] += red[tid + 2u]; }
-        workgroupBarrier();
-        let tile_sum = red[0] + red[1];
-
-        let tile_end = min(64u, seq_len - tile_start);
-        for (var d = tid; d < hd; d += 64u) {
-            var acc = out_sh[d] * rescale;
+        for (var d2 = tid; d2 < hd_u32; d2 += 64u) {
+            var a0 = out_sh[d2 * 2u] * rescale;
+            var a1 = out_sh[d2 * 2u + 1u] * rescale;
             for (var k = 0u; k < tile_end; k++) {
-                let v_off = P.layer_kv_offset + (tile_start + k) * kv_dim + kv_h * hd + d;
-                acc += scores[k] * V_CACHE[v_off];
+                let v_off = P.layer_kv_u32_offset + (tile_start + k) * kv_dim_u32 + kv_h * hd_u32 + d2;
+                let vp = unpack2x16float(V_CACHE[v_off]);
+                let wk = scores[k];
+                a0 += wk * vp.x;
+                a1 += wk * vp.y;
             }
-            out_sh[d] = acc;
+            out_sh[d2 * 2u] = a0;
+            out_sh[d2 * 2u + 1u] = a1;
         }
         running_sum = running_sum * rescale + tile_sum;
         running_max = new_max;
