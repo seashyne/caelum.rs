@@ -31,13 +31,13 @@
 
   <section class="hero">
     <h1>Caelum &amp; mybot-cli Architecture &amp; Tutorial</h1>
-    <p>ระบบเอกสารคู่มือการใช้งาน Caelum High-Performance Rust LLM Engine ร่วมกับ mybot-cli Coding Agent, Caelum Studio Desktop App, การเชื่อมต่อ IDE, Tool Calling และการรีดพลัง Intel Arc B580 GPU</p>
+    <p>ระบบเอกสารคู่มือการใช้งาน Caelum High-Performance Rust LLM Engine ร่วมกับ mybot-cli Coding Agent, My Bot AI Web Platform, การเชื่อมต่อ IDE, Tool Calling และการรีดพลัง Intel Arc B580 GPU</p>
     <div class="hero-tags">
       <span class="hero-tag">⚡ Intel Arc B580 Turbo (128 tok/s)</span>
       <span class="hero-tag">🦀 100% Pure Rust Engine</span>
       <span class="hero-tag">🛠️ OpenAI Tool Calling &amp; SSE</span>
       <span class="hero-tag">💻 mybot-cli TUI Coding Agent</span>
-      <span class="hero-tag">🖥️ Caelum Studio (Tauri 2)</span>
+      <span class="hero-tag">🌐 My Bot AI (Auth + /api/v1 + Coral)</span>
     </div>
   </section>
 
@@ -67,9 +67,9 @@
             <div class="card-desc">เอนจินหลัก ประมวลผล GGUF ด้วยความเร็ว 128 tok/s (1.5B) และ 43 tok/s (8B) บน Arc B580 พร้อม Web UI ในตัว</div>
           </div>
           <div class="card">
-            <div class="card-icon">🖥️</div>
-            <div class="card-title">Caelum Studio (<code>apps/studio/</code>)</div>
-            <div class="card-desc">Desktop App ด้วย Tauri 2 + Rust สแกนโมเดล GGUF, กด Start/Stop Engine, ดู Logs และแชทในหน้าต่างเดียว</div>
+            <div class="card-icon">🌐</div>
+            <div class="card-title">My Bot AI (<a href="https://github.com/seashyne/my-bot-ai" target="_blank" rel="noopener noreferrer" style="color: var(--brand);">seashyne/my-bot-ai</a>)</div>
+            <div class="card-desc">เว็บแอปสไตล์ ChatGPT แยกโปรเจกต์พร้อม Login (Auth.js), Personal API Keys (<code>mba_...</code>), Gateway <code>/api/v1/*</code> และ Deploy ด้วย Coral Runtime</div>
           </div>
           <div class="card">
             <div class="card-icon">💻</div>
@@ -161,6 +161,24 @@ model = "llama-3.1-8b-instruct"</pre>
           <li><strong>Context Compaction:</strong> พิมพ์ <code>/compact</code> เมื่อคุยยาว เพื่อให้โมเดลสรุปบริบทและลดขนาด Session</li>
           <li><strong>MCP Protocol:</strong> รองรับการเชื่อมต่อกับ Model Context Protocol Servers ภายนอกได้ทันที</li>
         </ul>
+
+        <h3>เชื่อมต่อผ่าน My Bot AI Gateway (<code>/api/v1/*</code> + Personal API Key <code>mba_...</code>)</h3>
+        <p>หาก Deploy <a href="https://github.com/seashyne/my-bot-ai" target="_blank" rel="noopener noreferrer" style="color: var(--brand); font-weight: 600;">My Bot AI</a> ไว้บนเซิร์ฟเวอร์ (ผ่าน Coral Runtime <code>coral compose up -d --build</code> หรือ Vercel) คุณสามารถสร้างคีย์ <code>mba_...</code> ที่หน้า <code>/keys</code> แล้วต่อ <code>mybot-cli</code> จากเครื่องอื่นได้อย่างปลอดภัย:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>~/.mybot/config.toml (ผ่าน My Bot AI Gateway)</span>
+            <button type="button" class="copy-btn" data-code="[providers.mybotai]
+kind = &quot;openai&quot;
+base_url = &quot;https://mybot.yourdomain.com/api/v1&quot;
+api_key = &quot;mba_YOUR_PERSONAL_KEY&quot;
+model = &quot;llama-3.1-8b-instruct&quot;">Copy</button>
+          </div>
+          <pre>[providers.mybotai]
+kind = "openai"
+base_url = "https://mybot.yourdomain.com/api/v1"
+api_key = "mba_YOUR_PERSONAL_KEY"
+model = "llama-3.1-8b-instruct"</pre>
+        </div>
       </div>
     </div>
 
