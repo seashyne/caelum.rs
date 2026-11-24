@@ -103,6 +103,7 @@ pub fn run_server(
     );
     println!("  Hardware: {hw_label}");
     println!("  Endpoints:");
+    println!("    GET  / or /docs            (Interactive Web Docs & Live Playground)");
     println!("    GET  /health");
     println!("    GET  /v1/models");
     println!("    POST /v1/chat/completions  (multi-turn, tools/function calling, SSE, json_object, prefix-cache)");
@@ -181,6 +182,9 @@ fn handle_connection(
     }
 
     match (method, path) {
+        ("GET", "/") | ("GET", "/docs") | ("HEAD", "/") | ("HEAD", "/docs") => {
+            write_html_response(stream, "200 OK", crate::docs_html::DOCS_HTML)
+        }
         ("GET", "/health") => {
             let now = unix_ts();
             let resp = format!(
@@ -653,6 +657,17 @@ fn parse_stop_sequences(req: &JsonValue) -> Vec<String> {
 fn write_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn write_html_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;

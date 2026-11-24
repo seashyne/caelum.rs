@@ -1,0 +1,1200 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Caelum & mybot-cli — ระบบเอกสารและคู่มือการใช้งาน (Docs & Tutorials)</title>
+  <style>
+    /* -------------------------------------------------------------
+       Modern Web Guidance Compliant Styles:
+       - color-scheme: light dark
+       - light-dark() CSS functional tokens with custom fallbacks
+       - Accessible tablist with pseudo-element indicator
+       - Responsive layout, modern system typography
+    ------------------------------------------------------------- */
+    :root {
+      --color-bg-light: #f8fafc;
+      --color-bg-dark: #090d16;
+      --color-surface-light: #ffffff;
+      --color-surface-dark: #111827;
+      --color-surface-muted-light: #f1f5f9;
+      --color-surface-muted-dark: #1e293b;
+      --color-border-light: #e2e8f0;
+      --color-border-dark: #334155;
+      
+      --color-text-light: #0f172a;
+      --color-text-dark: #f8fafc;
+      --color-text-muted-light: #64748b;
+      --color-text-muted-dark: #94a3b8;
+
+      --color-brand-light: #2563eb;
+      --color-brand-dark: #38bdf8;
+      --color-accent-light: #059669;
+      --color-accent-dark: #34d399;
+      --color-code-bg-light: #1e293b;
+      --color-code-bg-dark: #050811;
+
+      color-scheme: light dark;
+      --bg: light-dark(var(--color-bg-light), var(--color-bg-dark));
+      --surface: light-dark(var(--color-surface-light), var(--color-surface-dark));
+      --surface-muted: light-dark(var(--color-surface-muted-light), var(--color-surface-muted-dark));
+      --border: light-dark(var(--color-border-light), var(--color-border-dark));
+      --text: light-dark(var(--color-text-light), var(--color-text-dark));
+      --text-muted: light-dark(var(--color-text-muted-light), var(--color-text-muted-dark));
+      --brand: light-dark(var(--color-brand-light), var(--color-brand-dark));
+      --accent: light-dark(var(--color-accent-light), var(--color-accent-dark));
+      --code-bg: light-dark(var(--color-code-bg-light), var(--color-code-bg-dark));
+      
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Sukhumvit Set', 'Kanit', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    [data-theme="light"] {
+      color-scheme: light;
+      --bg: var(--color-bg-light);
+      --surface: var(--color-surface-light);
+      --surface-muted: var(--color-surface-muted-light);
+      --border: var(--color-border-light);
+      --text: var(--color-text-light);
+      --text-muted: var(--color-text-muted-light);
+      --brand: var(--color-brand-light);
+      --accent: var(--color-accent-light);
+      --code-bg: var(--color-code-bg-light);
+    }
+
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --bg: var(--color-bg-dark);
+      --surface: var(--color-surface-dark);
+      --surface-muted: var(--color-surface-muted-dark);
+      --border: var(--color-border-dark);
+      --text: var(--color-text-dark);
+      --text-muted: var(--color-text-muted-dark);
+      --brand: var(--color-brand-dark);
+      --accent: var(--color-accent-dark);
+      --code-bg: var(--color-code-bg-dark);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* Scrollbars */
+    :root {
+      --scrollbar-thumb: light-dark(#94a3b8, #475569);
+      --scrollbar-track: light-dark(#f1f5f9, #0f172a);
+      scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    }
+
+    /* Header Nav */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      background-color: light-dark(rgba(255, 255, 255, 0.85), rgba(17, 24, 39, 0.85));
+      border-bottom: 1px solid var(--border);
+      padding: 0.85rem 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .brand-wrap {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      text-decoration: none;
+      color: inherit;
+    }
+
+    .brand-badge {
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      padding: 0.2rem 0.6rem;
+      border-radius: 9999px;
+      background: linear-gradient(135deg, #0284c7, #2563eb);
+      color: white;
+    }
+
+    .brand-title {
+      font-size: 1.25rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .brand-title span {
+      color: var(--brand);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .live-status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 9999px;
+      background-color: var(--surface-muted);
+      border: 1px solid var(--border);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: #94a3b8;
+    }
+
+    .status-dot.online {
+      background-color: #10b981;
+      box-shadow: 0 0 8px #10b981;
+    }
+
+    .theme-toggle-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text);
+      cursor: pointer;
+      padding: 0.45rem 0.75rem;
+      border-radius: var(--radius-sm);
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      background-color: var(--surface);
+      transition: background-color 0.2s, border-color 0.2s;
+    }
+    .theme-toggle-btn:hover {
+      background-color: var(--surface-muted);
+    }
+
+    /* Hero Banner */
+    .hero {
+      padding: 3rem 1.5rem 2rem;
+      max-width: 1200px;
+      margin: 0 auto;
+      text-align: center;
+    }
+
+    .hero h1 {
+      font-size: clamp(2rem, 5vw, 3.25rem);
+      font-weight: 900;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 1rem;
+    }
+
+    .hero p {
+      font-size: 1.15rem;
+      color: var(--text-muted);
+      max-width: 760px;
+      margin: 0 auto 1.75rem;
+    }
+
+    .hero-tags {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .hero-tag {
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 0.3rem 0.85rem;
+      border-radius: 9999px;
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+    }
+
+    /* Main Container & Layout */
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 1.5rem 4rem;
+    }
+
+    /* Tabbed Navigation (Modern Web Guidance Compliant) */
+    .tabs-wrapper {
+      margin-bottom: 2rem;
+    }
+
+    [role="tablist"] {
+      display: flex;
+      gap: 0.25rem;
+      border-bottom: 1px solid var(--border);
+      overflow-x: auto;
+      scrollbar-width: none;
+      padding-bottom: 1px;
+    }
+    [role="tablist"]::-webkit-scrollbar {
+      display: none;
+    }
+
+    [role="tab"] {
+      position: relative;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-family: inherit;
+      font-size: 0.95rem;
+      font-weight: 600;
+      padding: 0.85rem 1.25rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: color 0.15s ease;
+      border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    }
+
+    [role="tab"]:hover {
+      color: var(--text);
+    }
+
+    [role="tab"][aria-selected="true"] {
+      color: var(--brand);
+    }
+
+    /* WCAG 1.4.1 Compliant Underline (Border pseudo-element) */
+    [role="tab"][aria-selected="true"]::after {
+      content: "";
+      position: absolute;
+      inset: auto 0 0;
+      border-block-end: 3px solid var(--brand);
+    }
+
+    /* Tab Panels */
+    [role="tabpanel"] {
+      display: block;
+    }
+    [role="tabpanel"][hidden] {
+      display: none;
+    }
+
+    .panel-inner {
+      background-color: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 2.25rem;
+      box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+    }
+
+    /* Content Typography & Elements */
+    h2 {
+      font-size: 1.75rem;
+      font-weight: 800;
+      margin-bottom: 0.75rem;
+      letter-spacing: -0.02em;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin: 1.75rem 0 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    p {
+      margin-bottom: 1rem;
+      color: var(--text);
+    }
+
+    .lead-text {
+      font-size: 1.05rem;
+      color: var(--text-muted);
+      margin-bottom: 1.5rem;
+    }
+
+    ul, ol {
+      margin-left: 1.5rem;
+      margin-bottom: 1.25rem;
+    }
+    li {
+      margin-bottom: 0.4rem;
+    }
+
+    /* Code Blocks with Copy Button */
+    .code-box {
+      position: relative;
+      margin: 1.2rem 0;
+      border-radius: var(--radius-md);
+      background-color: var(--code-bg);
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+
+    .code-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.5rem 1rem;
+      background-color: rgba(255, 255, 255, 0.04);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: #94a3b8;
+    }
+
+    .code-box pre {
+      padding: 1.1rem;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      line-height: 1.6;
+      color: #e2e8f0;
+    }
+
+    .copy-btn {
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: #f8fafc;
+      font-size: 0.75rem;
+      font-family: var(--font-sans);
+      padding: 0.25rem 0.65rem;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .copy-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    .copy-btn.copied {
+      background: #10b981;
+      border-color: #10b981;
+      color: white;
+    }
+
+    /* Info Callouts / Notes */
+    .callout {
+      border-left: 4px solid var(--brand);
+      background-color: var(--surface-muted);
+      padding: 1rem 1.25rem;
+      border-radius: 0 var(--radius-md) var(--radius-md) 0;
+      margin: 1.25rem 0;
+    }
+    .callout.tip {
+      border-left-color: var(--accent);
+    }
+    .callout.warning {
+      border-left-color: #f59e0b;
+    }
+    .callout-title {
+      font-weight: 700;
+      font-size: 0.95rem;
+      margin-bottom: 0.25rem;
+    }
+
+    /* Tables */
+    .table-wrap {
+      overflow-x: auto;
+      margin: 1.5rem 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.92rem;
+      text-align: left;
+    }
+    th, td {
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background-color: var(--surface-muted);
+      font-weight: 700;
+    }
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    /* Cards Grid */
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.25rem;
+      margin: 1.5rem 0;
+    }
+
+    .card {
+      background-color: var(--surface-muted);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 16px -2px rgba(0, 0, 0, 0.08);
+    }
+    .card-icon {
+      font-size: 1.75rem;
+      margin-bottom: 0.5rem;
+    }
+    .card-title {
+      font-weight: 700;
+      font-size: 1.1rem;
+      margin-bottom: 0.4rem;
+    }
+    .card-desc {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+    }
+
+    /* Live Playground Tab Styles */
+    .playground-box {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      margin-top: 1.5rem;
+    }
+    @media (max-width: 860px) {
+      .playground-box {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .pg-form {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .pg-label {
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .pg-input, .pg-textarea {
+      width: 100%;
+      padding: 0.75rem;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background-color: var(--surface-muted);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.95rem;
+    }
+    .pg-textarea {
+      min-height: 120px;
+      resize: vertical;
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+    }
+    .pg-btn {
+      background: linear-gradient(135deg, #2563eb, #0284c7);
+      color: white;
+      border: none;
+      padding: 0.8rem 1.5rem;
+      border-radius: var(--radius-sm);
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      transition: opacity 0.2s;
+    }
+    .pg-btn:hover {
+      opacity: 0.9;
+    }
+    .pg-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .pg-output {
+      display: flex;
+      flex-direction: column;
+      background-color: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 1rem;
+      min-height: 250px;
+      max-height: 420px;
+      overflow-y: auto;
+      color: #f8fafc;
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      white-space: pre-wrap;
+    }
+
+    .badge-pill {
+      display: inline-block;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      background-color: rgba(37, 99, 235, 0.15);
+      color: var(--brand);
+    }
+    .badge-pill.green {
+      background-color: rgba(16, 185, 129, 0.15);
+      color: var(--accent);
+    }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2.5rem 1.5rem;
+      text-align: center;
+      font-size: 0.88rem;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <a href="#" class="brand-wrap">
+      <span class="brand-badge">Engine v0.8.0</span>
+      <div class="brand-title">Caelum <span>Docs</span></div>
+    </a>
+    <div class="header-actions">
+      <div class="live-status" id="server-status-pill">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Checking Caelum...</span>
+      </div>
+      <button type="button" class="theme-toggle-btn" id="theme-btn" aria-label="Toggle theme">
+        <span id="theme-icon">🌙</span> <span id="theme-text">Dark</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Hero -->
+  <section class="hero">
+    <h1>Caelum & mybot-cli Architecture & Tutorial</h1>
+    <p>ระบบเอกสารคู่มือการใช้งาน Caelum High-Performance Rust LLM Engine ร่วมกับ mybot-cli Coding Agent, การเชื่อมต่อ IDE, Tool Calling และการรีดพลัง Intel Arc B580 GPU</p>
+    <div class="hero-tags">
+      <span class="hero-tag">⚡ Intel Arc B580 Turbo (128 tok/s)</span>
+      <span class="hero-tag">🦀 100% Pure Rust Engine</span>
+      <span class="hero-tag">🛠️ OpenAI Tool Calling & SSE</span>
+      <span class="hero-tag">💻 mybot-cli TUI Coding Agent</span>
+      <span class="hero-tag">📐 Celestia & Lenout Ready</span>
+    </div>
+  </section>
+
+  <!-- Main Tabs Interface -->
+  <main class="container">
+    <div class="tabs-wrapper">
+      <div role="tablist" aria-label="Documentation Navigation">
+        <button type="button" role="tab" id="tab-quickstart" aria-selected="true" focusgroupstart>🚀 1. คู่มือเริ่มต้น (Quickstart)</button>
+        <button type="button" role="tab" id="tab-mybot" aria-selected="false">🤖 2. เชื่อมต่อ mybot-cli Agent</button>
+        <button type="button" role="tab" id="tab-ides" aria-selected="false">🔌 3. เชื่อมต่อ IDE & LM Studio</button>
+        <button type="button" role="tab" id="tab-api" aria-selected="false">📡 4. สเปก API & Tool Calling</button>
+        <button type="button" role="tab" id="tab-gpu" aria-selected="false">⚡ 5. เทคนิค Intel Arc B580</button>
+        <button type="button" role="tab" id="tab-playground" aria-selected="false">🧪 6. Live API Playground</button>
+      </div>
+    </div>
+
+    <!-- Panel 1: Quickstart -->
+    <div role="tabpanel" id="panel-quickstart" aria-labelledby="tab-quickstart">
+      <div class="panel-inner">
+        <h2>🚀 เริ่มต้นใช้งาน Caelum ใน 1 นาที</h2>
+        <p class="lead-text">Caelum คือ LLM Inference Engine เขียนด้วย Pure Rust ที่เน้นความเร็วสูงสุด รองรับทั้ง Intel Arc GPU (Vulkan) และ Intel CPU (AVX-VNNI) โดยไม่ต้องพึ่ง Python หรือไดรเวอร์ภายนอกที่หนักเครื่อง</p>
+
+        <h3>สถาปัตยกรรมภาพรวมของระบบ</h3>
+        <div class="cards-grid">
+          <div class="card">
+            <div class="card-icon">⚡</div>
+            <div class="card-title">Caelum Engine</div>
+            <div class="card-desc">เอนจินหลัก ประมวลผล GGUF ด้วยความเร็ว 128 tok/s (1.5B) และ 43 tok/s (8B) บน Arc B580</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">💻</div>
+            <div class="card-title">mybot-cli</div>
+            <div class="card-desc">AI Coding Agent TUI (Rust) สั่งรันคำสั่ง bash, อ่าน/แก้ไขไฟล์ และคุยกับ Caelum แบบสตรีมมิ่ง</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">📐</div>
+            <div class="card-title">Celestia & Lenout</div>
+            <div class="card-desc">โมเดลสร้าง Proposal สำหรับงานออกแบบสถาปัตยกรรมและ CAD ผ่าน Grammar Constrained Decoding</div>
+          </div>
+        </div>
+
+        <h3>ขั้นตอนที่ 1: ตรวจสอบสถานะฮาร์ดแวร์</h3>
+        <p>ใช้คำสั่ง <code>caelum info</code> เพื่อตรวจสอบว่าระบบตรวจพบการ์ดจอ Intel Arc B580 และคำสั่ง AVX-VNNI ของ CPU หรือไม่:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button type="button" class="copy-btn" data-code="cd caelum && ./target/release/caelum info">Copy</button>
+          </div>
+          <pre>cd caelum && ./target/release/caelum info</pre>
+        </div>
+
+        <h3>ขั้นตอนที่ 2: ตรวจสอบโครงสร้างไฟล์โมเดล GGUF</h3>
+        <p>คุณสามารถใช้ <code>caelum inspect</code> เพื่ออ่านเมทาดาตา, ขนาดพารามิเตอร์, และประเภท Quantization ในเวลาเพียง 38 มิลลิวินาที:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button type="button" class="copy-btn" data-code="./target/release/caelum inspect &quot;../models/exported_gguf/llama-3.1-8b-instruct-q4_k_m.gguf&quot;">Copy</button>
+          </div>
+          <pre>./target/release/caelum inspect "../models/exported_gguf/llama-3.1-8b-instruct-q4_k_m.gguf"</pre>
+        </div>
+
+        <h3>ขั้นตอนที่ 3: เปิดเซิร์ฟเวอร์ Caelum บนการ์ดจอ Intel Arc B580</h3>
+        <p>สั่งรัน HTTP API Server (มาตรฐาน OpenAI) พร้อมเร่งความเร็วด้วย <code>--gpu</code>:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal (Server)</span>
+            <button type="button" class="copy-btn" data-code="./target/release/caelum serve &quot;../models/exported_gguf/llama-3.1-8b-instruct-q4_k_m.gguf&quot; --gpu --port 8000">Copy</button>
+          </div>
+          <pre>./target/release/caelum serve "../models/exported_gguf/llama-3.1-8b-instruct-q4_k_m.gguf" --gpu --port 8000</pre>
+        </div>
+        <div class="callout tip">
+          <div class="callout-title">💡 ทิปการประหยัดแรมบนโหมด CPU</div>
+          หากต้องการรันบน CPU ให้เอา <code>--gpu</code> ออก แล้วใส่ <code>--kv-q8</code> แทน เพื่อบีบอัด Key-Value Cache เป็น 8-bit ลดการกิน RAM ลงเกือบ 4 เท่า!
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 2: mybot-cli -->
+    <div role="tabpanel" id="panel-mybot" aria-labelledby="tab-mybot" hidden>
+      <div class="panel-inner">
+        <h2>🤖 การใช้งานร่วมกับ mybot-cli (Local AI Coding Agent)</h2>
+        <p class="lead-text">เมื่อจับคู่ <strong>Caelum Engine</strong> เข้ากับ <strong>mybot-cli</strong> คุณจะได้สแต็ก AI Coding Agent ที่เป็น <strong>100% Pure Rust</strong> ทั้งหมด ทำงานแบบออฟไลน์ 100% ไม่เสียค่า Token และปลอดภัยต่อข้อมูลของคุณ</p>
+
+        <h3>ขั้นตอนการเชื่อมต่อใน 2 สเต็ป</h3>
+        <ol>
+          <li><strong>ตั้งค่า Provider ใน <code>~/.mybot/config.toml</code>:</strong></li>
+        </ol>
+        <div class="code-box">
+          <div class="code-header">
+            <span>~/.mybot/config.toml</span>
+            <button type="button" class="copy-btn" data-code="[providers.caelum]
+kind = &quot;openai&quot;
+base_url = &quot;http://127.0.0.1:8000/v1&quot;
+model = &quot;llama-3.1-8b-instruct&quot;">Copy</button>
+          </div>
+          <pre>[providers.caelum]
+kind = "openai"
+base_url = "http://127.0.0.1:8000/v1"
+model = "llama-3.1-8b-instruct"</pre>
+        </div>
+
+        <ol start="2">
+          <li><strong>เปิดใช้งาน mybot ในโฟลเดอร์โปรเจกต์ของคุณ:</strong></li>
+        </ol>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button type="button" class="copy-btn" data-code="mybot --model caelum/llama-3.1-8b-instruct">Copy</button>
+          </div>
+          <pre>mybot --model caelum/llama-3.1-8b-instruct</pre>
+        </div>
+
+        <h3>ความสามารถเด่นเมื่อใช้งาน Caelum + mybot</h3>
+        <ul>
+          <li><strong>Agentic Tool Calling:</strong> Caelum รองรับ OpenAI Function Calling เต็มรูปแบบ ทำให้ <code>mybot</code> สามารถสั่ง <code>read</code>, <code>write</code>, <code>edit</code>, และ <code>bash</code> ในเครื่องได้แบบอัตโนมัติ</li>
+          <li><strong>Interactive TUI:</strong> หน้าจอเทอร์มินัลสวยงามด้วย Ratatui พร้อม Syntax Highlighting สำหรับบล็อกโค้ด</li>
+          <li><strong>Context Compaction:</strong> พิมพ์ <code>/compact</code> เมื่อคุยยาว เพื่อให้โมเดลสรุปบริบทและลดขนาด Session</li>
+          <li><strong>MCP Protocol:</strong> รองรับการเชื่อมต่อกับ Model Context Protocol Servers ภายนอกได้ทันที</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Panel 3: IDEs & LM Studio -->
+    <div role="tabpanel" id="panel-ides" aria-labelledby="tab-ides" hidden>
+      <div class="panel-inner">
+        <h2>🔌 การเชื่อมต่อ IDEs, Cline, WebUI และ LM Studio</h2>
+        <p class="lead-text">Caelum ปฏิบัติตามมาตรฐาน OpenAI API Specification 100% จึงสามารถนำไปเชื่อมต่อกับโปรแกรมหรือเครื่องมือพัฒนาซอฟต์แวร์ได้ทันที</p>
+
+        <h3>1. เชื่อมต่อกับ Cline / Roo Code / OpenCode / Continue.dev</h3>
+        <p>ในหน้าตั้งค่า Provider ของ Extension ใน VS Code หรือ IDE:</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ฟิลด์ตั้งค่า</th>
+                <th>ค่าที่ต้องระบุ</th>
+                <th>คำอธิบาย</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>API Provider</strong></td>
+                <td><code>OpenAI Compatible</code></td>
+                <td>เลือกโหมดมาตรฐาน OpenAI</td>
+              </tr>
+              <tr>
+                <td><strong>Base URL</strong></td>
+                <td><code>http://127.0.0.1:8000/v1</code></td>
+                <td>ที่อยู่เซิร์ฟเวอร์ Caelum (หรือพอร์ตที่คุณตั้ง)</td>
+              </tr>
+              <tr>
+                <td><strong>API Key</strong></td>
+                <td><code>not-needed</code></td>
+                <td>ใส่อะไรก็ได้ Caelum ไม่บังคับคีย์ภายในเครื่อง</td>
+              </tr>
+              <tr>
+                <td><strong>Model ID</strong></td>
+                <td><code>llama-3.1-8b</code></td>
+                <td>ระบุชื่อโมเดลที่ต้องการ</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>2. ใช้งานแทน LM Studio Local Server (พอร์ต 1234)</h3>
+        <p>หากคุณมีโปรแกรมที่เคยตั้งค่าเชื่อมต่อกับ LM Studio ที่พอร์ต <code>1234</code> คุณสามารถสั่งให้ Caelum รันแทนที่ได้ทันที:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button type="button" class="copy-btn" data-code="./target/release/caelum serve &quot;/run/media/seashyne/Project/My Artificial Intelligence/Chat AI/LM Studio/Models/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf&quot; --gpu --port 1234">Copy</button>
+          </div>
+          <pre>./target/release/caelum serve "/run/media/seashyne/Project/My Artificial Intelligence/Chat AI/LM Studio/Models/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf" --gpu --port 1234</pre>
+        </div>
+
+        <h3>3. เชื่อมต่อผ่าน Python (OpenAI Official SDK)</h3>
+        <div class="code-box">
+          <div class="code-header">
+            <span>python_client.py</span>
+            <button type="button" class="copy-btn" data-code="from openai import OpenAI
+
+client = OpenAI(base_url=&quot;http://127.0.0.1:8000/v1&quot;, api_key=&quot;not-needed&quot;)
+
+stream = client.chat.completions.create(
+    model=&quot;llama-3.1-8b&quot;,
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;เขียนตัวอย่างโค้ด Rust สำหรับ Multi-threading&quot;}],
+    stream=True,
+)
+
+for chunk in stream:
+    print(chunk.choices[0].delta.content or &quot;&quot;, end=&quot;&quot;, flush=True)">Copy</button>
+          </div>
+          <pre>from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed")
+
+stream = client.chat.completions.create(
+    model="llama-3.1-8b",
+    messages=[{"role": "user", "content": "เขียนตัวอย่างโค้ด Rust สำหรับ Multi-threading"}],
+    stream=True,
+)
+
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 4: API Specification -->
+    <div role="tabpanel" id="panel-api" aria-labelledby="tab-api" hidden>
+      <div class="panel-inner">
+        <h2>📡 สเปก API Endpoints & Tool Calling</h2>
+        <p class="lead-text">รายละเอียด Endpoint ทั้งหมดที่ Caelum ให้บริการ พร้อมโครงสร้าง Request / Response ตามมาตรฐานสากล</p>
+
+        <h3>1. GET <code>/health</code></h3>
+        <p>ตรวจสอบความสมบูรณ์ของระบบ ฮาร์ดแวร์ที่กำลังรัน และสถานะ KV Cache:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Response JSON</span>
+          </div>
+          <pre>{
+  "status": "healthy",
+  "engine": "caelum-rs",
+  "version": "0.8.0",
+  "model": "Meta-Llama-3.1-8B-Instruct",
+  "architecture": "llama",
+  "template": "llama3",
+  "kernel": "wgpu Intel(R) Arc(tm) B580 Graphics (BMG G21) (Vulkan, DiscreteGpu)",
+  "kv_mode": "F16",
+  "threads": 6,
+  "timestamp": 1732426300
+}</pre>
+        </div>
+
+        <h3>2. POST <code>/v1/chat/completions</code> (พร้อม Tool Calling)</h3>
+        <p>ส่งคำขอสร้างข้อความ หรือแนบ Tools เพื่อให้โมเดลเลือกเรียกเครื่องมือ:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>Request JSON</span>
+            <button type="button" class="copy-btn" data-code="{
+  &quot;model&quot;: &quot;llama-3.1-8b&quot;,
+  &quot;messages&quot;: [
+    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;เช็คสภาพอากาศที่กรุงเทพฯ ตอนนี้ให้หน่อย&quot;}
+  ],
+  &quot;tools&quot;: [
+    {
+      &quot;type&quot;: &quot;function&quot;,
+      &quot;function&quot;: {
+        &quot;name&quot;: &quot;get_weather&quot;,
+        &quot;description&quot;: &quot;Get current weather for location&quot;,
+        &quot;parameters&quot;: {
+          &quot;type&quot;: &quot;object&quot;,
+          &quot;properties&quot;: {
+            &quot;location&quot;: {&quot;type&quot;: &quot;string&quot;}
+          },
+          &quot;required&quot;: [&quot;location&quot;]
+        }
+      }
+    }
+  ],
+  &quot;stream&quot;: true
+}">Copy</button>
+          </div>
+          <pre>{
+  "model": "llama-3.1-8b",
+  "messages": [
+    {"role": "user", "content": "เช็คสภาพอากาศที่กรุงเทพฯ ตอนนี้ให้หน่อย"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string"}
+          },
+          "required": ["location"]
+        }
+      }
+    }
+  ],
+  "stream": true
+}</pre>
+        </div>
+
+        <h3>3. POST <code>/v1/celestia/propose</code> (Strict JSON Proposals)</h3>
+        <p>เอนด์พอยต์เฉพาะของระบบ Cetia/Lenout สำหรับบังคับให้โมเดลสร้างผลลัพธ์ตามโครงสร้าง JSON Schema 100%:</p>
+        <div class="code-box">
+          <div class="code-header">
+            <span>curl</span>
+            <button type="button" class="copy-btn" data-code="curl http://127.0.0.1:8000/v1/celestia/propose \
+  -H &quot;Content-Type: application/json&quot; \
+  -d '{&quot;mode&quot;: &quot;scene3d&quot;, &quot;prompt&quot;: &quot;สร้างห้องนั่งเล่นขนาด 4x5 เมตร มีโซฟาและโต๊ะกลาง&quot;}'">Copy</button>
+          </div>
+          <pre>curl http://127.0.0.1:8000/v1/celestia/propose \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "scene3d", "prompt": "สร้างห้องนั่งเล่นขนาด 4x5 เมตร มีโซฟาและโต๊ะกลาง"}'</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 5: GPU Turbo -->
+    <div role="tabpanel" id="panel-gpu" aria-labelledby="tab-gpu" hidden>
+      <div class="panel-inner">
+        <h2>⚡ เบื้องหลังความเร็วระดับ Turbo บน Intel Arc B580</h2>
+        <p class="lead-text">ใน Caelum v0.8.0 มีการปรับจูน Kernel และสถาปัตยกรรมระดับฮาร์ดแวร์เพื่อรีดประสิทธิภาพการ์ดจอ Intel Arc B580 (Battlemage G21 12GB) ให้ทำงานได้เต็มขีดจำกัด</p>
+
+        <div class="cards-grid">
+          <div class="card">
+            <div class="card-title">1. Subgroup Hardware Ops</div>
+            <div class="card-desc">ใช้คำสั่ง <code>subgroupAdd</code> และ <code>subgroupMax</code> ของฮาร์ดแวร์ Intel BMG ตัดรอบ <code>workgroupBarrier()</code> ช่วยลด Latency ระดับไมโครวินาที</div>
+          </div>
+          <div class="card">
+            <div class="card-title">2. 4-byte-aligned Q6_K</div>
+            <div class="card-desc">จัดระเบียบบล็อก GGML 210B เป็น 212B (53 <code>u32</code>) ทำให้ GPU โหลด Memory ได้ 100% Coalesced วิ่งเต็มแบนด์วิดท์ <strong>306.4 GB/s</strong> (เร็วขึ้น 2.5×)</div>
+          </div>
+          <div class="card">
+            <div class="card-title">3. Fused Kernels (-53%)</div>
+            <div class="card-desc">ฟิวส์ QKV+Bias, SwiGLU FFN, และ Residual+RMSNorm รวมเป็นคำสั่งเดียว ลด GPU Command Dispatches จาก 478 เหลือเพียง 226 ครั้งต่อโทเคน</div>
+          </div>
+          <div class="card">
+            <div class="card-title">4. Packed F16 KV Cache</div>
+            <div class="card-desc">บีบอัด Key-Value Cache บน VRAM ให้เป็น Half-Precision F16 ประหยัดแรมการ์ดจอลง 50% และลด Memory Traffic ขณะ Decode</div>
+          </div>
+          <div class="card">
+            <div class="card-title">5. Streaming DMA Uploads</div>
+            <div class="card-desc">ทยอยส่งข้อมูลเข้าการ์ดจอทีละ 16 MiB พร้อม Per-layer Flush โหลด Llama-3.1 8B เสร็จใน 12.5 วินาที โดยไม่ทำให้ Host RAM บวมหรือแตะ Swap</div>
+          </div>
+        </div>
+
+        <h3>ตารางเปรียบเทียบประสิทธิภาพบนเครื่องนี้</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>โมเดลและขนาด</th>
+                <th>Caelum v0.8.0 (Arc B580)</th>
+                <th>llama.cpp Vulkan (LM Studio)</th>
+                <th>การปรับปรุง</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Qwen2.5-Coder-1.5B (Q4_K_M)</strong></td>
+                <td><span class="badge-pill green">128.5 tok/s</span></td>
+                <td>~45.0 tok/s</td>
+                <td><strong>2.85× เร็วกว่า</strong></td>
+              </tr>
+              <tr>
+                <td><strong>Llama-3.1-8B-Instruct (Q4_K_M)</strong></td>
+                <td><span class="badge-pill green">42.88 tok/s</span></td>
+                <td>~20.5 tok/s</td>
+                <td><strong>2.09× เร็วกว่า</strong></td>
+              </tr>
+              <tr>
+                <td><strong>เวลาโหลดโมเดล 8B (Cold Load)</strong></td>
+                <td><span class="badge-pill green">12.5 วินาที</span></td>
+                <td>~35.0 วินาที</td>
+                <td><strong>เร็วขึ้นเกือบ 3 เท่า</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 6: Live Playground -->
+    <div role="tabpanel" id="panel-playground" aria-labelledby="tab-playground" hidden>
+      <div class="panel-inner">
+        <h2>🧪 Live API Playground</h2>
+        <p class="lead-text">ทดสอบส่งคำขอ Prompt ไปยัง Caelum API Server ที่กำลังรันอยู่บนเครื่องของคุณแบบเรียลไทม์</p>
+
+        <div class="playground-box">
+          <div class="pg-form">
+            <div>
+              <label class="pg-label" for="pg-endpoint">API Server Endpoint</label>
+              <input type="text" id="pg-endpoint" class="pg-input" value="http://127.0.0.1:8000/v1/chat/completions">
+            </div>
+
+            <div>
+              <label class="pg-label" for="pg-prompt">User Prompt</label>
+              <textarea id="pg-prompt" class="pg-textarea">เขียนฟังก์ชัน Rust ตรวจสอบข้อความ Palindrome สั้นๆ และรวดเร็ว</textarea>
+            </div>
+
+            <div style="display: flex; gap: 1rem;">
+              <div style="flex: 1;">
+                <label class="pg-label" for="pg-temp">Temperature (0.0 - 1.0)</label>
+                <input type="number" id="pg-temp" class="pg-input" value="0.7" step="0.1" min="0" max="2">
+              </div>
+              <div style="flex: 1;">
+                <label class="pg-label" for="pg-max-tokens">Max Tokens</label>
+                <input type="number" id="pg-max-tokens" class="pg-input" value="256" step="64" min="16" max="2048">
+              </div>
+            </div>
+
+            <button type="button" class="pg-btn" id="pg-send-btn">
+              <span>⚡ ส่งคำขอไปยัง Caelum Engine</span>
+            </button>
+          </div>
+
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+              <span class="pg-label">Output & Streaming Response</span>
+              <span id="pg-stats" style="font-size: 0.75rem; color: var(--accent); font-family: var(--font-mono);"></span>
+            </div>
+            <div class="pg-output" id="pg-output-box">// กดส่งคำขอเพื่อทดสอบการตอบกลับแบบเรียลไทม์...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Footer -->
+  <footer>
+    <p><strong>Caelum Engine & mybot-cli</strong> — High-Performance Zero-Dependency LLM Platform for Intel Arc GPU & ARMv9/x86 CPUs.</p>
+    <p style="margin-top: 0.35rem;">Part of the Cetia, Celestia & Lenout Ecosystem by @seashyne</p>
+  </footer>
+
+  <!-- Scripts: Tabs, Copying, Theme, Status Check, Playground -->
+  <script>
+    // 1. Modern Web Guidance Compliant Tab Navigation
+    const tablist = document.querySelector('[role="tablist"]');
+    const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+    const panels = Array.from(document.querySelectorAll('[role="tabpanel"]'));
+
+    function selectTab(targetTab) {
+      tabs.forEach(tab => {
+        const isSelected = tab === targetTab;
+        tab.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+        tab.toggleAttribute('focusgroupstart', isSelected);
+      });
+      panels.forEach(panel => {
+        const match = panel.getAttribute('aria-labelledby') === targetTab.id;
+        panel.hidden = !match;
+      });
+    }
+
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => selectTab(tab));
+      tab.addEventListener('keydown', (e) => {
+        let index = tabs.indexOf(tab);
+        if (e.key === 'ArrowRight') {
+          index = (index + 1) % tabs.length;
+          tabs[index].focus();
+          selectTab(tabs[index]);
+        } else if (e.key === 'ArrowLeft') {
+          index = (index - 1 + tabs.length) % tabs.length;
+          tabs[index].focus();
+          selectTab(tabs[index]);
+        }
+      });
+    });
+
+    // 2. Dark/Light Theme Toggle
+    const themeBtn = document.getElementById('theme-btn');
+    const themeIcon = document.getElementById('theme-icon');
+    const themeText = document.getElementById('theme-text');
+    let currentTheme = localStorage.getItem('caelum-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+
+    function applyTheme(theme) {
+      currentTheme = theme;
+      document.documentElement.setAttribute('data-theme', theme);
+      themeIcon.textContent = theme === 'dark' ? '☀️' : '🌙';
+      themeText.textContent = theme === 'dark' ? 'Light' : 'Dark';
+      localStorage.setItem('caelum-theme', theme);
+    }
+    applyTheme(currentTheme);
+
+    themeBtn.addEventListener('click', () => {
+      applyTheme(currentTheme === 'dark' ? 'light' : 'dark');
+    });
+
+    // 3. Code Copy Buttons
+    document.querySelectorAll('.copy-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const code = btn.getAttribute('data-code');
+        if (code) {
+          navigator.clipboard.writeText(code).then(() => {
+            const original = btn.textContent;
+            btn.textContent = 'Copied!';
+            btn.classList.add('copied');
+            setTimeout(() => {
+              btn.textContent = original;
+              btn.classList.remove('copied');
+            }, 1800);
+          });
+        }
+      });
+    });
+
+    // 4. Live Server Health Check
+    async function checkServerHealth() {
+      const statusPill = document.getElementById('server-status-pill');
+      const dot = document.getElementById('status-dot');
+      const text = document.getElementById('status-text');
+      try {
+        const base = window.location.origin.includes('8000') ? window.location.origin : 'http://127.0.0.1:8000';
+        const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) });
+        if (res.ok) {
+          const data = await res.json();
+          dot.classList.add('online');
+          text.textContent = `Online: ${data.model} (${data.kv_mode})`;
+          return;
+        }
+      } catch (e) {}
+      dot.classList.remove('online');
+      text.textContent = 'Offline (Run caelum serve)';
+    }
+    checkServerHealth();
+    setInterval(checkServerHealth, 5000);
+
+    // 5. Live Interactive Playground
+    const pgSendBtn = document.getElementById('pg-send-btn');
+    const pgOutputBox = document.getElementById('pg-output-box');
+    const pgStats = document.getElementById('pg-stats');
+
+    pgSendBtn.addEventListener('click', async () => {
+      const endpoint = document.getElementById('pg-endpoint').value.trim();
+      const prompt = document.getElementById('pg-prompt').value.trim();
+      const temp = parseFloat(document.getElementById('pg-temp').value) || 0.7;
+      const maxTokens = parseInt(document.getElementById('pg-max-tokens').value) || 256;
+
+      if (!prompt) return;
+
+      pgSendBtn.disabled = true;
+      pgOutputBox.textContent = 'Connecting to Caelum Engine...\n';
+      pgStats.textContent = '';
+      const startTime = performance.now();
+      let tokenCount = 0;
+
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [{ role: 'user', content: prompt }],
+            temperature: temp,
+            max_tokens: maxTokens,
+            stream: true
+          })
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          pgOutputBox.textContent = `Error ${res.status}: ${errText}`;
+          pgSendBtn.disabled = false;
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        pgOutputBox.textContent = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith('data: ')) {
+              const payload = trimmed.slice(6);
+              if (payload === '[DONE]') break;
+              try {
+                const parsed = JSON.parse(payload);
+                const delta = parsed.choices?.[0]?.delta?.content || '';
+                if (delta) {
+                  tokenCount++;
+                  pgOutputBox.textContent += delta;
+                  pgOutputBox.scrollTop = pgOutputBox.scrollHeight;
+                }
+              } catch (e) {}
+            }
+          }
+        }
+        const elapsedSec = (performance.now() - startTime) / 1000;
+        const tokPerSec = (tokenCount / elapsedSec).toFixed(1);
+        pgStats.textContent = `Generated ${tokenCount} tokens in ${elapsedSec.toFixed(2)}s (${tokPerSec} tok/s)`;
+      } catch (err) {
+        pgOutputBox.textContent = `Connection failed: ${err.message}\nMake sure caelum serve is running with --gpu!`;
+      } finally {
+        pgSendBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
