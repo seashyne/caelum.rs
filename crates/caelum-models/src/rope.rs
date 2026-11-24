@@ -38,8 +38,17 @@ impl RopeConfig {
         let freq_base = gguf
             .get_meta(&format!("{p}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or_else(|| if arch.starts_with("qwen") { 1_000_000.0 } else { 10_000.0 });
-        let style = if arch.starts_with("qwen") || arch == "celestia" {
+            .unwrap_or_else(|| {
+                if arch.starts_with("qwen") || arch == "gemma3" {
+                    1_000_000.0
+                } else {
+                    10_000.0
+                }
+            });
+        let style = if arch.starts_with("qwen")
+            || arch == "celestia"
+            || matches!(arch, "gemma" | "gemma2" | "gemma3" | "phi3" | "starcoder2")
+        {
             RopeStyle::NeoX
         } else {
             RopeStyle::Normal
@@ -179,6 +188,32 @@ impl RopeTable {
             cos,
             sin,
         }
+    }
+
+    #[inline]
+    pub fn half_dim(&self) -> usize {
+        self.half_dim
+    }
+
+    #[inline]
+    pub fn is_neox(&self) -> bool {
+        matches!(self.style, RopeStyle::NeoX)
+    }
+
+    /// Packs `[cos[pos, 0..half], sin[pos, 0..half]]` per position for GPU VRAM upload.
+    pub fn packed_cos_sin(&self) -> Vec<f32> {
+        let half = self.half_dim;
+        if half == 0 {
+            return Vec::new();
+        }
+        let max_seq = self.cos.len() / half;
+        let mut out = Vec::with_capacity(max_seq * half * 2);
+        for pos in 0..max_seq {
+            let row = pos * half;
+            out.extend_from_slice(&self.cos[row..row + half]);
+            out.extend_from_slice(&self.sin[row..row + half]);
+        }
+        out
     }
 
     #[inline]

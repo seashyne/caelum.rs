@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+gpu = ["caelum-kernels/gpu", "caelum-models/gpu"]
+
 [[bin]]
 name = "caelum"
 path = "src/main.rs"

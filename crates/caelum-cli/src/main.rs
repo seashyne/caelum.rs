@@ -3,6 +3,7 @@
 mod json;
 mod lenout;
 mod server;
+mod tools;
 
 use caelum_core::{
     f32_to_f16, quantize_row_q4_0, quantize_row_q8_0, quantize_row_q8_k, BlockQ4_0, BlockQ8_0,
@@ -10,13 +11,50 @@ use caelum_core::{
 };
 use caelum_gguf::GgufFile;
 use caelum_kernels::{Backend, CpuBackend, CpuCaps};
+#[cfg(feature = "gpu")]
+use caelum_kernels::GpuContext;
 use caelum_models::{
     write_synthetic_celestia_gguf, CaelumModel, CelestiaConfig, KvPrecision, SamplerConfig,
 };
 use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, SchemaGrammar, Tokenizer};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 use std::time::Instant;
+
+fn load_model_for_cli<'a>(
+    gguf: &'a GgufFile,
+    backend: &CpuBackend,
+    max_ctx: Option<usize>,
+    kv_precision: KvPrecision,
+    enable_repack: bool,
+    use_gpu: bool,
+) -> Result<(CaelumModel<'a>, String)> {
+    if use_gpu {
+        #[cfg(feature = "gpu")]
+        {
+            let gpu = Arc::new(GpuContext::new()?);
+            let label = format!("wgpu {}", gpu.device_summary());
+            let model = CaelumModel::from_gguf_gpu(gguf, gpu, max_ctx)?;
+            Ok((model, label))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (gguf, backend, max_ctx, kv_precision, enable_repack);
+            Err(caelum_core::CaelumError::Runtime(
+                "--gpu requires compiling with `--features gpu` (cargo build --release --features gpu)".into(),
+            ))
+        }
+    } else {
+        let mut model = CaelumModel::from_gguf_with_kv(gguf, max_ctx, kv_precision)?;
+        if enable_repack {
+            model.optimize_for_backend(backend);
+        }
+        let label = format!("{} | {} threads", backend.name(), backend.num_threads());
+        Ok((model, label))
+    }
+}
 
 fn print_usage() {
     println!(
@@ -26,10 +64,10 @@ USAGE:
   caelum info
   caelum inspect <model.gguf>
   caelum run <model.gguf> -p "<prompt>" [OPTIONS]
-  caelum chat <model.gguf> [--system "..."] [--kv-q8] [--ctx 4096] [--threads N]
-  caelum propose <model.gguf> --mode <mode> -p "<prompt>" [--kv-q8] [--threads N] [--max-tokens 512]
-  caelum serve <model.gguf> [--host 127.0.0.1] [--port 8000] [--kv-q8] [--threads N] [--ctx 2048]
-  caelum bench [--dim 2048] [--iters 200] [--threads N]
+  caelum chat <model.gguf> [--system "..."] [--kv-q8] [--ctx 4096] [--threads N] [--gpu]
+  caelum propose <model.gguf> --mode <mode> -p "<prompt>" [--kv-q8] [--threads N] [--max-tokens 512] [--gpu]
+  caelum serve <model.gguf> [--host 127.0.0.1] [--port 8000] [--kv-q8] [--threads N] [--ctx 2048] [--gpu]
+  caelum bench [--dim 2048] [--iters 200] [--threads N] [--gpu]
   caelum demo-celestia [--save <path.gguf>] [--threads N]
 
 OPTIONS:
@@ -41,8 +79,9 @@ OPTIONS:
   --top-p <FLOAT>         Top-P nucleus sampling cutoff (default: 0.9)
   --ctx <N>               Max KV context length (default: model min 4096)
   --kv-q8                 Use 8-bit Q8_0 quantized KV cache (3.76× less RAM)
+  --gpu                   Run inference/benchmark on Vulkan/Metal/DX12 GPU (--features gpu)
   --threads <N>           Worker thread count (default: auto P-core pinning)
-  --template <NAME>       Chat template: auto, chatml, qwen3-nothink, llama3,
+  --template <NAME>       Chat template: auto, chatml, qwen3-nothink, llama3, gemma, phi3,
                           deepseek2, deepseek-v1, mistral, celestia, raw
   --no-repack             Disable online 8-row SIMD weight repacking
   --json                  Enable strict JSON Grammar Constrained Decoding
@@ -101,9 +140,20 @@ fn cmd_info() -> Result<()> {
     println!("  Version:       v{}", env!("CARGO_PKG_VERSION"));
     println!("  Hardware:      {caps}");
     println!("  Default Pool:  {} threads (P-core pinned)", backend.num_threads());
+    #[cfg(feature = "gpu")]
+    {
+        match GpuContext::new() {
+            Ok(gpu) => println!("  GPU (wgpu):    {}", gpu.device_summary()),
+            Err(e) => println!("  GPU (wgpu):    unavailable ({e})"),
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        println!("  GPU (wgpu):    disabled (build with --features gpu for Vulkan/Metal/DX12)");
+    }
     println!("  Quantization:  F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K");
-    println!("  Architectures: llama, qwen2/2.5, qwen2moe, qwen3, qwen3moe, deepseek2 (MLA+MoE), mistral, celestia");
-    println!("  Accelerators:  x86 AVX-VNNI/AVX2+FMA+F16C (8x4/8x8 Repacked) | ARMv9 NEON+DotProd+I8MM SMMLA");
+    println!("  Architectures: llama, qwen2/2.5, qwen2moe, qwen3, qwen3moe, deepseek2, gemma2/3, phi3/4, starcoder2, mistral, celestia");
+    println!("  Accelerators:  x86 AVX-VNNI/AVX2+FMA+F16C (8x4/8x8 Repacked) | ARMv9 NEON+DotProd+I8MM SMMLA | wgpu Vulkan/Metal/DX12");
     println!("============================================================");
     Ok(())
 }
@@ -188,6 +238,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let mut raw_mode = false;
     let mut template_override: Option<String> = None;
     let mut enable_repack = true;
+    let mut use_gpu = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -231,6 +282,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
                 max_ctx = args.get(i).and_then(|v| v.parse().ok());
             }
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--gpu" => use_gpu = true,
             "--threads" => {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
@@ -257,21 +309,25 @@ fn cmd_run(args: &[String]) -> Result<()> {
     } else {
         Tokenizer::from_gguf(&gguf)?
     };
-    let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
-    if enable_repack {
-        model.optimize_for_backend(&backend);
-    }
+    let (mut model, hw_label) = load_model_for_cli(
+        &gguf,
+        &backend,
+        max_ctx,
+        kv_precision,
+        enable_repack,
+        use_gpu,
+    )?;
     let template = resolve_template(&gguf, template_override.as_deref(), raw_mode)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!(
-        "[Caelum] Loaded {} ({:.1}M params) in {:.1}ms | {} | {} threads | tmpl={} | packed={:.0}MB | KV {} ({:.1} MB)",
+        "[Caelum] Loaded {} ({:.1}M params) in {:.1}ms | {} | tmpl={} | {}={:.0}MB | KV {} ({:.1} MB)",
         arch,
         gguf.total_parameters() as f64 / 1e6,
         load_ms,
-        backend.name(),
-        backend.num_threads(),
+        hw_label,
         template.name(),
+        if use_gpu { "vram" } else { "packed" },
         model.packed_bytes() as f64 / (1024.0 * 1024.0),
         model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0),
@@ -342,6 +398,7 @@ fn cmd_chat(args: &[String]) -> Result<()> {
     let mut kv_precision = KvPrecision::Q8_0; // Default Q8_0 for interactive long-context chat
     let mut template_override: Option<String> = None;
     let mut enable_repack = true;
+    let mut use_gpu = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -368,6 +425,7 @@ fn cmd_chat(args: &[String]) -> Result<()> {
             }
             "--kv-f32" => kv_precision = KvPrecision::F32,
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--gpu" => use_gpu = true,
             "--threads" => {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
@@ -386,18 +444,21 @@ fn cmd_chat(args: &[String]) -> Result<()> {
     let gguf = GgufFile::open(model_path)?;
     let arch = gguf.architecture().unwrap_or("llama").to_string();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
-    if enable_repack {
-        model.optimize_for_backend(&backend);
-    }
+    let (mut model, hw_label) = load_model_for_cli(
+        &gguf,
+        &backend,
+        max_ctx,
+        kv_precision,
+        enable_repack,
+        use_gpu,
+    )?;
     let template = resolve_template(&gguf, template_override.as_deref(), false)?;
 
     println!("============================================================");
     println!("  CAELUM INTERACTIVE CHAT (Prefix Caching ON)");
     println!(
-        "  Model: {arch} ({:.1}M) | {} | KV: {} ({:.1} MB)",
+        "  Model: {arch} ({:.1}M) | {hw_label} | KV: {} ({:.1} MB)",
         gguf.total_parameters() as f64 / 1e6,
-        backend.name(),
         model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
     );
@@ -489,6 +550,7 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     let mut kv_precision = KvPrecision::F32;
     let mut template_override: Option<String> = None;
     let mut enable_repack = true;
+    let mut use_gpu = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -518,6 +580,7 @@ fn cmd_propose(args: &[String]) -> Result<()> {
                 }
             }
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--gpu" => use_gpu = true,
             "--threads" => {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
@@ -535,10 +598,14 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     let backend = CpuBackend::new(threads);
     let gguf = GgufFile::open(model_path)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let mut model = CaelumModel::from_gguf_with_kv(&gguf, Some(2048), kv_precision)?;
-    if enable_repack {
-        model.optimize_for_backend(&backend);
-    }
+    let (mut model, hw_label) = load_model_for_cli(
+        &gguf,
+        &backend,
+        Some(2048),
+        kv_precision,
+        enable_repack,
+        use_gpu,
+    )?;
     let template = resolve_template(&gguf, template_override.as_deref(), false)?;
 
     let sys = lenout::build_lenout_system_prompt(&mode, "req_caelum_cli", "fp_caelum_cli");
@@ -558,9 +625,7 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
 
     eprintln!(
-        "[Caelum Propose] mode={mode} | {} | {} threads | KV {} ({:.1} MB) | Strict SchemaGrammar=ON",
-        backend.name(),
-        backend.num_threads(),
+        "[Caelum Propose] mode={mode} | {hw_label} | KV {} ({:.1} MB) | Strict SchemaGrammar=ON",
         model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
     );
@@ -604,6 +669,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let mut kv_precision = KvPrecision::F32;
     let mut template_override: Option<String> = None;
     let mut enable_repack = true;
+    let mut use_gpu = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -629,6 +695,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                 max_ctx = args.get(i).and_then(|v| v.parse().ok());
             }
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--gpu" => use_gpu = true,
             "--template" => {
                 i += 1;
                 template_override = args.get(i).cloned();
@@ -648,6 +715,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         kv_precision,
         template_override.as_deref(),
         enable_repack,
+        use_gpu,
     )
 }
 
@@ -655,6 +723,7 @@ fn cmd_bench(args: &[String]) -> Result<()> {
     let mut dim = 2048usize;
     let mut iters = 100usize;
     let mut threads: Option<usize> = None;
+    let mut use_gpu = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -675,6 +744,7 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                 i += 1;
                 threads = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--gpu" => use_gpu = true,
             _ => {}
         }
         i += 1;
@@ -862,6 +932,50 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                     flops_gemm / dt_p16 / 1e9,
                     (flops_gemm / dt_p16) / (flops / dt_p1)
                 );
+            }
+        }
+
+        if use_gpu {
+            #[cfg(feature = "gpu")]
+            {
+                let gpu = GpuContext::new()?;
+                println!("------------------------------------------------------------");
+                println!("  WGPU GPU BENCHMARK: {}", gpu.device_summary());
+                println!("------------------------------------------------------------");
+                let mut ref_out = vec![0.0f32; dim];
+                for (label, buf, batch_sz, run_iters) in [
+                    ("GPU F32   B=1 ", &buf_f32, 1usize, iters),
+                    ("GPU Q8_0  B=1 ", &buf_q8, 1, iters),
+                    ("GPU Q4_0  B=1 ", &buf_q4, 1, iters),
+                    ("GPU Q4_K  B=1 ", &buf_q4k, 1, iters),
+                    ("GPU Q4_K  B=16", &buf_q4k, batch, b_iters),
+                    ("GPU Q5_K  B=1 ", &buf_q5k, 1, iters),
+                    ("GPU Q6_K  B=1 ", &buf_q6k, 1, iters),
+                    ("GPU Q6_K  B=16", &buf_q6k, batch, b_iters),
+                ] {
+                    let x_in = if batch_sz == 1 { &x[..] } else { &x_batch[..] };
+                    let (dt, gpu_out) = gpu.bench_matmul(&buf.as_view(), x_in, batch_sz, run_iters)?;
+                    backend.matvec(&buf.as_view(), &x_in[..dim], &mut ref_out)?;
+                    let max_err = gpu_out[..dim]
+                        .iter()
+                        .zip(&ref_out)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    let total_bytes = buf.data.len() as f64 * run_iters as f64;
+                    let total_flops = (2 * dim * dim * batch_sz) as f64 * run_iters as f64;
+                    println!(
+                        "  {label}: {:7.3} ms/op | {:6.2} GB/s | {:7.2} GFLOP/s | err={max_err:.2e}",
+                        dt * 1000.0 / run_iters as f64,
+                        total_bytes / dt / 1e9,
+                        total_flops / dt / 1e9,
+                    );
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                return Err(caelum_core::CaelumError::Runtime(
+                    "--gpu requires compiling with `--features gpu`".into(),
+                ));
             }
         }
     }

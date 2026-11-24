@@ -12,6 +12,16 @@ pub mod x86;
 #[cfg(target_arch = "aarch64")]
 pub mod armv9;
 
+#[cfg(feature = "gpu")]
+pub mod wgpu_ctx;
+#[cfg(feature = "gpu")]
+pub mod wgpu_shaders;
+
+#[cfg(feature = "gpu")]
+pub use wgpu_ctx::{GpuContext, UniformArena};
+#[cfg(feature = "gpu")]
+pub use wgpu;
+
 use caelum_core::{
     quantize_row_q8_0, quantize_row_q8_k, BlockQ8_0, BlockQ8_K, CaelumError, DType, Result,
     TensorView, QK8_0, QK_K,

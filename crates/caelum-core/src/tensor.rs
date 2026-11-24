@@ -105,6 +105,28 @@ impl<'a> TensorView<'a> {
         })
     }
 
+    /// Zero-copy slices rows `start_row..start_row + num_rows` of a 2D `[rows, cols]` tensor
+    /// (used for fused Phi-3/4 `attn_qkv.weight` and `ffn_up.weight` across all quantizations).
+    #[inline]
+    pub fn slice_rows(&self, start_row: usize, num_rows: usize) -> Result<TensorView<'a>> {
+        let (rows, cols) = self.dims_2d()?;
+        if start_row.saturating_add(num_rows) > rows {
+            return Err(CaelumError::ShapeMismatch {
+                expected: format!("row slice {start_row}..{} within {rows}", start_row + num_rows),
+                actual: format!("[{rows}, {cols}]"),
+            });
+        }
+        let row_bytes = self.dtype.byte_size_for(cols)?;
+        let start = start_row * row_bytes;
+        let byte_len = num_rows * row_bytes;
+        Ok(TensorView {
+            data: &self.data[start..start + byte_len],
+            shape: [num_rows, cols, 1, 1],
+            ndim: 2,
+            dtype: self.dtype,
+        })
+    }
+
     /// Returns the raw byte slice for row `row_idx` of a 2D `[rows, cols]` tensor.
     #[inline]
     pub fn row_bytes(&self, row_idx: usize) -> &[u8] {

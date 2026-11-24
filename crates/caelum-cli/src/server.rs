@@ -8,9 +8,15 @@
 
 use crate::json::JsonValue;
 use crate::lenout::build_lenout_system_prompt;
+use crate::tools::{
+    extract_tool_calls, inject_tools_into_messages, parse_openai_messages, parse_tools_and_choice,
+    StreamEvent, ToolChoice, ToolStreamFilter,
+};
 use caelum_core::Result;
 use caelum_gguf::GgufFile;
 use caelum_kernels::{Backend, CpuBackend};
+#[cfg(feature = "gpu")]
+use caelum_kernels::GpuContext;
 use caelum_models::{CaelumModel, KvPrecision, SamplerConfig};
 use caelum_tokenizer::{
     ChatMessage, ChatRole, ChatTemplate, JsonGrammar, LogitGrammar, SchemaGrammar, Tokenizer,
@@ -18,6 +24,8 @@ use caelum_tokenizer::{
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[allow(clippy::too_many_arguments)]
@@ -30,6 +38,7 @@ pub fn run_server(
     kv_precision: KvPrecision,
     template_override: Option<&str>,
     enable_repack: bool,
+    use_gpu: bool,
 ) -> Result<()> {
     let backend = CpuBackend::new(threads);
     println!("[Caelum Server] Loading GGUF via zero-copy mmap: {model_path}");
@@ -46,10 +55,28 @@ pub fn run_server(
     } else {
         Tokenizer::from_gguf(&gguf)?
     };
-    let mut model = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
-    if enable_repack {
-        model.optimize_for_backend(&backend);
-    }
+    let (mut model, hw_label) = if use_gpu {
+        #[cfg(feature = "gpu")]
+        {
+            let gpu = Arc::new(GpuContext::new()?);
+            let label = format!("wgpu {}", gpu.device_summary());
+            let m = CaelumModel::from_gguf_gpu(&gguf, gpu, max_ctx)?;
+            (m, label)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            return Err(caelum_core::CaelumError::Runtime(
+                "--gpu requires compiling with `--features gpu` (cargo build --release --features gpu)".into(),
+            ));
+        }
+    } else {
+        let mut m = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
+        if enable_repack {
+            m.optimize_for_backend(&backend);
+        }
+        let label = format!("{} ({} threads)", backend.caps(), backend.num_threads());
+        (m, label)
+    };
     let template = match template_override {
         None | Some("auto") => ChatTemplate::from_gguf(&gguf),
         Some(name) => ChatTemplate::from_name(name).ok_or_else(|| {
@@ -66,23 +93,20 @@ pub fn run_server(
     );
     println!("  Listen:   http://{addr}");
     println!(
-        "  Model:    {model_id} ({arch}, {:.1}M params) | tmpl={} | packed={:.0}MB | KV: {} ({:.1} MB)",
+        "  Model:    {model_id} ({arch}, {:.1}M params) | tmpl={} | {}={:.0}MB | KV: {} ({:.1} MB)",
         gguf.total_parameters() as f64 / 1e6,
         template.name(),
+        if use_gpu { "vram" } else { "packed" },
         model.packed_bytes() as f64 / (1024.0 * 1024.0),
         model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
     );
-    println!(
-        "  Hardware: {} ({} threads)",
-        backend.caps(),
-        backend.num_threads()
-    );
+    println!("  Hardware: {hw_label}");
     println!("  Endpoints:");
     println!("    GET  /health");
     println!("    GET  /v1/models");
-    println!("    POST /v1/chat/completions  (multi-turn, SSE, json_object, stop, prefix-cache)");
-    println!("    POST /v1/completions       (IDE FIM tab autocomplete, SSE/JSON)");
+    println!("    POST /v1/chat/completions  (multi-turn, tools/function calling, SSE, json_object, prefix-cache)");
+    println!("    POST /v1/completions       (IDE FIM tab autocomplete: Qwen/DeepSeek/StarCoder2, SSE/JSON)");
     println!("    POST /v1/celestia/propose  (Lenout strict SchemaGrammar + prefix-cache)");
     println!("============================================================");
 
@@ -97,6 +121,7 @@ pub fn run_server(
                     template,
                     &arch,
                     &model_id,
+                    &hw_label,
                 ) {
                     eprintln!("[Caelum Server] Request error: {e}");
                 }
@@ -116,6 +141,7 @@ fn handle_connection(
     template: ChatTemplate,
     arch: &str,
     model_id: &str,
+    hw_label: &str,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -163,7 +189,7 @@ fn handle_connection(
                 escape_json(model_id),
                 escape_json(arch),
                 template.name(),
-                escape_json(backend.name()),
+                escape_json(hw_label),
                 model.kv_mode_label(),
                 backend.num_threads(),
                 now
@@ -193,7 +219,13 @@ fn handle_connection(
                 }
             };
 
-            let messages = parse_chat_messages(&req);
+            let mut messages = parse_openai_messages(&req);
+            let (tools, tool_choice) = parse_tools_and_choice(&req);
+            let tools_active = !tools.is_empty() && tool_choice != ToolChoice::None;
+            if tools_active {
+                inject_tools_into_messages(&mut messages, &tools, &tool_choice);
+            }
+
             let max_tokens = req
                 .get("max_completion_tokens")
                 .or_else(|| req.get("max_tokens"))
@@ -203,7 +235,7 @@ fn handle_connection(
                 .get("temperature")
                 .and_then(JsonValue::as_f64)
                 .map(|v| v as f32)
-                .unwrap_or(0.7);
+                .unwrap_or(if tools_active { 0.2 } else { 0.7 });
             let top_p = req
                 .get("top_p")
                 .and_then(JsonValue::as_f64)
@@ -229,7 +261,7 @@ fn handle_connection(
                 ..Default::default()
             };
 
-            let mut json_g = if json_mode {
+            let mut json_g = if json_mode && !tools_active {
                 Some(JsonGrammar::new())
             } else {
                 None
@@ -242,20 +274,61 @@ fn handle_connection(
                 stream.write_all(header.as_bytes())?;
                 stream.flush()?;
 
-                let cmpl_id = format!("chatcmpl-caelum-{}", unix_ts());
                 let created = unix_ts();
+                let cmpl_id = format!("chatcmpl-caelum-{created}");
                 let mut write_err = false;
+                let escaped_model = escape_json(model_id);
 
                 // Initial role delta per OpenAI SSE specification
                 let role_chunk = format!(
-                    "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
-                    cmpl_id,
-                    created,
-                    escape_json(model_id),
+                    "data: {{\"id\":\"{cmpl_id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{escaped_model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
                 );
                 if stream.write_all(role_chunk.as_bytes()).is_err() || stream.flush().is_err() {
                     write_err = true;
                 }
+
+                let emit_text = |s: &mut TcpStream, err: &mut bool, txt: &str| {
+                    if *err || txt.is_empty() {
+                        return;
+                    }
+                    let chunk = format!(
+                        "data: {{\"id\":\"{cmpl_id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{escaped_model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n",
+                        escape_json(txt)
+                    );
+                    if s.write_all(chunk.as_bytes()).is_err() || s.flush().is_err() {
+                        *err = true;
+                    }
+                };
+
+                let emit_event = |s: &mut TcpStream, err: &mut bool, ev: StreamEvent<'_>| match ev {
+                    StreamEvent::Text(txt) => emit_text(s, err, txt),
+                    StreamEvent::ToolCall(idx, call) => {
+                        if *err {
+                            return;
+                        }
+                        let head = format!(
+                            "data: {{\"id\":\"{cmpl_id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{escaped_model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{idx},\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                            escape_json(&call.id),
+                            escape_json(&call.name),
+                        );
+                        let args = format!(
+                            "data: {{\"id\":\"{cmpl_id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{escaped_model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{idx},\"function\":{{\"arguments\":\"{}\"}}}}]}},\"finish_reason\":null}}]}}\n\n",
+                            escape_json(&call.arguments_json),
+                        );
+                        if s.write_all(head.as_bytes()).is_err()
+                            || s.write_all(args.as_bytes()).is_err()
+                            || s.flush().is_err()
+                        {
+                            *err = true;
+                        }
+                    }
+                };
+
+                let mut tool_filter = if tools_active {
+                    Some(ToolStreamFilter::new(&tools, created))
+                } else {
+                    None
+                };
 
                 let (_, stats) = model.generate_with_stop(
                     backend,
@@ -269,25 +342,24 @@ fn handle_connection(
                         if write_err || piece.is_empty() {
                             return;
                         }
-                        let chunk = format!(
-                            "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n",
-                            cmpl_id,
-                            created,
-                            escape_json(model_id),
-                            escape_json(piece)
-                        );
-                        if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
-                            write_err = true;
+                        if let Some(ref mut filter) = tool_filter {
+                            filter.push(piece, |ev| emit_event(stream, &mut write_err, ev));
+                        } else {
+                            emit_text(stream, &mut write_err, piece);
                         }
                     },
                 )?;
 
+                let mut has_tool_calls = false;
+                if let Some(ref mut filter) = tool_filter {
+                    filter.finish(|ev| emit_event(stream, &mut write_err, ev));
+                    has_tool_calls = filter.emitted_tool_calls > 0;
+                }
+
                 if !write_err {
+                    let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
                     let final_chunk = format!(
-                        "data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{},\"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}}}\n\ndata: [DONE]\n\n",
-                        cmpl_id,
-                        created,
-                        escape_json(model_id),
+                        "data: {{\"id\":\"{cmpl_id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{escaped_model}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{},\"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}}}\n\ndata: [DONE]\n\n",
                         stats.prompt_tokens,
                         stats.generated_tokens,
                         stats.prompt_tokens + stats.generated_tokens,
@@ -311,12 +383,42 @@ fn handle_connection(
             )?;
 
             let now = unix_ts();
+            let (content_opt, tool_calls) = if tools_active {
+                extract_tool_calls(&output, &tools, now)
+            } else {
+                (Some(output), Vec::new())
+            };
+
+            let (message_json, finish_reason) = if !tool_calls.is_empty() {
+                let content_field = match content_opt {
+                    Some(ref c) => format!(r#""{}""#, escape_json(c)),
+                    None => "null".to_string(),
+                };
+                let calls_json: Vec<String> =
+                    tool_calls.iter().map(|c| c.to_openai_json()).collect();
+                (
+                    format!(
+                        r#"{{"role":"assistant","content":{},"tool_calls":[{}]}}"#,
+                        content_field,
+                        calls_json.join(",")
+                    ),
+                    "tool_calls",
+                )
+            } else {
+                let text = content_opt.unwrap_or_default();
+                (
+                    format!(r#"{{"role":"assistant","content":"{}"}}"#, escape_json(&text)),
+                    "stop",
+                )
+            };
+
             let resp = format!(
-                r#"{{"id":"chatcmpl-caelum-{}","object":"chat.completion","created":{},"model":"{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{},"prompt_tokens_details":{{"cached_tokens":{}}},"prefill_tps":{:.2},"decode_tps":{:.2}}}}}"#,
+                r#"{{"id":"chatcmpl-caelum-{}","object":"chat.completion","created":{},"model":"{}","choices":[{{"index":0,"message":{},"finish_reason":"{}"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{},"prompt_tokens_details":{{"cached_tokens":{}}},"prefill_tps":{:.2},"decode_tps":{:.2}}}}}"#,
                 now,
                 now,
                 escape_json(model_id),
-                escape_json(&output),
+                message_json,
+                finish_reason,
                 stats.prompt_tokens,
                 stats.generated_tokens,
                 stats.prompt_tokens + stats.generated_tokens,
@@ -365,12 +467,14 @@ fn handle_connection(
                 .unwrap_or(false);
             let stop_seqs = parse_stop_sequences(&req);
 
-            // Auto-format Qwen2.5-Coder / DeepSeek FIM when `suffix` is supplied
+            // Auto-format Qwen2.5-Coder / DeepSeek / StarCoder2 FIM when `suffix` is supplied
             let effective_prompt = if let Some(suf) = suffix {
                 if tokenizer.token_id("<|fim_prefix|>").is_some() {
                     format!("<|fim_prefix|>{prompt_raw}<|fim_suffix|>{suf}<|fim_middle|>")
                 } else if tokenizer.token_id("<｜fim▁begin｜>").is_some() {
                     format!("<｜fim▁begin｜>{prompt_raw}<｜fim▁hole｜>{suf}<｜fim▁end｜>")
+                } else if tokenizer.token_id("<fim_prefix>").is_some() {
+                    format!("<fim_prefix>{prompt_raw}<fim_suffix>{suf}<fim_middle>")
                 } else {
                     prompt_raw
                 }
@@ -532,40 +636,6 @@ fn handle_connection(
         }
         _ => write_response(stream, "404 Not Found", r#"{"error":"route not found"}"#),
     }
-}
-
-fn parse_chat_messages(req: &JsonValue) -> Vec<ChatMessage> {
-    let mut out = Vec::new();
-    if let Some(arr) = req.get("messages").and_then(JsonValue::as_array) {
-        for item in arr {
-            let role = match item.get("role").and_then(JsonValue::as_str).unwrap_or("user") {
-                "system" | "developer" => ChatRole::System,
-                "assistant" => ChatRole::Assistant,
-                _ => ChatRole::User,
-            };
-            let content = match item.get("content") {
-                Some(JsonValue::Str(s)) => s.clone(),
-                Some(JsonValue::Array(parts)) => {
-                    let mut combined = String::new();
-                    for p in parts {
-                        if let Some(txt) = p.get("text").and_then(JsonValue::as_str) {
-                            combined.push_str(txt);
-                        }
-                    }
-                    combined
-                }
-                _ => String::new(),
-            };
-            out.push(ChatMessage { role, content });
-        }
-    }
-    if out.is_empty() {
-        out.push(ChatMessage {
-            role: ChatRole::User,
-            content: "Hello".to_string(),
-        });
-    }
-    out
 }
 
 fn parse_stop_sequences(req: &JsonValue) -> Vec<String> {

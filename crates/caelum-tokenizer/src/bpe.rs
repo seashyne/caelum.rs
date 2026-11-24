@@ -259,6 +259,9 @@ impl Tokenizer {
                     | "<|end_of_text|>"
                     | "<|EOT|>"
                     | "<｜end▁of▁sentence｜>"
+                    | "<end_of_turn>"
+                    | "<|end|>"
+                    | "<|file_sep|>"
                     | "</s>"
                     | "</assistant>"
             )

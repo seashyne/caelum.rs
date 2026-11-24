@@ -137,6 +137,7 @@ impl KvCache {
     }
 
     /// Computes causal attention output for a single query head `qh` against cached `0..=max_t`.
+    #[allow(clippy::too_many_arguments)]
     pub fn attend_head(
         &self,
         backend: &dyn Backend,
@@ -148,22 +149,58 @@ impl KvCache {
         att_buf: &mut [f32],
         out_head: &mut [f32],
     ) {
+        self.attend_head_ext(
+            backend, layer, kv_head, qh, max_t, scale, None, 0.0, att_buf, out_head,
+        );
+    }
+
+    /// Extended causal attention supporting Sliding Window Attention (Gemma-2/3, Phi-3, Mistral,
+    /// StarCoder2) and Attention Logit Soft-Capping (`softcap * tanh(score / softcap)`, Gemma-2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_head_ext(
+        &self,
+        backend: &dyn Backend,
+        layer: usize,
+        kv_head: usize,
+        qh: &[f32],
+        max_t: usize,
+        scale: f32,
+        sliding_window: Option<usize>,
+        logit_softcap: f32,
+        att_buf: &mut [f32],
+        out_head: &mut [f32],
+    ) {
         let head_dim = self.head_dim;
         let kv_dim = self.num_kv_heads * head_dim;
         out_head.fill(0.0);
+        let t_start = match sliding_window {
+            Some(w) if w > 0 => max_t.saturating_sub(w - 1),
+            _ => 0,
+        };
+        let win_len = max_t - t_start + 1;
+        let att_slice = &mut att_buf[..win_len];
+        let inv_cap = if logit_softcap > 0.0 {
+            1.0 / logit_softcap
+        } else {
+            0.0
+        };
 
         match &self.storage {
             KvStorage::F32 { k, v } => {
                 let kv_off = kv_head * head_dim;
                 let layer_base = layer * self.max_seq_len * kv_dim;
-                for t in 0..=max_t {
+                for (wi, t) in (t_start..=max_t).enumerate() {
                     let off = layer_base + t * kv_dim + kv_off;
-                    att_buf[t] = backend.dot_f32(qh, &k[off..off + head_dim]) * scale;
+                    let mut score = backend.dot_f32(qh, &k[off..off + head_dim]) * scale;
+                    if logit_softcap > 0.0 {
+                        score = logit_softcap * (score * inv_cap).tanh();
+                    }
+                    att_slice[wi] = score;
                 }
-                backend.softmax(&mut att_buf[..=max_t]);
+                backend.softmax(att_slice);
 
-                for t in 0..=max_t {
-                    let a = att_buf[t];
+                for (wi, t) in (t_start..=max_t).enumerate() {
+                    let a = att_slice[wi];
                     let off = layer_base + t * kv_dim + kv_off;
                     let vt = &v[off..off + head_dim];
                     for d in 0..head_dim {
@@ -187,14 +224,18 @@ impl KvCache {
                 let q_blocks = &mut q_q8[..bph];
                 quantize_row_q8_0(qh, q_blocks);
 
-                for t in 0..=max_t {
+                for (wi, t) in (t_start..=max_t).enumerate() {
                     let off = layer_base + t * blocks_per_pos + h_off;
-                    att_buf[t] = backend.dot_q8_0(q_blocks, &k[off..off + bph]) * scale;
+                    let mut score = backend.dot_q8_0(q_blocks, &k[off..off + bph]) * scale;
+                    if logit_softcap > 0.0 {
+                        score = logit_softcap * (score * inv_cap).tanh();
+                    }
+                    att_slice[wi] = score;
                 }
-                backend.softmax(&mut att_buf[..=max_t]);
+                backend.softmax(att_slice);
 
-                for t in 0..=max_t {
-                    let a = att_buf[t];
+                for (wi, t) in (t_start..=max_t).enumerate() {
+                    let a = att_slice[wi];
                     let off = layer_base + t * blocks_per_pos + h_off;
                     let v_blocks = &v[off..off + bph];
                     for (bi, blk) in v_blocks.iter().enumerate() {

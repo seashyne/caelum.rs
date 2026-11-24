@@ -24,6 +24,10 @@ pub enum ChatTemplate {
     Qwen3NoThink,
     /// `<|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>` (Llama 3 / 3.1 / 3.2).
     Llama3,
+    /// `<start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n` (Gemma 2 / Gemma 3).
+    Gemma,
+    /// `<|system|>\n...<|end|>\n<|user|>\n...<|end|>\n<|assistant|>\n` (Phi-3).
+    Phi3,
     /// DeepSeek-V2 / DeepSeek-Coder-V2 (`User: ...\n\nAssistant:`).
     DeepSeekV2,
     /// DeepSeek-Coder v1 (`### Instruction:\n...\n### Response:\n`).
@@ -51,6 +55,12 @@ impl ChatTemplate {
             if tmpl.contains("<|start_header_id|>") {
                 return ChatTemplate::Llama3;
             }
+            if tmpl.contains("<start_of_turn>") {
+                return ChatTemplate::Gemma;
+            }
+            if tmpl.contains("<|user|>") && tmpl.contains("<|end|>") {
+                return ChatTemplate::Phi3;
+            }
             if tmpl.contains("### Instruction:") {
                 return ChatTemplate::DeepSeekV1;
             }
@@ -69,6 +79,9 @@ impl ChatTemplate {
     pub fn from_architecture(arch: &str) -> Self {
         match arch {
             "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" => ChatTemplate::ChatMl,
+            "gemma" | "gemma2" | "gemma3" => ChatTemplate::Gemma,
+            "phi3" => ChatTemplate::Phi3,
+            "starcoder2" => ChatTemplate::Raw,
             "deepseek2" => ChatTemplate::DeepSeekV2,
             "mistral" => ChatTemplate::Mistral,
             "celestia" => ChatTemplate::Celestia,
@@ -80,14 +93,16 @@ impl ChatTemplate {
     /// Parses a user-supplied `--template <name>` CLI flag.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
-            "chatml" | "qwen" | "qwen2" | "qwen3" => Some(ChatTemplate::ChatMl),
+            "chatml" | "qwen" | "qwen2" | "qwen3" | "phi4" => Some(ChatTemplate::ChatMl),
             "qwen3-nothink" | "nothink" => Some(ChatTemplate::Qwen3NoThink),
             "llama3" | "llama" => Some(ChatTemplate::Llama3),
+            "gemma" | "gemma2" | "gemma3" => Some(ChatTemplate::Gemma),
+            "phi3" | "phi" => Some(ChatTemplate::Phi3),
             "deepseek2" | "deepseek-v2" | "deepseek" => Some(ChatTemplate::DeepSeekV2),
             "deepseek-v1" | "deepseek-coder" => Some(ChatTemplate::DeepSeekV1),
             "mistral" | "codellama" | "codestral" => Some(ChatTemplate::Mistral),
             "celestia" => Some(ChatTemplate::Celestia),
-            "raw" => Some(ChatTemplate::Raw),
+            "raw" | "starcoder2" => Some(ChatTemplate::Raw),
             _ => None,
         }
     }
@@ -97,6 +112,8 @@ impl ChatTemplate {
             ChatTemplate::ChatMl => "chatml",
             ChatTemplate::Qwen3NoThink => "qwen3-nothink",
             ChatTemplate::Llama3 => "llama3",
+            ChatTemplate::Gemma => "gemma",
+            ChatTemplate::Phi3 => "phi3",
             ChatTemplate::DeepSeekV2 => "deepseek2",
             ChatTemplate::DeepSeekV1 => "deepseek-v1",
             ChatTemplate::Mistral => "mistral",
@@ -138,6 +155,44 @@ impl ChatTemplate {
                 }
                 if add_generation_prompt {
                     out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+                }
+            }
+            ChatTemplate::Gemma => {
+                let mut pending_sys: Option<&str> = None;
+                for m in messages {
+                    match m.role {
+                        ChatRole::System => pending_sys = Some(m.content.as_str()),
+                        ChatRole::User => {
+                            out.push_str("<start_of_turn>user\n");
+                            if let Some(sys) = pending_sys.take() {
+                                out.push_str(sys);
+                                out.push_str("\n\n");
+                            }
+                            out.push_str(&m.content);
+                            out.push_str("<end_of_turn>\n");
+                        }
+                        ChatRole::Assistant => {
+                            out.push_str("<start_of_turn>model\n");
+                            out.push_str(&m.content);
+                            out.push_str("<end_of_turn>\n");
+                        }
+                    }
+                }
+                if add_generation_prompt {
+                    out.push_str("<start_of_turn>model\n");
+                }
+            }
+            ChatTemplate::Phi3 => {
+                for m in messages {
+                    let tag = match m.role {
+                        ChatRole::System => "system",
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "assistant",
+                    };
+                    out.push_str(&format!("<|{tag}|>\n{}<|end|>\n", m.content));
+                }
+                if add_generation_prompt {
+                    out.push_str("<|assistant|>\n");
                 }
             }
             ChatTemplate::DeepSeekV2 => {

@@ -70,6 +70,77 @@ impl JsonValue {
             _ => None,
         }
     }
+
+    /// Serializes this `JsonValue` into compact, RFC-8259-compliant JSON text.
+    pub fn to_json_string(&self) -> String {
+        let mut out = String::new();
+        self.write_json(&mut out);
+        out
+    }
+
+    fn write_json(&self, out: &mut String) {
+        match self {
+            JsonValue::Null => out.push_str("null"),
+            JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            JsonValue::Number(n) => {
+                if !n.is_finite() {
+                    out.push_str("null");
+                } else if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
+                    out.push_str(&format!("{}", *n as i64));
+                } else {
+                    out.push_str(&format!("{n}"));
+                }
+            }
+            JsonValue::Str(s) => {
+                out.push('"');
+                write_escaped_json_str(s, out);
+                out.push('"');
+            }
+            JsonValue::Array(arr) => {
+                out.push('[');
+                for (i, item) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write_json(out);
+                }
+                out.push(']');
+            }
+            JsonValue::Object(map) => {
+                out.push('{');
+                for (i, (k, v)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('"');
+                    write_escaped_json_str(k, out);
+                    out.push_str("\":");
+                    v.write_json(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+}
+
+pub fn write_escaped_json_str(s: &str, out: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+}
+
+pub fn escape_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    write_escaped_json_str(s, &mut out);
+    out
 }
 
 struct Parser<'a> {

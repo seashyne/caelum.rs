@@ -8,11 +8,17 @@ pub mod llama_qwen;
 pub mod moe;
 pub mod rope;
 pub mod sampler;
+#[cfg(feature = "gpu")]
+pub mod wgpu_runner;
 
 use caelum_core::{CaelumError, Result};
 use caelum_gguf::GgufFile;
 use caelum_kernels::Backend;
+#[cfg(feature = "gpu")]
+use caelum_kernels::GpuContext;
 use caelum_tokenizer::{JsonGrammar, LogitGrammar, Tokenizer};
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 use std::time::Instant;
 
 pub use cache::{KvCache, KvPrecision, MlaLatentCache};
@@ -22,6 +28,8 @@ pub use llama_qwen::{LlamaQwenConfig, LlamaQwenModel};
 pub use moe::{ExpertGating, MoeConfig};
 pub use rope::{RopeConfig, RopeScalingType, RopeTable};
 pub use sampler::{Sampler, SamplerConfig};
+#[cfg(feature = "gpu")]
+pub use wgpu_runner::WgpuLlamaQwenModel;
 
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
@@ -60,6 +68,8 @@ impl GenerationStats {
 
 enum ModelInner<'a> {
     LlamaQwen(LlamaQwenModel<'a>),
+    #[cfg(feature = "gpu")]
+    WgpuLlamaQwen(WgpuLlamaQwenModel<'a>),
     DeepSeek2(DeepSeek2Model<'a>),
     Celestia(CelestiaModel<'a>),
 }
@@ -84,7 +94,17 @@ impl<'a> CaelumModel<'a> {
         let inner = match arch {
             "celestia" => ModelInner::Celestia(CelestiaModel::from_gguf(gguf, max_seq_len)?),
             "deepseek2" => ModelInner::DeepSeek2(DeepSeek2Model::from_gguf(gguf, max_seq_len)?),
-            "llama" | "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "mistral" => {
+            "llama"
+            | "qwen2"
+            | "qwen2moe"
+            | "qwen3"
+            | "qwen3moe"
+            | "gemma"
+            | "gemma2"
+            | "gemma3"
+            | "phi3"
+            | "starcoder2"
+            | "mistral" => {
                 ModelInner::LlamaQwen(LlamaQwenModel::from_gguf_with_kv(
                     gguf,
                     max_seq_len,
@@ -93,7 +113,7 @@ impl<'a> CaelumModel<'a> {
             }
             other => {
                 return Err(CaelumError::InvalidFormat(format!(
-                    "unsupported GGUF architecture '{other}' (supported: llama, qwen2, qwen2moe, qwen3, qwen3moe, deepseek2, mistral, celestia)"
+                    "unsupported GGUF architecture '{other}' (supported: llama, qwen2, qwen2moe, qwen3, qwen3moe, gemma2, gemma3, phi3, starcoder2, deepseek2, mistral, celestia)"
                 )))
             }
         };
@@ -103,11 +123,37 @@ impl<'a> CaelumModel<'a> {
         })
     }
 
+    /// Loads a model directly onto a `wgpu` GPU (Vulkan / Metal / DX12) with 100% VRAM-resident
+    /// weights, activations, and KV cache.
+    #[cfg(feature = "gpu")]
+    pub fn from_gguf_gpu(
+        gguf: &'a GgufFile,
+        gpu: Arc<GpuContext>,
+        max_seq_len: Option<usize>,
+    ) -> Result<Self> {
+        let arch = gguf.architecture().unwrap_or("llama");
+        match arch {
+            "llama" | "qwen2" | "qwen3" | "phi3" | "mistral" => Ok(Self {
+                inner: ModelInner::WgpuLlamaQwen(WgpuLlamaQwenModel::from_gguf(
+                    gguf,
+                    gpu,
+                    max_seq_len,
+                )?),
+                cached_tokens: Vec::new(),
+            }),
+            other => Err(CaelumError::InvalidFormat(format!(
+                "wgpu GPU runner does not yet support architecture '{other}' (supported on GPU: llama, qwen2, qwen3, phi3, mistral)"
+            ))),
+        }
+    }
+
     /// Repacks compatible `Q4_K`/`Q6_K` weights into cache-aligned 8-row SIMD tiles for
     /// maximum AVX-VNNI / AVX2+FMA decode and prefill speed.
     pub fn optimize_for_backend(&mut self, backend: &dyn Backend) {
         match &mut self.inner {
             ModelInner::LlamaQwen(m) => m.optimize_for_backend(backend),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(_) => {}
             ModelInner::DeepSeek2(m) => m.optimize_for_backend(backend),
             ModelInner::Celestia(_) => {}
         }
@@ -116,6 +162,8 @@ impl<'a> CaelumModel<'a> {
     pub fn packed_bytes(&self) -> usize {
         match &self.inner {
             ModelInner::LlamaQwen(m) => m.packed_bytes(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.vram_weight_bytes(),
             ModelInner::DeepSeek2(m) => m.packed_bytes(),
             ModelInner::Celestia(_) => 0,
         }
@@ -124,6 +172,8 @@ impl<'a> CaelumModel<'a> {
     pub fn architecture(&self) -> &str {
         match &self.inner {
             ModelInner::LlamaQwen(m) => &m.config.arch,
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => &m.config.arch,
             ModelInner::DeepSeek2(_) => "deepseek2",
             ModelInner::Celestia(_) => "celestia",
         }
@@ -132,6 +182,8 @@ impl<'a> CaelumModel<'a> {
     pub fn vocab_size(&self) -> usize {
         match &self.inner {
             ModelInner::LlamaQwen(m) => m.config.vocab_size,
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.config.vocab_size,
             ModelInner::DeepSeek2(m) => m.config.vocab_size,
             ModelInner::Celestia(m) => m.config.vocab_size,
         }
@@ -140,6 +192,8 @@ impl<'a> CaelumModel<'a> {
     pub fn max_seq_len(&self) -> usize {
         match &self.inner {
             ModelInner::LlamaQwen(m) => m.max_seq_len(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.max_seq_len(),
             ModelInner::DeepSeek2(m) => m.max_seq_len(),
             ModelInner::Celestia(m) => m.max_seq_len(),
         }
@@ -148,6 +202,8 @@ impl<'a> CaelumModel<'a> {
     pub fn kv_cache_bytes(&self) -> usize {
         match &self.inner {
             ModelInner::LlamaQwen(m) => m.kv_cache_bytes(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.kv_cache_bytes(),
             ModelInner::DeepSeek2(m) => m.kv_cache_bytes(),
             ModelInner::Celestia(m) => m.kv_cache_bytes(),
         }
@@ -159,6 +215,8 @@ impl<'a> CaelumModel<'a> {
                 KvPrecision::F32 => "GQA-F32",
                 KvPrecision::Q8_0 => "GQA-Q8_0",
             },
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(_) => "VRAM-GQA-F32",
             ModelInner::DeepSeek2(_) => "MLA-Absorbed",
             ModelInner::Celestia(_) => "MLA-Latent",
         }
@@ -168,6 +226,8 @@ impl<'a> CaelumModel<'a> {
         self.cached_tokens.clear();
         match &mut self.inner {
             ModelInner::LlamaQwen(m) => m.reset_cache(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.reset_cache(),
             ModelInner::DeepSeek2(m) => m.reset_cache(),
             ModelInner::Celestia(m) => m.reset_cache(),
         }
@@ -182,6 +242,8 @@ impl<'a> CaelumModel<'a> {
     ) -> Result<&[f32]> {
         match &mut self.inner {
             ModelInner::LlamaQwen(m) => m.forward_token(backend, token_id, pos, compute_logits),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.forward_token(token_id, pos, compute_logits),
             ModelInner::DeepSeek2(m) => m.forward_token(backend, token_id, pos, compute_logits),
             ModelInner::Celestia(m) => m.forward_token(backend, token_id, pos, compute_logits),
         }
@@ -198,6 +260,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => {
                 m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.forward_batch(tokens, start_pos, compute_last_logits),
             ModelInner::DeepSeek2(m) => {
                 m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
@@ -322,6 +386,10 @@ impl<'a> CaelumModel<'a> {
         let mut last_logits_vec = match &mut self.inner {
             ModelInner::LlamaQwen(m) => {
                 m.forward_batch(backend, uncached, common, true)?.to_vec()
+            }
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => {
+                m.forward_batch(uncached, common, true)?.to_vec()
             }
             ModelInner::DeepSeek2(m) => {
                 m.forward_batch(backend, uncached, common, true)?.to_vec()
