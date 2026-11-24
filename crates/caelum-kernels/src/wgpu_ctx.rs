@@ -206,30 +206,74 @@ impl GpuContext {
         )
     }
 
-    /// Uploads raw quantized/F32 tensor bytes into GPU VRAM, padding to a 4-byte multiple.
+    /// Flushes pending `queue.write_buffer` DMA transfers to VRAM and reclaims staging memory
+    /// so loading large 7B–14B+ models never accumulates gigabytes of staging RAM or hits Swap.
+    pub fn flush_uploads(&self) {
+        self.queue.submit([]);
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+    }
+
+    /// Streams raw quantized/F32 tensor bytes directly into GPU VRAM in bounded `16 MiB` DMA
+    /// chunks (`mapped_at_creation: false`), padding to a 4-byte multiple with minimal RAM usage.
     pub fn upload_raw_padded(&self, label: &str, data: &[u8]) -> wgpu::Buffer {
         let padded_len = ((data.len() + 3) & !3).max(4);
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: padded_len as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        {
-            let mut view = buf.get_mapped_range_mut(..).expect("mapped GPU buffer");
-            view.slice(..data.len()).copy_from_slice(data);
-            if padded_len > data.len() {
-                let pad = padded_len - data.len();
-                view.slice(data.len()..padded_len)
-                    .copy_from_slice(&[0u8; 4][..pad]);
+        if data.is_empty() {
+            return buf;
+        }
+        const CHUNK: usize = 16 * 1024 * 1024; // 16 MiB (multiple of 4)
+        let aligned_main = data.len() & !3;
+        let mut off = 0usize;
+        while off < aligned_main {
+            let end = (off + CHUNK).min(aligned_main);
+            self.queue.write_buffer(&buf, off as u64, &data[off..end]);
+            off = end;
+            if aligned_main > CHUNK && off < aligned_main {
+                self.flush_uploads();
             }
         }
-        buf.unmap();
+        if aligned_main < data.len() {
+            let mut tail = [0u8; 4];
+            let rem = data.len() - aligned_main;
+            tail[..rem].copy_from_slice(&data[aligned_main..]);
+            self.queue.write_buffer(&buf, aligned_main as u64, &tail);
+        }
+        buf
+    }
+
+    /// Uploads concatenated slices directly into ONE VRAM storage buffer with zero intermediate
+    /// CPU allocation (used for fused `Q4_K` `[wq; wk; wv]` where each slice is 4-byte aligned).
+    pub fn upload_concat_aligned(&self, label: &str, slices: &[&[u8]]) -> wgpu::Buffer {
+        let total: usize = slices.iter().map(|s| s.len()).sum();
+        let padded_len = ((total + 3) & !3).max(4);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: padded_len as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut off = 0usize;
+        for s in slices {
+            debug_assert_eq!(s.len() % 4, 0);
+            if !s.is_empty() {
+                self.queue.write_buffer(&buf, off as u64, s);
+                off += s.len();
+            }
+        }
         buf
     }
 
     /// Repacks GGML `Q6_K` (`210` bytes/block) into 4-byte-aligned GPU blocks (`212` bytes = `53 u32`/block)
-    /// with pre-decoded `f32` block scale `d`, enabling 100% coalesced `u32` GPU loads (+0.95% VRAM).
+    /// with pre-decoded `f32` block scale `d`, streaming in bounded `~13.8 MiB` CPU chunks via
+    /// `queue.write_buffer` (fast contiguous DMA, zero write-combining stalls, <16 MiB peak RAM).
     pub fn upload_q6k_aligned(&self, label: &str, raw: &[u8]) -> wgpu::Buffer {
         debug_assert_eq!(raw.len() % 210, 0);
         let n_blocks = raw.len() / 210;
@@ -238,21 +282,32 @@ impl GpuContext {
             label: Some(label),
             size: out_bytes as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: false,
         });
-        {
-            let mut view = buf.get_mapped_range_mut(..).expect("mapped Q6_K GPU buffer");
-            let mut tmp = [0u8; 212];
-            for b in 0..n_blocks {
-                let src = &raw[b * 210..(b + 1) * 210];
-                tmp[0..208].copy_from_slice(&src[0..208]);
+        if n_blocks == 0 {
+            return buf;
+        }
+        const CHUNK_BLOCKS: usize = 65_536; // 65536 * 212 B = ~13.89 MiB
+        let cap_blocks = n_blocks.min(CHUNK_BLOCKS);
+        let mut scratch = vec![0u8; cap_blocks * 212];
+        let mut blk_off = 0usize;
+        while blk_off < n_blocks {
+            let count = (n_blocks - blk_off).min(CHUNK_BLOCKS);
+            for i in 0..count {
+                let src = &raw[(blk_off + i) * 210..(blk_off + i + 1) * 210];
+                let dst = &mut scratch[i * 212..(i + 1) * 212];
+                dst[0..208].copy_from_slice(&src[0..208]);
                 let d_f16 = u16::from_le_bytes([src[208], src[209]]);
                 let d_f32 = f16_to_f32(d_f16);
-                tmp[208..212].copy_from_slice(&d_f32.to_le_bytes());
-                view.slice(b * 212..(b + 1) * 212).copy_from_slice(&tmp);
+                dst[208..212].copy_from_slice(&d_f32.to_le_bytes());
+            }
+            self.queue
+                .write_buffer(&buf, (blk_off * 212) as u64, &scratch[..count * 212]);
+            blk_off += count;
+            if n_blocks > CHUNK_BLOCKS && blk_off < n_blocks {
+                self.flush_uploads();
             }
         }
-        buf.unmap();
         buf
     }
 

@@ -190,6 +190,7 @@ impl<'a> WgpuLlamaQwenModel<'a> {
 
         let output_norm = gpu.upload_f32("output_norm", &output_norm_vec);
         let output_weight = upload_view("lm_head", output_weight_view, &mut vram_weight_bytes)?;
+        gpu.flush_uploads();
 
         // Pre-upload all `attn_norm` buffers first so layer `l` can bind fused `res + next_attn_norm`!
         let mut attn_norms = Vec::with_capacity(config.num_layers);
@@ -241,18 +242,16 @@ impl<'a> WgpuLlamaQwenModel<'a> {
             let bk_v = opt_f32_vec(format!("blk.{i}.attn_k.bias"))?;
             let bv_v = opt_f32_vec(format!("blk.{i}.attn_v.bias"))?;
 
-            // Fuse Q+K+V+Bias into ONE single dispatch whenever all 3 are Q4_K!
+            // Fuse Q+K+V+Bias into ONE single dispatch whenever all 3 are Q4_K (zero CPU copy!)
             let qkv = if wq_v.dtype == DType::Q4_K
                 && wk_v.dtype == DType::Q4_K
                 && wv_v.dtype == DType::Q4_K
             {
-                let mut combined =
-                    Vec::with_capacity(wq_v.data.len() + wk_v.data.len() + wv_v.data.len());
-                combined.extend_from_slice(wq_v.data);
-                combined.extend_from_slice(wk_v.data);
-                combined.extend_from_slice(wv_v.data);
-                vram_weight_bytes += combined.len();
-                let w_qkv = gpu.upload_raw_padded(&format!("l{i}.w_qkv"), &combined);
+                vram_weight_bytes += wq_v.data.len() + wk_v.data.len() + wv_v.data.len();
+                let w_qkv = gpu.upload_concat_aligned(
+                    &format!("l{i}.w_qkv"),
+                    &[wq_v.data, wk_v.data, wv_v.data],
+                );
 
                 let has_bias = bq_v.is_some() || bk_v.is_some() || bv_v.is_some();
                 let b_qkv = if has_bias {
@@ -364,6 +363,8 @@ impl<'a> WgpuLlamaQwenModel<'a> {
                 bg_w_down,
                 bg_res_next_attn_norm,
             });
+            // Flush this layer's DMA writes into VRAM & reclaim staging RAM immediately!
+            gpu.flush_uploads();
         }
         // Move actual `attn_norm` buffers into each layer so they stay alive!
         for (layer, an_buf) in layers.iter_mut().zip(attn_norms.into_iter()) {
