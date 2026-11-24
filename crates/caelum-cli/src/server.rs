@@ -103,7 +103,8 @@ pub fn run_server(
     );
     println!("  Hardware: {hw_label}");
     println!("  Endpoints:");
-    println!("    GET  / or /docs            (Interactive Web Docs & Live Playground)");
+    println!("    GET  / or /chat            (Interactive Web Chat — Claude/ChatGPT style)");
+    println!("    GET  /docs                 (Interactive Web Docs & API Reference)");
     println!("    GET  /health");
     println!("    GET  /v1/models");
     println!("    POST /v1/chat/completions  (multi-turn, tools/function calling, SSE, json_object, prefix-cache)");
@@ -182,7 +183,10 @@ fn handle_connection(
     }
 
     match (method, path) {
-        ("GET", "/") | ("GET", "/docs") | ("HEAD", "/") | ("HEAD", "/docs") => {
+        ("GET", "/") | ("GET", "/chat") | ("HEAD", "/") | ("HEAD", "/chat") => {
+            write_html_response(stream, "200 OK", crate::chat_html::CHAT_HTML)
+        }
+        ("GET", "/docs") | ("HEAD", "/docs") => {
             write_html_response(stream, "200 OK", crate::docs_html::DOCS_HTML)
         }
         ("GET", "/health") => {

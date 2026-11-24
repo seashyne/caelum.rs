@@ -1,5 +1,6 @@
 //! Caelum CLI: Pure Rust ARMv9-first LLM Inference Engine for Celestia, Astraea & Lenout.
 
+mod chat_html;
 mod docs_html;
 mod json;
 mod lenout;
