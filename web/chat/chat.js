@@ -279,6 +279,7 @@ async function handleSend() {
   abortController = new AbortController();
   let fullResponse = '';
   let tokenCount = 0;
+  let cachedTokens = 0;
   let firstTokenTime = null;
   const startTime = performance.now();
 
@@ -327,6 +328,9 @@ async function handleSend() {
           if (payload === '[DONE]') break;
           try {
             const parsed = JSON.parse(payload);
+            if (parsed.usage?.prompt_tokens_details?.cached_tokens != null) {
+              cachedTokens = parsed.usage.prompt_tokens_details.cached_tokens;
+            }
             const delta = parsed.choices?.[0]?.delta?.content || '';
             if (delta) {
               if (!firstTokenTime) firstTokenTime = performance.now();
@@ -352,7 +356,8 @@ async function handleSend() {
     const totalSec = Math.max((performance.now() - startTime) / 1000, 0.001);
     const ttft = firstTokenTime ? ((firstTokenTime - startTime) / 1000).toFixed(2) : '0.00';
     const tokPerSec = (tokenCount / totalSec).toFixed(1);
-    const hudStr = `<span class="hud-tag">${tokPerSec} tok/s</span> · ${tokenCount} tokens · TTFT ${ttft}s`;
+    const cacheNote = cachedTokens > 0 ? ` · ${cachedTokens} cached` : '';
+    const hudStr = `<span class="hud-tag">${tokPerSec} tok/s</span> · ${tokenCount} tokens · TTFT ${ttft}s${cacheNote}`;
 
     const hudEl = document.createElement('div');
     hudEl.className = 'message-hud';
@@ -466,19 +471,39 @@ document.getElementById('clear-history-btn').addEventListener('click', () => {
 async function checkHealth() {
   const dot = document.getElementById('topbar-status-dot');
   const name = document.getElementById('topbar-model-name');
+  const slotsPill = document.getElementById('topbar-slots-pill');
+  const slotsText = document.getElementById('topbar-slots-text');
+  const verBadge = document.getElementById('sidebar-version-badge');
+  const footerHint = document.getElementById('engine-footer-hint');
   try {
     const res = await fetch(`${defaultBase}/health`, { signal: AbortSignal.timeout(1500) });
     if (res.ok) {
       const data = await res.json();
       dot.classList.add('online');
       name.textContent = `${data.model} (${(data.architecture || '').toUpperCase()} · ${data.kv_mode})`;
+      if (data.version && verBadge) {
+        verBadge.textContent = `v${data.version}`;
+      }
+      if (slotsPill && slotsText && typeof data.slots_total === 'number') {
+        const active = data.slots_active ?? 0;
+        const queued = data.queue_depth ?? 0;
+        slotsPill.hidden = false;
+        slotsPill.classList.toggle('busy', active > 0 || queued > 0);
+        slotsText.textContent = queued > 0
+          ? `Slots ${active}/${data.slots_total} · Q:${queued}`
+          : `Slots ${active}/${data.slots_total}`;
+      }
+      if (footerHint && data.version) {
+        footerHint.textContent = `Caelum Engine v${data.version} · ${data.batching === 'continuous' ? `Continuous Batching (${data.slots_total ?? 1} slots)` : 'Single-Slot'} · ${data.kv_mode} · 100% Private Local Inference`;
+      }
       return;
     }
   } catch (_) {}
   dot.classList.remove('online');
+  if (slotsPill) slotsPill.hidden = true;
   name.textContent = 'Caelum Offline (run caelum serve --gpu)';
 }
 
 initSessions();
 checkHealth();
-setInterval(checkHealth, 5000);
+setInterval(checkHealth, 3000);

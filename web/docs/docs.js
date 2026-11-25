@@ -3,7 +3,7 @@ const tablist = document.querySelector('[role="tablist"]');
 const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
 const panels = Array.from(document.querySelectorAll('[role="tabpanel"]'));
 
-function selectTab(targetTab) {
+function selectTab(targetTab, { scroll = true } = {}) {
   tabs.forEach(tab => {
     const isSelected = tab === targetTab;
     tab.setAttribute('aria-selected', isSelected ? 'true' : 'false');
@@ -11,9 +11,25 @@ function selectTab(targetTab) {
   });
   panels.forEach(panel => {
     const match = panel.getAttribute('aria-labelledby') === targetTab.id;
-    panel.hidden = !match;
+    if (match) {
+      panel.removeAttribute('hidden');
+    } else {
+      panel.setAttribute('hidden', 'until-found');
+    }
   });
+  if (scroll) {
+    targetTab.scrollIntoView({ block: 'nearest', inline: 'nearest', container: 'nearest' });
+  }
 }
+
+// Automatically switch to a hidden panel when browser Find-in-Page matches text inside it
+panels.forEach(panel => {
+  panel.addEventListener('beforematch', () => {
+    const tabId = panel.getAttribute('aria-labelledby');
+    const matchingTab = tabs.find(t => t.id === tabId);
+    if (matchingTab) selectTab(matchingTab);
+  });
+});
 
 tabs.forEach(tab => {
   tab.addEventListener('click', () => selectTab(tab));
@@ -75,12 +91,19 @@ const defaultBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:800
 async function checkServerHealth() {
   const dot = document.getElementById('status-dot');
   const text = document.getElementById('status-text');
+  const badge = document.getElementById('docs-version-badge');
   try {
     const res = await fetch(`${defaultBase}/health`, { signal: AbortSignal.timeout(1500) });
     if (res.ok) {
       const data = await res.json();
       dot.classList.add('online');
-      text.textContent = `Online: ${data.model} (${data.kv_mode})`;
+      if (data.version && badge) {
+        badge.textContent = `Engine v${data.version}`;
+      }
+      const slotInfo = typeof data.slots_total === 'number'
+        ? ` · Slots ${data.slots_active ?? 0}/${data.slots_total}`
+        : '';
+      text.textContent = `Online: ${data.model} (${data.kv_mode}${slotInfo})`;
       return;
     }
   } catch (_) {}
@@ -88,7 +111,7 @@ async function checkServerHealth() {
   text.textContent = 'Offline (Run caelum serve)';
 }
 checkServerHealth();
-setInterval(checkServerHealth, 5000);
+setInterval(checkServerHealth, 3000);
 
 // Live Interactive Playground
 const pgEndpoint = document.getElementById('pg-endpoint');

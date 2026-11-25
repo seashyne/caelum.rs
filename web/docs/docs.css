@@ -152,6 +152,8 @@ header {
 
 [role="tab"] {
   position: relative;
+  flex: none;
+  scroll-snap-align: start;
   background: none;
   border: none;
   color: var(--text-muted);
@@ -180,7 +182,7 @@ header {
 [role="tabpanel"] {
   display: block;
 }
-[role="tabpanel"][hidden] {
+[role="tabpanel"][hidden]:not([hidden="until-found"]) {
   display: none;
 }
 
@@ -288,29 +290,83 @@ li {
   margin-bottom: 0.25rem;
 }
 
-/* Tables */
+/* Responsive Tables (sticky headers + @container stacked fallback) */
 .table-wrap {
-  overflow-x: auto;
+  overflow: auto;
+  max-inline-size: 100%;
   margin: 1.5rem 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  container-type: inline-size;
+}
+.table-wrap:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
 }
 table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: 0.92rem;
   text-align: left;
+}
+table caption {
+  text-align: left;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0.65rem 1rem;
+  background-color: var(--surface-muted);
+  border-bottom: 1px solid var(--border);
+}
+thead {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
 }
 th, td {
   padding: 0.85rem 1rem;
   border-bottom: 1px solid var(--border);
 }
-th {
+thead th {
   background-color: var(--surface-muted);
   font-weight: 700;
 }
-tr:last-child td {
+tbody th {
+  font-weight: 600;
+  background-color: var(--surface);
+}
+tbody tr:last-child th,
+tbody tr:last-child td {
   border-bottom: none;
+}
+
+@container (width < 560px) {
+  table, thead, tbody, tr, th, td {
+    display: block;
+  }
+  thead {
+    display: none;
+  }
+  tbody tr {
+    border-bottom: 1px solid var(--border);
+    padding: 0.5rem 0;
+  }
+  tbody th {
+    background-color: var(--surface-muted);
+    padding: 0.55rem 0.9rem;
+  }
+  tbody td {
+    border-bottom: none;
+    padding: 0.35rem 0.9rem;
+  }
+  tbody td[data-label]::before {
+    content: attr(data-label) ": ";
+    font-weight: 700;
+    color: var(--text-muted);
+  }
 }
 
 /* Cards */

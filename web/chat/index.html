@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light dark">
-  <title>Caelum AI Chat — Intel Arc B580 Turbo Engine</title>
+  <title>Caelum AI Chat v0.12.0 — Continuous Batching Engine</title>
   <link rel="stylesheet" href="../shared/theme.css">
   <link rel="stylesheet" href="./chat.css">
   <script src="./chat.js" defer></script>
@@ -15,7 +15,7 @@
       <div class="sidebar-header">
         <a href="#" class="app-brand">
           <span>✦ Caelum</span>
-          <span class="app-brand-badge">Arc B580</span>
+          <span class="app-brand-badge" id="sidebar-version-badge">v0.12.0</span>
         </a>
         <button type="button" class="sidebar-toggle-btn" id="close-sidebar-btn" aria-label="Close sidebar">✕</button>
       </div>
@@ -42,9 +42,12 @@
       <div class="chat-topbar">
         <div class="topbar-left">
           <button type="button" class="sidebar-toggle-btn" id="open-sidebar-btn" aria-label="Open sidebar">☰</button>
-          <div class="model-badge">
-            <span class="status-dot" id="topbar-status-dot"></span>
+          <div class="model-badge" aria-live="off">
+            <span class="status-dot" id="topbar-status-dot" aria-hidden="true"></span>
             <span id="topbar-model-name">Loading Caelum Engine...</span>
+          </div>
+          <div class="slots-pill" id="topbar-slots-pill" aria-live="off" hidden>
+            <span id="topbar-slots-text">Slots 0/4</span>
           </div>
         </div>
 
@@ -64,17 +67,17 @@
 
       <div id="messages-container">
         <div class="welcome-hero" id="welcome-hero">
-          <h2>สวัสดีครับ วันนี้มีอะไรให้ Caelum ช่วยไหมครับ?</h2>
-          <p>ระบบประมวลผลบนการ์ดจอ <strong>Intel Arc B580 (Vulkan wgpu)</strong> ความเร็วสูงถึง 128 tok/s ในเครื่องของคุณ 100%</p>
+          <h1>สวัสดีครับ วันนี้มีอะไรให้ Caelum ช่วยไหมครับ?</h1>
+          <p><strong>Caelum v0.12.0</strong> — Pure Rust LLM Engine พร้อม <strong>Multi-User Continuous Batching</strong>, <strong>Split-GGUF</strong>, <strong>Qwen 3.5 / Gemma 4</strong> และ <strong>Ultra-Low RAM</strong> (GPU ~118 MB RSS)</p>
 
           <div class="starter-cards">
             <button type="button" class="starter-card" data-prompt="เขียนฟังก์ชันคำนวณ Fibonacci ในภาษา Rust แบบ Zero-copy และ Benchmark เปรียบเทียบ">
               <div class="starter-card-title">🦀 เขียนโค้ด Rust ความเร็วสูง</div>
               <div class="starter-card-desc">อัลกอริทึม Zero-copy และ SIMD</div>
             </button>
-            <button type="button" class="starter-card" data-prompt="อธิบายเทคนิค Subgroups 16-32 และ 4-byte Aligned Q6_K บนสถาปัตยกรรม Intel Battlemage G21">
-              <div class="starter-card-title">⚡ วิเคราะห์สถาปัตยกรรม Arc GPU</div>
-              <div class="starter-card-desc">เทคนิคการเร่ง VRAM แบนด์วิดท์ 306 GB/s</div>
+            <button type="button" class="starter-card" data-prompt="อธิบายการทำงานของ Iteration-Level Continuous Batching และ Per-Slot KV Prefix Caching">
+              <div class="starter-card-title">⚡ Continuous Batching &amp; GPU</div>
+              <div class="starter-card-desc">รันหลาย User พร้อมกัน แชร์ Weight รอบเดียว</div>
             </button>
             <button type="button" class="starter-card" data-prompt="ช่วยออกแบบโครงสร้างข้อมูลห้องสี่เหลี่ยม 3 มิติ สำหรับโปรแกรม Lenout CAD ในรูปแบบ JSON">
               <div class="starter-card-title">📐 ออกแบบโครงสร้าง CAD / Lenout</div>
@@ -102,7 +105,7 @@
             </div>
           </div>
         </div>
-        <div class="input-hint">Caelum Engine v0.8.0 · Intel Arc B580 (BMG G21 12GB) · 100% Private Local Inference</div>
+        <div class="input-hint" id="engine-footer-hint">Caelum Engine v0.12.0 · Multi-User Continuous Batching · Ultra-Low RAM · 100% Private Local Inference</div>
       </div>
     </main>
   </div>
@@ -121,7 +124,7 @@
 
       <div class="form-group">
         <div class="form-label">
-          <span>Temperature (ความสร้างสรรค์)</span>
+          <label for="setting-temp">Temperature (ความสร้างสรรค์)</label>
           <span id="val-temp">0.7</span>
         </div>
         <input type="range" id="setting-temp" class="form-range" min="0" max="1.5" step="0.05" value="0.7">
@@ -129,7 +132,7 @@
 
       <div class="form-group">
         <div class="form-label">
-          <span>Max Completion Tokens</span>
+          <label for="setting-max-tokens">Max Completion Tokens</label>
           <span id="val-max-tokens">512</span>
         </div>
         <input type="range" id="setting-max-tokens" class="form-range" min="64" max="4096" step="64" value="512">
