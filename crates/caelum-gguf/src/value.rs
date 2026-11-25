@@ -115,6 +115,24 @@ impl GgufValue {
         }
         Some(out)
     }
+
+    pub fn as_usize_vec(&self) -> Option<Vec<usize>> {
+        let arr = self.as_array()?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            out.push(item.as_usize()?);
+        }
+        Some(out)
+    }
+
+    pub fn as_bool_vec(&self) -> Option<Vec<bool>> {
+        let arr = self.as_array()?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            out.push(item.as_bool()?);
+        }
+        Some(out)
+    }
 }
 
 impl fmt::Display for GgufValue {

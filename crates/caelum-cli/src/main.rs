@@ -24,6 +24,39 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Checks available system RAM (on Linux `/proc/meminfo`) to avoid OOM/swap thrashing when
+/// repacking large GGUF files into a second in-memory copy.
+fn should_repack_for_ram(model_bytes: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                    if let Some(kb) = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        let avail_bytes = (kb as usize).saturating_mul(1024);
+                        // Repacking allocates ~1.0x model_bytes in RAM on top of page cache.
+                        if model_bytes > avail_bytes * 55 / 100 {
+                            eprintln!(
+                                "[Caelum] Skipping CPU weight repack ({:.1} GB model vs {:.1} GB free RAM) — using zero-copy mmap.",
+                                model_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                                avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                            );
+                            return false;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    let _ = model_bytes;
+    true
+}
+
 fn load_model_for_cli<'a>(
     gguf: &'a GgufFile,
     backend: &CpuBackend,
@@ -32,24 +65,39 @@ fn load_model_for_cli<'a>(
     enable_repack: bool,
     use_gpu: bool,
 ) -> Result<(CaelumModel<'a>, String)> {
+    let do_repack = enable_repack && should_repack_for_ram(gguf.file_size());
     if use_gpu {
         #[cfg(feature = "gpu")]
         {
-            let gpu = Arc::new(GpuContext::new()?);
-            let label = format!("wgpu {}", gpu.device_summary());
-            let model = CaelumModel::from_gguf_gpu(gguf, gpu, max_ctx)?;
-            Ok((model, label))
+            let arch = gguf.architecture().unwrap_or("llama");
+            if matches!(arch, "llama" | "qwen2" | "qwen3" | "phi3" | "mistral") {
+                let gpu = Arc::new(GpuContext::new()?);
+                let label = format!("wgpu {}", gpu.device_summary());
+                let model = CaelumModel::from_gguf_gpu(gguf, gpu, max_ctx)?;
+                return Ok((model, label));
+            }
+            eprintln!(
+                "[Caelum] Architecture '{arch}' runs on CPU SIMD (GPU kernel coming soon); falling back to {} ({} threads).",
+                backend.name(),
+                backend.num_threads()
+            );
+            let mut model = CaelumModel::from_gguf_with_kv(gguf, max_ctx, kv_precision)?;
+            if do_repack {
+                model.optimize_for_backend(backend);
+            }
+            let label = format!("{} | {} threads (CPU fallback)", backend.name(), backend.num_threads());
+            return Ok((model, label));
         }
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (gguf, backend, max_ctx, kv_precision, enable_repack);
+            let _ = (gguf, backend, max_ctx, kv_precision, do_repack);
             Err(caelum_core::CaelumError::Runtime(
                 "--gpu requires compiling with `--features gpu` (cargo build --release --features gpu)".into(),
             ))
         }
     } else {
         let mut model = CaelumModel::from_gguf_with_kv(gguf, max_ctx, kv_precision)?;
-        if enable_repack {
+        if do_repack {
             model.optimize_for_backend(backend);
         }
         let label = format!("{} | {} threads", backend.name(), backend.num_threads());
@@ -152,8 +200,8 @@ fn cmd_info() -> Result<()> {
     {
         println!("  GPU (wgpu):    disabled (build with --features gpu for Vulkan/Metal/DX12)");
     }
-    println!("  Quantization:  F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K");
-    println!("  Architectures: llama, qwen2/2.5, qwen2moe, qwen3, qwen3moe, deepseek2, gemma2/3, phi3/4, starcoder2, mistral, celestia");
+    println!("  Quantization:  F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K (Single & Split-GGUF)");
+    println!("  Architectures: llama, qwen2/2.5, qwen2moe, qwen3, qwen3moe, qwen35, deepseek2, gemma2/3/4, phi3/4, starcoder2, mistral, celestia");
     println!("  Accelerators:  x86 AVX-VNNI/AVX2+FMA+F16C (8x4/8x8 Repacked) | ARMv9 NEON+DotProd+I8MM SMMLA | wgpu Vulkan/Metal/DX12");
     println!("============================================================");
     Ok(())
@@ -189,6 +237,9 @@ fn cmd_inspect(path: &str) -> Result<()> {
     println!("  CAELUM GGUF INSPECTOR ({elapsed_ms:.2} ms mmap load)");
     println!("============================================================");
     println!("  File:          {path}");
+    if gguf.split_count > 1 {
+        println!("  Split Shards:  {} files (auto-stitched zero-copy mmap)", gguf.split_count);
+    }
     println!("  Size:          {:.2} MB", gguf.file_size() as f64 / (1024.0 * 1024.0));
     println!("  GGUF Version:  v{}", gguf.version);
     println!("  Architecture:  {}", gguf.architecture().unwrap_or("unknown"));

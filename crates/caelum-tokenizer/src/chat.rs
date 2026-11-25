@@ -26,6 +26,8 @@ pub enum ChatTemplate {
     Llama3,
     /// `<start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n` (Gemma 2 / Gemma 3).
     Gemma,
+    /// `<|turn>system\n...<turn|>\n<|turn>user\n...<turn|>\n<|turn>model\n<|channel>thought\n<channel|>` (Gemma 4).
+    Gemma4,
     /// `<|system|>\n...<|end|>\n<|user|>\n...<|end|>\n<|assistant|>\n` (Phi-3).
     Phi3,
     /// DeepSeek-V2 / DeepSeek-Coder-V2 (`User: ...\n\nAssistant:`).
@@ -55,6 +57,9 @@ impl ChatTemplate {
             if tmpl.contains("<|start_header_id|>") {
                 return ChatTemplate::Llama3;
             }
+            if tmpl.contains("<|turn>") {
+                return ChatTemplate::Gemma4;
+            }
             if tmpl.contains("<start_of_turn>") {
                 return ChatTemplate::Gemma;
             }
@@ -78,8 +83,9 @@ impl ChatTemplate {
 
     pub fn from_architecture(arch: &str) -> Self {
         match arch {
-            "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" => ChatTemplate::ChatMl,
+            "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "qwen35" => ChatTemplate::ChatMl,
             "gemma" | "gemma2" | "gemma3" => ChatTemplate::Gemma,
+            "gemma4" => ChatTemplate::Gemma4,
             "phi3" => ChatTemplate::Phi3,
             "starcoder2" => ChatTemplate::Raw,
             "deepseek2" => ChatTemplate::DeepSeekV2,
@@ -93,10 +99,11 @@ impl ChatTemplate {
     /// Parses a user-supplied `--template <name>` CLI flag.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
-            "chatml" | "qwen" | "qwen2" | "qwen3" | "phi4" => Some(ChatTemplate::ChatMl),
+            "chatml" | "qwen" | "qwen2" | "qwen3" | "qwen35" | "phi4" => Some(ChatTemplate::ChatMl),
             "qwen3-nothink" | "nothink" => Some(ChatTemplate::Qwen3NoThink),
             "llama3" | "llama" => Some(ChatTemplate::Llama3),
             "gemma" | "gemma2" | "gemma3" => Some(ChatTemplate::Gemma),
+            "gemma4" => Some(ChatTemplate::Gemma4),
             "phi3" | "phi" => Some(ChatTemplate::Phi3),
             "deepseek2" | "deepseek-v2" | "deepseek" => Some(ChatTemplate::DeepSeekV2),
             "deepseek-v1" | "deepseek-coder" => Some(ChatTemplate::DeepSeekV1),
@@ -113,6 +120,7 @@ impl ChatTemplate {
             ChatTemplate::Qwen3NoThink => "qwen3-nothink",
             ChatTemplate::Llama3 => "llama3",
             ChatTemplate::Gemma => "gemma",
+            ChatTemplate::Gemma4 => "gemma4",
             ChatTemplate::Phi3 => "phi3",
             ChatTemplate::DeepSeekV2 => "deepseek2",
             ChatTemplate::DeepSeekV1 => "deepseek-v1",
@@ -180,6 +188,19 @@ impl ChatTemplate {
                 }
                 if add_generation_prompt {
                     out.push_str("<start_of_turn>model\n");
+                }
+            }
+            ChatTemplate::Gemma4 => {
+                for m in messages {
+                    let role = match m.role {
+                        ChatRole::System => "system",
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "model",
+                    };
+                    out.push_str(&format!("<|turn>{role}\n{}<turn|>\n", m.content));
+                }
+                if add_generation_prompt {
+                    out.push_str("<|turn>model\n<|channel>thought\n<channel|>");
                 }
             }
             ChatTemplate::Phi3 => {

@@ -47,7 +47,10 @@ impl RopeConfig {
             });
         let style = if arch.starts_with("qwen")
             || arch == "celestia"
-            || matches!(arch, "gemma" | "gemma2" | "gemma3" | "phi3" | "starcoder2")
+            || matches!(
+                arch,
+                "gemma" | "gemma2" | "gemma3" | "gemma4" | "phi3" | "starcoder2"
+            )
         {
             RopeStyle::NeoX
         } else {
@@ -126,6 +129,16 @@ pub struct RopeTable {
 
 impl RopeTable {
     pub fn new(max_seq_len: usize, cfg: &RopeConfig) -> Self {
+        Self::with_freq_factors(max_seq_len, cfg, None)
+    }
+
+    /// Builds a RoPE table with optional per-pair frequency divisors (`rope_freqs.weight`,
+    /// e.g. Gemma 4 proportional RoPE where unrotated pairs carry factor `~1e30`).
+    pub fn with_freq_factors(
+        max_seq_len: usize,
+        cfg: &RopeConfig,
+        freq_factors: Option<&[f32]>,
+    ) -> Self {
         let rope_dim = cfg.rope_dim;
         let half_dim = rope_dim / 2;
         let freq_scale = if cfg.scaling_type == RopeScalingType::None {
@@ -160,13 +173,20 @@ impl RopeTable {
         for i in 0..half_dim {
             let extrap = 1.0 / cfg.freq_base.powf((2 * i) as f32 / rope_dim as f32);
             let interp = freq_scale * extrap;
-            let freq = if ext_factor != 0.0 {
+            let mut freq = if ext_factor != 0.0 {
                 let y = (i as f32 - low_dim) / (high_dim - low_dim).max(0.001);
                 let ramp = (1.0 - y.clamp(0.0, 1.0)) * ext_factor;
                 interp * (1.0 - ramp) + extrap * ramp
             } else {
                 interp
             };
+            if let Some(factors) = freq_factors {
+                if let Some(&ff) = factors.get(i) {
+                    if ff.is_finite() && ff != 0.0 {
+                        freq /= ff;
+                    }
+                }
+            }
             inv_freqs.push(freq);
         }
 

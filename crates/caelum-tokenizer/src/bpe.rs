@@ -25,6 +25,7 @@ pub struct Tokenizer {
     pub bos_token_id: Option<u32>,
     pub eos_token_id: u32,
     pub add_bos: bool,
+    pub add_space_prefix: bool,
     byte_to_char: [char; 256],
     char_to_byte: HashMap<char, u8>,
     /// Precomputed decoded raw bytes per token (skip_special=true -> empty for special tokens)
@@ -91,7 +92,7 @@ impl Tokenizer {
             .unwrap_or_default();
 
         let kind = match model {
-            "llama" | "spm" => TokenizerKind::SentencePiece,
+            "llama" | "spm" | "gemma4" => TokenizerKind::SentencePiece,
             "celestia" => TokenizerKind::CelestiaByte,
             _ => TokenizerKind::ByteLevelBpe,
         };
@@ -135,6 +136,10 @@ impl Tokenizer {
             .get_meta("tokenizer.ggml.add_bos_token")
             .and_then(|v| v.as_bool())
             .unwrap_or(matches!(kind, TokenizerKind::SentencePiece));
+        let add_space_prefix = gguf
+            .get_meta("tokenizer.ggml.add_space_prefix")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(matches!(kind, TokenizerKind::SentencePiece));
 
         let (byte_to_char, char_to_byte) = build_gpt2_byte_maps();
 
@@ -149,6 +154,7 @@ impl Tokenizer {
             bos_token_id,
             eos_token_id,
             add_bos,
+            add_space_prefix,
             byte_to_char,
             char_to_byte,
             cached_normal_bytes: Vec::new(),
@@ -216,6 +222,7 @@ impl Tokenizer {
             bos_token_id: Some(1),
             eos_token_id: 2,
             add_bos: false,
+            add_space_prefix: false,
             byte_to_char,
             char_to_byte,
             cached_normal_bytes: Vec::new(),
@@ -260,6 +267,7 @@ impl Tokenizer {
                     | "<|EOT|>"
                     | "<｜end▁of▁sentence｜>"
                     | "<end_of_turn>"
+                    | "<turn|>"
                     | "<|end|>"
                     | "<|file_sep|>"
                     | "</s>"
@@ -375,28 +383,58 @@ impl Tokenizer {
     }
 
     fn encode_spm(&self, text: &str, out: &mut Vec<u32>) {
-        let escaped = format!("▁{}", text.replace(' ', "▁"));
+        let escaped = if self.add_space_prefix {
+            format!("▁{}", text.replace(' ', "▁"))
+        } else {
+            text.replace(' ', "▁")
+        };
         let mut symbols: Vec<String> = escaped.chars().map(|c| c.to_string()).collect();
 
-        loop {
-            if symbols.len() < 2 {
-                break;
-            }
-            let mut best_score = f32::NEG_INFINITY;
-            let mut best_idx = None;
-            for j in 0..(symbols.len() - 1) {
-                let candidate = format!("{}{}", symbols[j], symbols[j + 1]);
-                if let Some(&id) = self.token_to_id.get(&candidate) {
-                    let score = self.scores.get(id as usize).copied().unwrap_or(0.0);
-                    if score > best_score {
-                        best_score = score;
-                        best_idx = Some((j, candidate));
+        if !self.merges.is_empty() {
+            // Merge-rank SentencePiece BPE (e.g. Gemma 4)
+            loop {
+                if symbols.len() < 2 {
+                    break;
+                }
+                let mut best_rank = usize::MAX;
+                let mut best_idx = None;
+                for j in 0..(symbols.len() - 1) {
+                    if let Some(&rank) =
+                        self.merges.get(&(symbols[j].clone(), symbols[j + 1].clone()))
+                    {
+                        if rank < best_rank {
+                            best_rank = rank;
+                            best_idx = Some(j);
+                        }
                     }
                 }
+                let Some(idx) = best_idx else { break };
+                let merged = format!("{}{}", symbols[idx], symbols[idx + 1]);
+                symbols[idx] = merged;
+                symbols.remove(idx + 1);
             }
-            let Some((idx, merged)) = best_idx else { break };
-            symbols[idx] = merged;
-            symbols.remove(idx + 1);
+        } else {
+            // Score-priority SentencePiece BPE (Llama 2 / Mistral / Gemma 2 & 3)
+            loop {
+                if symbols.len() < 2 {
+                    break;
+                }
+                let mut best_score = f32::NEG_INFINITY;
+                let mut best_idx = None;
+                for j in 0..(symbols.len() - 1) {
+                    let candidate = format!("{}{}", symbols[j], symbols[j + 1]);
+                    if let Some(&id) = self.token_to_id.get(&candidate) {
+                        let score = self.scores.get(id as usize).copied().unwrap_or(0.0);
+                        if score > best_score {
+                            best_score = score;
+                            best_idx = Some((j, candidate));
+                        }
+                    }
+                }
+                let Some((idx, merged)) = best_idx else { break };
+                symbols[idx] = merged;
+                symbols.remove(idx + 1);
+            }
         }
 
         for sym in symbols {

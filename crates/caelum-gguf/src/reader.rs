@@ -15,9 +15,11 @@ pub struct TensorInfo {
     /// GGML-order dimensions `[ne0, ne1, ...]` where `ne0` is contiguous.
     pub ggml_dims: Vec<usize>,
     pub dtype: DType,
-    /// Byte offset relative to `GgufFile::data_offset`.
+    /// Byte offset relative to `GgufFile::data_offsets[shard]`.
     pub offset: usize,
     pub byte_size: usize,
+    /// Backing shard index (`0` for single-file GGUF, `0..split_count` for multi-shard split GGUF).
+    pub shard: usize,
 }
 
 impl TensorInfo {
@@ -39,7 +41,9 @@ pub struct GgufFile {
     pub tensors: BTreeMap<String, TensorInfo>,
     pub alignment: usize,
     pub data_offset: usize,
-    backing: MappedFile,
+    pub split_count: usize,
+    data_offsets: Vec<usize>,
+    backings: Vec<MappedFile>,
 }
 
 struct Cursor<'a> {
@@ -151,90 +155,198 @@ fn align_up(offset: usize, alignment: usize) -> usize {
     }
 }
 
+/// Resolves a sibling split-GGUF shard path matching `*-NNNNN-of-MMMMM.gguf` (1-indexed).
+fn resolve_split_shard_path(
+    base_path: &Path,
+    shard_idx: usize,
+    split_count: usize,
+) -> Option<std::path::PathBuf> {
+    let fname = base_path.file_name()?.to_str()?;
+    let stem = fname.strip_suffix(".gguf")?;
+    // Expected suffix: `-NNNNN-of-MMMMM` (15 ASCII bytes)
+    if stem.len() >= 15 {
+        let split_pos = stem.len() - 15;
+        let suffix = &stem[split_pos..];
+        if suffix.starts_with('-')
+            && &suffix[6..10] == "-of-"
+            && suffix[1..6].bytes().all(|b| b.is_ascii_digit())
+            && suffix[10..15].bytes().all(|b| b.is_ascii_digit())
+        {
+            let prefix = &stem[..split_pos];
+            let shard_name = format!("{prefix}-{:05}-of-{:05}.gguf", shard_idx + 1, split_count);
+            return Some(base_path.with_file_name(shard_name));
+        }
+    }
+    None
+}
+
+type ParsedGgufParts = (
+    u32,
+    BTreeMap<String, GgufValue>,
+    BTreeMap<String, TensorInfo>,
+    usize,
+    usize,
+);
+
 impl GgufFile {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let backing = MappedFile::open(path)?;
-        Self::parse(backing)
+        let path = path.as_ref();
+        let first_backing = MappedFile::open(path)?;
+        let (version, metadata, tensors, alignment, data_offset) =
+            Self::parse_parts(first_backing.as_slice(), 0)?;
+
+        let split_count = metadata
+            .get("split.count")
+            .and_then(GgufValue::as_usize)
+            .unwrap_or(1)
+            .max(1);
+        let split_no = metadata
+            .get("split.no")
+            .and_then(GgufValue::as_usize)
+            .unwrap_or(0);
+
+        // If user passed shard > 0 (e.g. -00002-of-00002.gguf), transparently pivot to shard 0
+        // so full model metadata & tokenizer KVs are loaded properly.
+        if split_count > 1 && split_no > 0 {
+            if let Some(shard0_path) = resolve_split_shard_path(path, 0, split_count) {
+                if shard0_path.exists() {
+                    return Self::open(shard0_path);
+                }
+            }
+            return Err(CaelumError::InvalidFormat(format!(
+                "GGUF file is split shard {}/{} and shard 1 could not be found beside '{}'",
+                split_no + 1,
+                split_count,
+                path.display()
+            )));
+        }
+
+        let mut all_tensors = tensors;
+        let mut backings = vec![first_backing];
+        let mut data_offsets = vec![data_offset];
+
+        if split_count > 1 {
+            for shard_idx in 1..split_count {
+                let shard_path = resolve_split_shard_path(path, shard_idx, split_count)
+                    .ok_or_else(|| {
+                        CaelumError::InvalidFormat(format!(
+                            "cannot infer split shard {}/{} filename from '{}'",
+                            shard_idx + 1,
+                            split_count,
+                            path.display()
+                        ))
+                    })?;
+                if !shard_path.exists() {
+                    return Err(CaelumError::InvalidFormat(format!(
+                        "missing GGUF split shard {}/{}: '{}'",
+                        shard_idx + 1,
+                        split_count,
+                        shard_path.display()
+                    )));
+                }
+                let shard_backing = MappedFile::open(&shard_path)?;
+                let (_, _, shard_tensors, _, shard_data_offset) =
+                    Self::parse_parts(shard_backing.as_slice(), shard_idx)?;
+                for (name, info) in shard_tensors {
+                    all_tensors.insert(name, info);
+                }
+                backings.push(shard_backing);
+                data_offsets.push(shard_data_offset);
+            }
+        }
+
+        Ok(Self {
+            version,
+            metadata,
+            tensors: all_tensors,
+            alignment,
+            data_offset,
+            split_count,
+            data_offsets,
+            backings,
+        })
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        Self::parse(MappedFile::from_bytes(bytes))
-    }
-
-    fn parse(backing: MappedFile) -> Result<Self> {
-        let (version, metadata, tensors, alignment, data_offset) = {
-            let mut cur = Cursor::new(backing.as_slice());
-            let magic = cur.read_bytes(4)?;
-            if magic != GGUF_MAGIC {
-                return Err(CaelumError::InvalidFormat(format!(
-                    "bad GGUF magic: {:?}",
-                    magic
-                )));
-            }
-            let version = cur.read_u32()?;
-            if version != 2 && version != 3 {
-                return Err(CaelumError::InvalidFormat(format!(
-                    "unsupported GGUF version {version} (expected 2 or 3)"
-                )));
-            }
-
-            let tensor_count = cur.read_u64()? as usize;
-            let metadata_kv_count = cur.read_u64()? as usize;
-
-            let mut metadata = BTreeMap::new();
-            for _ in 0..metadata_kv_count {
-                let key = cur.read_string()?;
-                let val_type = cur.read_u32()?;
-                let val = cur.read_value(val_type)?;
-                metadata.insert(key, val);
-            }
-
-            let alignment = metadata
-                .get("general.alignment")
-                .and_then(GgufValue::as_usize)
-                .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
-
-            let mut tensors = BTreeMap::new();
-            for _ in 0..tensor_count {
-                let name = cur.read_string()?;
-                let n_dims = cur.read_u32()? as usize;
-                let mut ggml_dims = Vec::with_capacity(n_dims);
-                for _ in 0..n_dims {
-                    ggml_dims.push(cur.read_u64()? as usize);
-                }
-                let dtype_id = cur.read_u32()?;
-                let dtype = DType::from_ggml_id(dtype_id)?;
-                let offset = cur.read_u64()? as usize;
-                let num_elems: usize = ggml_dims.iter().product();
-                let byte_size = dtype.byte_size_for(num_elems)?;
-                tensors.insert(
-                    name.clone(),
-                    TensorInfo {
-                        name,
-                        ggml_dims,
-                        dtype,
-                        offset,
-                        byte_size,
-                    },
-                );
-            }
-
-            let data_offset = align_up(cur.pos, alignment);
-            (version, metadata, tensors, alignment, data_offset)
-        };
-
+        let backing = MappedFile::from_bytes(bytes);
+        let (version, metadata, tensors, alignment, data_offset) =
+            Self::parse_parts(backing.as_slice(), 0)?;
         Ok(Self {
             version,
             metadata,
             tensors,
             alignment,
             data_offset,
-            backing,
+            split_count: 1,
+            data_offsets: vec![data_offset],
+            backings: vec![backing],
         })
     }
 
+    fn parse_parts(buf: &[u8], shard: usize) -> Result<ParsedGgufParts> {
+        let mut cur = Cursor::new(buf);
+        let magic = cur.read_bytes(4)?;
+        if magic != GGUF_MAGIC {
+            return Err(CaelumError::InvalidFormat(format!(
+                "bad GGUF magic: {:?}",
+                magic
+            )));
+        }
+        let version = cur.read_u32()?;
+        if version != 2 && version != 3 {
+            return Err(CaelumError::InvalidFormat(format!(
+                "unsupported GGUF version {version} (expected 2 or 3)"
+            )));
+        }
+
+        let tensor_count = cur.read_u64()? as usize;
+        let metadata_kv_count = cur.read_u64()? as usize;
+
+        let mut metadata = BTreeMap::new();
+        for _ in 0..metadata_kv_count {
+            let key = cur.read_string()?;
+            let val_type = cur.read_u32()?;
+            let val = cur.read_value(val_type)?;
+            metadata.insert(key, val);
+        }
+
+        let alignment = metadata
+            .get("general.alignment")
+            .and_then(GgufValue::as_usize)
+            .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
+
+        let mut tensors = BTreeMap::new();
+        for _ in 0..tensor_count {
+            let name = cur.read_string()?;
+            let n_dims = cur.read_u32()? as usize;
+            let mut ggml_dims = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                ggml_dims.push(cur.read_u64()? as usize);
+            }
+            let dtype_id = cur.read_u32()?;
+            let dtype = DType::from_ggml_id(dtype_id)?;
+            let offset = cur.read_u64()? as usize;
+            let num_elems: usize = ggml_dims.iter().product();
+            let byte_size = dtype.byte_size_for(num_elems)?;
+            tensors.insert(
+                name.clone(),
+                TensorInfo {
+                    name,
+                    ggml_dims,
+                    dtype,
+                    offset,
+                    byte_size,
+                    shard,
+                },
+            );
+        }
+
+        let data_offset = align_up(cur.pos, alignment);
+        Ok((version, metadata, tensors, alignment, data_offset))
+    }
+
     pub fn file_size(&self) -> usize {
-        self.backing.len()
+        self.backings.iter().map(|b| b.as_slice().len()).sum()
     }
 
     pub fn architecture(&self) -> Option<&str> {
@@ -261,25 +373,70 @@ impl GgufFile {
         self.tensors.contains_key(name)
     }
 
-    /// Returns a zero-copy `TensorView` borrowing directly from the `mmap`'d file.
+    /// Returns a zero-copy `TensorView` borrowing directly from the `mmap`'d shard file.
     pub fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
         let info = self
             .tensors
             .get(name)
             .ok_or_else(|| CaelumError::MissingTensor(name.to_string()))?;
-        let start = self.data_offset + info.offset;
+        let backing = self.backings.get(info.shard).ok_or_else(|| {
+            CaelumError::InvalidFormat(format!(
+                "tensor '{name}' references invalid shard {}",
+                info.shard
+            ))
+        })?;
+        let start = self.data_offsets[info.shard] + info.offset;
         let end = start + info.byte_size;
-        if end > self.backing.len() {
+        if end > backing.len() {
             return Err(CaelumError::InvalidFormat(format!(
-                "tensor '{name}' exceeds file bounds ({end} > {})",
-                self.backing.len()
+                "tensor '{name}' exceeds shard {} bounds ({end} > {})",
+                info.shard,
+                backing.len()
             )));
         }
         let dims = info.row_major_dims();
-        TensorView::new(&self.backing[start..end], &dims, info.dtype)
+        TensorView::new(&backing[start..end], &dims, info.dtype)
     }
 
     pub fn total_parameters(&self) -> u64 {
         self.tensors.values().map(|t| t.num_elements() as u64).sum()
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use crate::writer::GgufWriter;
+
+    #[test]
+    fn test_split_gguf_two_shards_zero_copy_open() {
+        let dir = std::env::temp_dir().join(format!("caelum_split_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shard1 = dir.join("demo-00001-of-00002.gguf");
+        let shard2 = dir.join("demo-00002-of-00002.gguf");
+
+        let mut w1 = GgufWriter::new();
+        w1.add_meta("general.architecture", GgufValue::String("qwen2".into()));
+        w1.add_meta("split.no", GgufValue::U16(0));
+        w1.add_meta("split.count", GgufValue::U16(2));
+        w1.add_tensor_f32("t0", vec![4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        w1.write_to_file(&shard1).unwrap();
+
+        let mut w2 = GgufWriter::new();
+        w2.add_meta("split.no", GgufValue::U16(1));
+        w2.add_meta("split.count", GgufValue::U16(2));
+        w2.add_tensor_f32("t1", vec![4], &[5.0, 6.0, 7.0, 8.0]).unwrap();
+        w2.write_to_file(&shard2).unwrap();
+
+        // Opening shard 1 or shard 2 yields both tensors seamlessly
+        for p in [&shard1, &shard2] {
+            let gguf = GgufFile::open(p).unwrap();
+            assert_eq!(gguf.split_count, 2);
+            assert_eq!(gguf.architecture(), Some("qwen2"));
+            assert_eq!(gguf.tensor("t0").unwrap().to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+            assert_eq!(gguf.tensor("t1").unwrap().to_f32_vec().unwrap(), vec![5.0, 6.0, 7.0, 8.0]);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

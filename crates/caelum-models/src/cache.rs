@@ -219,8 +219,8 @@ impl KvCache {
                 let h_off = kv_head * bph;
 
                 // Quantize query head once into Q8_0 for fast SIMD integer attention scores
-                let mut q_q8 = [BlockQ8_0 { d: 0, qs: [0; 32] }; 8];
-                debug_assert!(bph <= 8, "head_dim > 256 unsupported in stack q_q8");
+                let mut q_q8 = [BlockQ8_0 { d: 0, qs: [0; 32] }; 16];
+                debug_assert!(bph <= 16, "head_dim > 512 unsupported in stack q_q8");
                 let q_blocks = &mut q_q8[..bph];
                 quantize_row_q8_0(qh, q_blocks);
 

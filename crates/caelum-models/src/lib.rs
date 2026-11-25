@@ -4,8 +4,10 @@
 pub mod cache;
 pub mod celestia;
 pub mod deepseek2;
+pub mod gemma4;
 pub mod llama_qwen;
 pub mod moe;
+pub mod qwen35;
 pub mod rope;
 pub mod sampler;
 #[cfg(feature = "gpu")]
@@ -24,8 +26,10 @@ use std::time::Instant;
 pub use cache::{KvCache, KvPrecision, MlaLatentCache};
 pub use celestia::{write_synthetic_celestia_gguf, CelestiaConfig, CelestiaModel};
 pub use deepseek2::{DeepSeek2Config, DeepSeek2Model};
+pub use gemma4::{Gemma4Config, Gemma4Model};
 pub use llama_qwen::{LlamaQwenConfig, LlamaQwenModel};
 pub use moe::{ExpertGating, MoeConfig};
+pub use qwen35::{Qwen35Config, Qwen35Model};
 pub use rope::{RopeConfig, RopeScalingType, RopeTable};
 pub use sampler::{Sampler, SamplerConfig};
 #[cfg(feature = "gpu")]
@@ -70,6 +74,8 @@ enum ModelInner<'a> {
     LlamaQwen(LlamaQwenModel<'a>),
     #[cfg(feature = "gpu")]
     WgpuLlamaQwen(WgpuLlamaQwenModel<'a>),
+    Gemma4(Gemma4Model<'a>),
+    Qwen35(Qwen35Model<'a>),
     DeepSeek2(DeepSeek2Model<'a>),
     Celestia(CelestiaModel<'a>),
 }
@@ -94,6 +100,12 @@ impl<'a> CaelumModel<'a> {
         let inner = match arch {
             "celestia" => ModelInner::Celestia(CelestiaModel::from_gguf(gguf, max_seq_len)?),
             "deepseek2" => ModelInner::DeepSeek2(DeepSeek2Model::from_gguf(gguf, max_seq_len)?),
+            "gemma4" => {
+                ModelInner::Gemma4(Gemma4Model::from_gguf_with_kv(gguf, max_seq_len, kv_precision)?)
+            }
+            "qwen35" => {
+                ModelInner::Qwen35(Qwen35Model::from_gguf_with_kv(gguf, max_seq_len, kv_precision)?)
+            }
             "llama"
             | "qwen2"
             | "qwen2moe"
@@ -113,7 +125,7 @@ impl<'a> CaelumModel<'a> {
             }
             other => {
                 return Err(CaelumError::InvalidFormat(format!(
-                    "unsupported GGUF architecture '{other}' (supported: llama, qwen2, qwen2moe, qwen3, qwen3moe, gemma2, gemma3, phi3, starcoder2, deepseek2, mistral, celestia)"
+                    "unsupported GGUF architecture '{other}' (supported: llama, qwen2, qwen2moe, qwen3, qwen3moe, qwen35, gemma2, gemma3, gemma4, phi3, starcoder2, deepseek2, mistral, celestia)"
                 )))
             }
         };
@@ -154,6 +166,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => m.optimize_for_backend(backend),
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(_) => {}
+            ModelInner::Gemma4(m) => m.optimize_for_backend(backend),
+            ModelInner::Qwen35(m) => m.optimize_for_backend(backend),
             ModelInner::DeepSeek2(m) => m.optimize_for_backend(backend),
             ModelInner::Celestia(_) => {}
         }
@@ -164,6 +178,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => m.packed_bytes(),
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.vram_weight_bytes(),
+            ModelInner::Gemma4(m) => m.packed_bytes(),
+            ModelInner::Qwen35(m) => m.packed_bytes(),
             ModelInner::DeepSeek2(m) => m.packed_bytes(),
             ModelInner::Celestia(_) => 0,
         }
@@ -174,6 +190,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => &m.config.arch,
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => &m.config.arch,
+            ModelInner::Gemma4(_) => "gemma4",
+            ModelInner::Qwen35(_) => "qwen35",
             ModelInner::DeepSeek2(_) => "deepseek2",
             ModelInner::Celestia(_) => "celestia",
         }
@@ -184,6 +202,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => m.config.vocab_size,
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.config.vocab_size,
+            ModelInner::Gemma4(m) => m.config.vocab_size,
+            ModelInner::Qwen35(m) => m.config.vocab_size,
             ModelInner::DeepSeek2(m) => m.config.vocab_size,
             ModelInner::Celestia(m) => m.config.vocab_size,
         }
@@ -194,6 +214,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => m.max_seq_len(),
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.max_seq_len(),
+            ModelInner::Gemma4(m) => m.max_seq_len(),
+            ModelInner::Qwen35(m) => m.max_seq_len(),
             ModelInner::DeepSeek2(m) => m.max_seq_len(),
             ModelInner::Celestia(m) => m.max_seq_len(),
         }
@@ -204,6 +226,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => m.kv_cache_bytes(),
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.kv_cache_bytes(),
+            ModelInner::Gemma4(m) => m.kv_cache_bytes(),
+            ModelInner::Qwen35(m) => m.kv_cache_bytes(),
             ModelInner::DeepSeek2(m) => m.kv_cache_bytes(),
             ModelInner::Celestia(m) => m.kv_cache_bytes(),
         }
@@ -217,6 +241,14 @@ impl<'a> CaelumModel<'a> {
             },
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(_) => "VRAM-GQA-F16",
+            ModelInner::Gemma4(m) => match m.kv_precision() {
+                KvPrecision::F32 => "Gemma4-Hybrid-F32",
+                KvPrecision::Q8_0 => "Gemma4-Hybrid-Q8_0",
+            },
+            ModelInner::Qwen35(m) => match m.kv_precision() {
+                KvPrecision::F32 => "DeltaNet+GQA-F32",
+                KvPrecision::Q8_0 => "DeltaNet+GQA-Q8_0",
+            },
             ModelInner::DeepSeek2(_) => "MLA-Absorbed",
             ModelInner::Celestia(_) => "MLA-Latent",
         }
@@ -228,6 +260,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => m.reset_cache(),
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.reset_cache(),
+            ModelInner::Gemma4(m) => m.reset_cache(),
+            ModelInner::Qwen35(m) => m.reset_cache(),
             ModelInner::DeepSeek2(m) => m.reset_cache(),
             ModelInner::Celestia(m) => m.reset_cache(),
         }
@@ -244,6 +278,8 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => m.forward_token(backend, token_id, pos, compute_logits),
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.forward_token(token_id, pos, compute_logits),
+            ModelInner::Gemma4(m) => m.forward_token(backend, token_id, pos, compute_logits),
+            ModelInner::Qwen35(m) => m.forward_token(backend, token_id, pos, compute_logits),
             ModelInner::DeepSeek2(m) => m.forward_token(backend, token_id, pos, compute_logits),
             ModelInner::Celestia(m) => m.forward_token(backend, token_id, pos, compute_logits),
         }
@@ -262,6 +298,12 @@ impl<'a> CaelumModel<'a> {
             }
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.forward_batch(tokens, start_pos, compute_last_logits),
+            ModelInner::Gemma4(m) => {
+                m.forward_batch(backend, tokens, start_pos, compute_last_logits)
+            }
+            ModelInner::Qwen35(m) => {
+                m.forward_batch(backend, tokens, start_pos, compute_last_logits)
+            }
             ModelInner::DeepSeek2(m) => {
                 m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
@@ -372,13 +414,20 @@ impl<'a> CaelumModel<'a> {
             )));
         }
 
-        // 1. Automatic KV Prefix Cache match (always recompute at least the final prompt token for logits)
+        // 1. Automatic KV Prefix Cache match (always recompute at least the final prompt token for logits).
+        // For recurrent/SSM architectures (`qwen35`), state cannot be truncated backward — only reuse
+        // when the new prompt strictly extends the exact cached prefix; otherwise reset cleanly.
         let mut common = 0usize;
         let max_reuse = self.cached_tokens.len().min(prompt_tokens.len() - 1);
         while common < max_reuse && self.cached_tokens[common] == prompt_tokens[common] {
             common += 1;
         }
-        self.cached_tokens.truncate(common);
+        if matches!(self.inner, ModelInner::Qwen35(_)) && common < self.cached_tokens.len() {
+            self.reset_cache();
+            common = 0;
+        } else {
+            self.cached_tokens.truncate(common);
+        }
 
         // 2. Batched Prefill for uncached suffix `prompt_tokens[common..]`
         let t_prefill = Instant::now();
@@ -390,6 +439,12 @@ impl<'a> CaelumModel<'a> {
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => {
                 m.forward_batch(uncached, common, true)?.to_vec()
+            }
+            ModelInner::Gemma4(m) => {
+                m.forward_batch(backend, uncached, common, true)?.to_vec()
+            }
+            ModelInner::Qwen35(m) => {
+                m.forward_batch(backend, uncached, common, true)?.to_vec()
             }
             ModelInner::DeepSeek2(m) => {
                 m.forward_batch(backend, uncached, common, true)?.to_vec()
