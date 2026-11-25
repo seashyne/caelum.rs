@@ -25,6 +25,7 @@ mod unix_mmap {
 
     pub const PROT_READ: i32 = 1;
     pub const MAP_PRIVATE: i32 = 2;
+    pub const MADV_DONTNEED: i32 = 4;
     pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
     extern "C" {
@@ -37,6 +38,7 @@ mod unix_mmap {
             offset: i64,
         ) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, length: usize) -> i32;
+        pub fn madvise(addr: *mut c_void, length: usize, advice: i32) -> i32;
     }
 }
 
@@ -87,6 +89,24 @@ impl MappedFile {
             #[cfg(unix)]
             Self::Mmap { ptr, len, .. } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
             Self::Owned(v) => v.as_slice(),
+        }
+    }
+
+    /// Advises the OS kernel (`MADV_DONTNEED`) that mapped file pages are no longer needed in
+    /// resident system RAM (e.g., after all weights have been uploaded to GPU VRAM).
+    /// Future accesses transparently fault in only the specific 4 KB pages touched.
+    pub fn advise_dontneed(&self) {
+        #[cfg(unix)]
+        if let Self::Mmap { ptr, len, .. } = self {
+            if *len > 0 && !ptr.is_null() {
+                unsafe {
+                    let _ = unix_mmap::madvise(
+                        *ptr as *mut std::ffi::c_void,
+                        *len,
+                        unix_mmap::MADV_DONTNEED,
+                    );
+                }
+            }
         }
     }
 }

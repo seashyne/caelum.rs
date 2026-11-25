@@ -299,18 +299,21 @@ impl<'a> CaelumModel<'a> {
             ModelInner::LlamaQwen(m) => match m.kv_precision() {
                 KvPrecision::F32 => "GQA-F32",
                 KvPrecision::Q8_0 => "GQA-Q8_0",
+                KvPrecision::Q4_0 => "GQA-Q4_0",
             },
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(_) => "VRAM-GQA-F16",
             ModelInner::Gemma4(m) => match m.kv_precision() {
                 KvPrecision::F32 => "Gemma4-Hybrid-F32",
                 KvPrecision::Q8_0 => "Gemma4-Hybrid-Q8_0",
+                KvPrecision::Q4_0 => "Gemma4-Hybrid-Q4_0",
             },
             #[cfg(feature = "gpu")]
             ModelInner::WgpuGemma4(_) => "VRAM-Gemma4-F16",
             ModelInner::Qwen35(m) => match m.kv_precision() {
                 KvPrecision::F32 => "DeltaNet+GQA-F32",
                 KvPrecision::Q8_0 => "DeltaNet+GQA-Q8_0",
+                KvPrecision::Q4_0 => "DeltaNet+GQA-Q4_0",
             },
             #[cfg(feature = "gpu")]
             ModelInner::WgpuQwen35(_) => "VRAM-DeltaNet+F16",

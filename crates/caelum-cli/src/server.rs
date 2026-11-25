@@ -76,7 +76,7 @@ pub fn run_server(
 ) -> Result<()> {
     let backend = CpuBackend::new(threads);
     println!("[Caelum Server] Loading GGUF via zero-copy mmap: {model_path}");
-    let gguf = GgufFile::open(model_path)?;
+    let mut gguf = GgufFile::open(model_path)?;
     let arch = gguf.architecture().unwrap_or("llama").to_string();
     let num_slots = requested_slots
         .unwrap_or_else(|| default_slots_for_arch(&arch))
@@ -92,12 +92,22 @@ pub fn run_server(
     } else {
         Tokenizer::from_gguf(&gguf)?
     };
+    let template = match template_override {
+        None | Some("auto") => ChatTemplate::from_gguf(&gguf),
+        Some(name) => ChatTemplate::from_name(name)
+            .ok_or_else(|| CaelumError::Runtime(format!("unknown --template '{name}'")))?,
+    };
+    // Free bulky vocab/merges arrays from GGUF metadata now that Tokenizer is built (~25–60 MB saved!)
+    gguf.release_tokenizer_metadata();
+
     let (mut model, hw_label) = if use_gpu {
         #[cfg(feature = "gpu")]
         {
             let gpu = Arc::new(GpuContext::new()?);
             let label = format!("wgpu {}", gpu.device_summary());
             let m = CaelumModel::from_gguf_gpu_slots(&gguf, gpu, max_ctx, num_slots)?;
+            // Evict uploaded weight pages from host page cache (`MADV_DONTNEED`) so GPU server stays tiny in RAM!
+            gguf.advise_dontneed();
             (m, label)
         }
         #[cfg(not(feature = "gpu"))]
@@ -113,11 +123,6 @@ pub fn run_server(
         }
         let label = format!("{} ({} threads)", backend.caps(), backend.num_threads());
         (m, label)
-    };
-    let template = match template_override {
-        None | Some("auto") => ChatTemplate::from_gguf(&gguf),
-        Some(name) => ChatTemplate::from_name(name)
-            .ok_or_else(|| CaelumError::Runtime(format!("unknown --template '{name}'")))?,
     };
 
     let active_slots = model.num_slots();

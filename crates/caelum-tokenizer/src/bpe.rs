@@ -18,7 +18,8 @@ pub struct Tokenizer {
     pub kind: TokenizerKind,
     pub vocab: Vec<String>,
     token_to_id: HashMap<String, u32>,
-    merges: HashMap<(String, String), usize>,
+    /// Compact integer-keyed BPE merge table `(id_a, id_b) -> rank` (zero heap Strings!).
+    merges: HashMap<(u32, u32), u32>,
     scores: Vec<f32>,
     special_tokens: Vec<(String, u32)>,
     special_ids: HashSet<u32>,
@@ -28,9 +29,9 @@ pub struct Tokenizer {
     pub add_space_prefix: bool,
     byte_to_char: [char; 256],
     char_to_byte: HashMap<char, u8>,
-    /// Precomputed decoded raw bytes per token (skip_special=true -> empty for special tokens)
-    /// for zero-allocation grammar masking across 150k+ vocabularies.
-    cached_normal_bytes: Vec<Vec<u8>>,
+    /// Flat byte arena of precomputed decoded raw bytes per token (1 allocation instead of 150k+ Vecs).
+    cached_bytes_data: Vec<u8>,
+    cached_bytes_off: Vec<u32>,
 }
 
 fn build_gpt2_byte_maps() -> ([char; 256], HashMap<char, u8>) {
@@ -116,12 +117,16 @@ impl Tokenizer {
         // Match longer special tokens first
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        let mut merges = HashMap::with_capacity(merges_raw.len());
+        let mut merges: HashMap<(u32, u32), u32> = HashMap::with_capacity(merges_raw.len());
         for (rank, line) in merges_raw.iter().enumerate() {
             if let Some((a, b)) = line.split_once(' ') {
-                merges.insert((a.to_string(), b.to_string()), rank);
+                if let (Some(&ia), Some(&ib)) = (token_to_id.get(a), token_to_id.get(b)) {
+                    merges.insert((ia, ib), rank as u32);
+                }
             }
         }
+        merges.shrink_to_fit();
+        let scores = if merges.is_empty() { scores } else { Vec::new() };
 
         let bos_token_id = gguf
             .get_meta("tokenizer.ggml.bos_token_id")
@@ -157,7 +162,8 @@ impl Tokenizer {
             add_space_prefix,
             byte_to_char,
             char_to_byte,
-            cached_normal_bytes: Vec::new(),
+            cached_bytes_data: Vec::new(),
+            cached_bytes_off: Vec::new(),
         };
         tok.rebuild_byte_cache();
         Ok(tok)
@@ -225,7 +231,8 @@ impl Tokenizer {
             add_space_prefix: false,
             byte_to_char,
             char_to_byte,
-            cached_normal_bytes: Vec::new(),
+            cached_bytes_data: Vec::new(),
+            cached_bytes_off: Vec::new(),
         };
         tok.rebuild_byte_cache();
         tok
@@ -233,20 +240,30 @@ impl Tokenizer {
 
     fn rebuild_byte_cache(&mut self) {
         let n = self.vocab.len();
-        let mut cache = Vec::with_capacity(n);
+        let mut data = Vec::with_capacity(n * 6);
+        let mut off = Vec::with_capacity(n + 1);
+        off.push(0u32);
         for id in 0..n {
-            cache.push(self.token_to_bytes(id as u32, true));
+            let bytes = self.token_to_bytes(id as u32, true);
+            data.extend_from_slice(&bytes);
+            off.push(data.len() as u32);
         }
-        self.cached_normal_bytes = cache;
+        data.shrink_to_fit();
+        self.cached_bytes_data = data;
+        self.cached_bytes_off = off;
     }
 
     /// Zero-allocation slice of decoded raw bytes for a non-special token (empty for special tokens).
     #[inline]
     pub fn cached_token_bytes(&self, id: u32) -> &[u8] {
-        self.cached_normal_bytes
-            .get(id as usize)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        let idx = id as usize;
+        if idx + 1 < self.cached_bytes_off.len() {
+            let s = self.cached_bytes_off[idx] as usize;
+            let e = self.cached_bytes_off[idx + 1] as usize;
+            &self.cached_bytes_data[s..e]
+        } else {
+            &[]
+        }
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -347,15 +364,18 @@ impl Tokenizer {
                     if symbols.len() < 2 {
                         break;
                     }
-                    let mut best_rank = usize::MAX;
+                    let mut best_rank = u32::MAX;
                     let mut best_idx = None;
                     for j in 0..(symbols.len() - 1) {
-                        if let Some(&rank) =
-                            self.merges.get(&(symbols[j].clone(), symbols[j + 1].clone()))
-                        {
-                            if rank < best_rank {
-                                best_rank = rank;
-                                best_idx = Some(j);
+                        if let (Some(&ia), Some(&ib)) = (
+                            self.token_to_id.get(&symbols[j]),
+                            self.token_to_id.get(&symbols[j + 1]),
+                        ) {
+                            if let Some(&rank) = self.merges.get(&(ia, ib)) {
+                                if rank < best_rank {
+                                    best_rank = rank;
+                                    best_idx = Some(j);
+                                }
                             }
                         }
                     }
@@ -396,15 +416,18 @@ impl Tokenizer {
                 if symbols.len() < 2 {
                     break;
                 }
-                let mut best_rank = usize::MAX;
+                let mut best_rank = u32::MAX;
                 let mut best_idx = None;
                 for j in 0..(symbols.len() - 1) {
-                    if let Some(&rank) =
-                        self.merges.get(&(symbols[j].clone(), symbols[j + 1].clone()))
-                    {
-                        if rank < best_rank {
-                            best_rank = rank;
-                            best_idx = Some(j);
+                    if let (Some(&ia), Some(&ib)) = (
+                        self.token_to_id.get(&symbols[j]),
+                        self.token_to_id.get(&symbols[j + 1]),
+                    ) {
+                        if let Some(&rank) = self.merges.get(&(ia, ib)) {
+                            if rank < best_rank {
+                                best_rank = rank;
+                                best_idx = Some(j);
+                            }
                         }
                     }
                 }

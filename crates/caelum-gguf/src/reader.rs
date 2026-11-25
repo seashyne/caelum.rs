@@ -401,6 +401,23 @@ impl GgufFile {
     pub fn total_parameters(&self) -> u64 {
         self.tensors.values().map(|t| t.num_elements() as u64).sum()
     }
+
+    /// Releases bulky tokenizer arrays (`tokens`, `merges`, `scores`, `token_type`) from GGUF
+    /// metadata after `Tokenizer::from_gguf` has been built, freeing ~25–60 MB of duplicate heap RAM.
+    pub fn release_tokenizer_metadata(&mut self) {
+        self.metadata.remove("tokenizer.ggml.tokens");
+        self.metadata.remove("tokenizer.ggml.merges");
+        self.metadata.remove("tokenizer.ggml.scores");
+        self.metadata.remove("tokenizer.ggml.token_type");
+    }
+
+    /// Advises the OS to evict `mmap`'d GGUF pages from resident system RAM (`MADV_DONTNEED`).
+    /// Ideal immediately after uploading all model weights into GPU VRAM (`--gpu`).
+    pub fn advise_dontneed(&self) {
+        for backing in &self.backings {
+            backing.advise_dontneed();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -77,6 +77,7 @@ fn load_model_for_cli<'a>(
                 let gpu = Arc::new(GpuContext::new()?);
                 let label = format!("wgpu {}", gpu.device_summary());
                 let model = CaelumModel::from_gguf_gpu(gguf, gpu, max_ctx)?;
+                gguf.advise_dontneed();
                 return Ok((model, label));
             }
             eprintln!(
@@ -131,7 +132,9 @@ OPTIONS:
   --top-p <FLOAT>         Top-P nucleus sampling cutoff (default: 0.9)
   --ctx <N>               Max KV context length (default: model min 4096)
   --slots <N>             Concurrent KV slots for multi-user continuous batching (serve, default: 4)
-  --kv-q8                 Use 8-bit Q8_0 quantized KV cache (3.76× less RAM)
+  --kv-q8                 Use 8-bit Q8_0 quantized KV cache (3.76× less RAM; default on serve/chat)
+  --kv-q4                 Use 4-bit Q4_0 quantized KV cache (7.11× less RAM than F32)
+  --kv-f32                Use full 32-bit F32 KV cache
   --gpu                   Run inference/benchmark on Vulkan/Metal/DX12 GPU (--features gpu)
   --threads <N>           Worker thread count (default: auto P-core pinning)
   --template <NAME>       Chat template: auto, chatml, qwen3-nothink, llama3, gemma, phi3,
@@ -337,7 +340,9 @@ fn cmd_run(args: &[String]) -> Result<()> {
                 i += 1;
                 max_ctx = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--kv-f32" => kv_precision = KvPrecision::F32,
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--kv-q4" => kv_precision = KvPrecision::Q4_0,
             "--gpu" => use_gpu = true,
             "--threads" => {
                 i += 1;
@@ -357,7 +362,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
 
     let backend = CpuBackend::new(threads);
     let t_load = Instant::now();
-    let gguf = GgufFile::open(model_path)?;
+    let mut gguf = GgufFile::open(model_path)?;
     let arch = gguf.architecture().unwrap_or("llama").to_string();
     let tokenizer = if arch == "celestia" && gguf.get_meta("tokenizer.ggml.tokens").is_none() {
         let (v, _) = gguf.tensor("token_embd.weight")?.dims_2d()?;
@@ -365,6 +370,8 @@ fn cmd_run(args: &[String]) -> Result<()> {
     } else {
         Tokenizer::from_gguf(&gguf)?
     };
+    let template = resolve_template(&gguf, template_override.as_deref(), raw_mode)?;
+    gguf.release_tokenizer_metadata();
     let (mut model, hw_label) = load_model_for_cli(
         &gguf,
         &backend,
@@ -373,7 +380,6 @@ fn cmd_run(args: &[String]) -> Result<()> {
         enable_repack,
         use_gpu,
     )?;
-    let template = resolve_template(&gguf, template_override.as_deref(), raw_mode)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!(
@@ -481,6 +487,7 @@ fn cmd_chat(args: &[String]) -> Result<()> {
             }
             "--kv-f32" => kv_precision = KvPrecision::F32,
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--kv-q4" => kv_precision = KvPrecision::Q4_0,
             "--gpu" => use_gpu = true,
             "--threads" => {
                 i += 1;
@@ -497,9 +504,11 @@ fn cmd_chat(args: &[String]) -> Result<()> {
     }
 
     let backend = CpuBackend::new(threads);
-    let gguf = GgufFile::open(model_path)?;
+    let mut gguf = GgufFile::open(model_path)?;
     let arch = gguf.architecture().unwrap_or("llama").to_string();
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let template = resolve_template(&gguf, template_override.as_deref(), false)?;
+    gguf.release_tokenizer_metadata();
     let (mut model, hw_label) = load_model_for_cli(
         &gguf,
         &backend,
@@ -508,7 +517,6 @@ fn cmd_chat(args: &[String]) -> Result<()> {
         enable_repack,
         use_gpu,
     )?;
-    let template = resolve_template(&gguf, template_override.as_deref(), false)?;
 
     println!("============================================================");
     println!("  CAELUM INTERACTIVE CHAT (Prefix Caching ON)");
@@ -635,7 +643,9 @@ fn cmd_propose(args: &[String]) -> Result<()> {
                     temp = v.parse().unwrap_or(0.2);
                 }
             }
+            "--kv-f32" => kv_precision = KvPrecision::F32,
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--kv-q4" => kv_precision = KvPrecision::Q4_0,
             "--gpu" => use_gpu = true,
             "--threads" => {
                 i += 1;
@@ -652,8 +662,10 @@ fn cmd_propose(args: &[String]) -> Result<()> {
     }
 
     let backend = CpuBackend::new(threads);
-    let gguf = GgufFile::open(model_path)?;
+    let mut gguf = GgufFile::open(model_path)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let template = resolve_template(&gguf, template_override.as_deref(), false)?;
+    gguf.release_tokenizer_metadata();
     let (mut model, hw_label) = load_model_for_cli(
         &gguf,
         &backend,
@@ -662,7 +674,6 @@ fn cmd_propose(args: &[String]) -> Result<()> {
         enable_repack,
         use_gpu,
     )?;
-    let template = resolve_template(&gguf, template_override.as_deref(), false)?;
 
     let sys = lenout::build_lenout_system_prompt(&mode, "req_caelum_cli", "fp_caelum_cli");
     let formatted = template.format(
@@ -722,7 +733,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let mut port = 8000u16;
     let mut threads: Option<usize> = None;
     let mut max_ctx: Option<usize> = None;
-    let mut kv_precision = KvPrecision::F32;
+    let mut kv_precision = KvPrecision::Q8_0; // Default Q8_0 for multi-slot serve (3.76× less KV RAM!)
     let mut template_override: Option<String> = None;
     let mut enable_repack = true;
     let mut use_gpu = false;
@@ -755,7 +766,9 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                 i += 1;
                 slots = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--kv-f32" => kv_precision = KvPrecision::F32,
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
+            "--kv-q4" => kv_precision = KvPrecision::Q4_0,
             "--gpu" => use_gpu = true,
             "--template" => {
                 i += 1;
