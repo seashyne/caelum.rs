@@ -96,7 +96,9 @@ pub struct GpuPipelines {
     pub bgl_res_rms: wgpu::BindGroupLayout,
     pub bgl_rw_r_u: wgpu::BindGroupLayout,
     pub bgl_rope_kv: wgpu::BindGroupLayout,
+    pub bgl_rope_kv_slots: wgpu::BindGroupLayout,
     pub bgl_gqa: wgpu::BindGroupLayout,
+    pub bgl_gqa_slots: wgpu::BindGroupLayout,
     pub bgl_deinterleave_qg: wgpu::BindGroupLayout,
     pub bgl_deltanet_conv: wgpu::BindGroupLayout,
     pub bgl_deltanet_step: wgpu::BindGroupLayout,
@@ -119,7 +121,9 @@ pub struct GpuPipelines {
     pub rms_norm_inplace: wgpu::ComputePipeline,
     pub add_bias: wgpu::ComputePipeline,
     pub rope_kv_store: wgpu::ComputePipeline,
+    pub rope_kv_store_slots: wgpu::ComputePipeline,
     pub gqa_flash_attn: wgpu::ComputePipeline,
+    pub gqa_flash_attn_slots: wgpu::ComputePipeline,
     pub swiglu: wgpu::ComputePipeline,
     pub geglu: wgpu::ComputePipeline,
     pub residual_add: wgpu::ComputePipeline,
@@ -371,6 +375,14 @@ impl GpuContext {
         self.queue.write_buffer(buf, 0, bytes);
     }
 
+    /// Writes `u32` data into a GPU buffer via DMA (used for multi-slot continuous batch metadata).
+    pub fn write_u32(&self, buf: &wgpu::Buffer, vals: &[u32]) {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(vals.as_ptr() as *const u8, std::mem::size_of_val(vals))
+        };
+        self.queue.write_buffer(buf, 0, bytes);
+    }
+
     /// Maps `staging` after `queue.submit` and copies `dst.len()` floats back to CPU.
     pub fn read_staging_f32(&self, staging: &wgpu::Buffer, dst: &mut [f32]) -> Result<()> {
         let byte_len = std::mem::size_of_val(dst) as u64;
@@ -404,7 +416,7 @@ impl GpuContext {
     pub fn matmul_pipeline(&self, dtype: DType, batch: usize) -> Result<(&wgpu::ComputePipeline, bool)> {
         match dtype {
             DType::Q4_K => {
-                if batch >= 4 {
+                if batch >= 2 {
                     Ok((&self.pipelines.matmul_q4_k_b4, true))
                 } else {
                     Ok((&self.pipelines.matmul_q4_k, false))
@@ -412,7 +424,7 @@ impl GpuContext {
             }
             DType::Q5_K => Ok((&self.pipelines.matmul_q5_k, false)),
             DType::Q6_K => {
-                if batch >= 4 {
+                if batch >= 2 {
                     Ok((&self.pipelines.matmul_q6_k_b4, true))
                 } else {
                     Ok((&self.pipelines.matmul_q6_k, false))
@@ -709,6 +721,72 @@ impl GpuContext {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn bind_rope_kv_slots(
+        &self,
+        q: &wgpu::Buffer,
+        k: &wgpu::Buffer,
+        v: &wgpu::Buffer,
+        cos_sin: &wgpu::Buffer,
+        k_cache: &wgpu::Buffer,
+        v_cache: &wgpu::Buffer,
+        slot_meta: &wgpu::Buffer,
+        arena: &UniformArena,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines.bgl_rope_kv_slots,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: k.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: v.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cos_sin.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: k_cache.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: v_cache.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: slot_meta.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &arena.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(32),
+                    }),
+                },
+            ],
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_gqa_slots(
+        &self,
+        q: &wgpu::Buffer,
+        k_cache: &wgpu::Buffer,
+        v_cache: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        slot_meta: &wgpu::Buffer,
+        arena: &UniformArena,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines.bgl_gqa_slots,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: k_cache.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: v_cache.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: slot_meta.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &arena.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(32),
+                    }),
+                },
+            ],
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_deltanet_step(
         &self,
         conv_out: &wgpu::Buffer,
@@ -929,6 +1007,19 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
             uniform_entry(6, 32),
         ],
     });
+    let bgl_rope_kv_slots = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgl-rope-kv-slots"),
+        entries: &[
+            storage_entry(0, false),
+            storage_entry(1, false),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, false),
+            storage_entry(5, false),
+            storage_entry(6, true),
+            uniform_entry(7, 32),
+        ],
+    });
     let bgl_gqa = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bgl-gqa"),
         entries: &[
@@ -937,6 +1028,17 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
             storage_entry(2, true),
             storage_entry(3, false),
             uniform_entry(4, 32),
+        ],
+    });
+    let bgl_gqa_slots = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgl-gqa-slots"),
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            storage_entry(4, true),
+            uniform_entry(5, 32),
         ],
     });
     let bgl_deinterleave_qg = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1012,10 +1114,21 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
         wgpu_shaders::SHADER_ROPE_KV_STORE_F16,
         &bgl_rope_kv,
     );
+    let rope_kv_store_slots = compile_pipeline(
+        device,
+        "rope_kv_store_slots_f16",
+        wgpu_shaders::SHADER_ROPE_KV_STORE_SLOTS_F16,
+        &bgl_rope_kv_slots,
+    );
     let gqa_flash_attn = comp(
         "gqa_flash_attn_f16",
         wgpu_shaders::SHADER_GQA_FLASH_ATTN_F16,
         &bgl_gqa,
+    );
+    let gqa_flash_attn_slots = comp(
+        "gqa_flash_attn_slots_f16",
+        wgpu_shaders::SHADER_GQA_FLASH_ATTN_SLOTS_F16,
+        &bgl_gqa_slots,
     );
     let swiglu = compile_pipeline(device, "swiglu", wgpu_shaders::SHADER_SWIGLU, &bgl_rw_r_u);
     let geglu = compile_pipeline(device, "geglu", wgpu_shaders::SHADER_GEGLU, &bgl_rw_r_u);
@@ -1065,7 +1178,9 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
         bgl_res_rms,
         bgl_rw_r_u,
         bgl_rope_kv,
+        bgl_rope_kv_slots,
         bgl_gqa,
+        bgl_gqa_slots,
         bgl_deinterleave_qg,
         bgl_deltanet_conv,
         bgl_deltanet_step,
@@ -1086,7 +1201,9 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
         rms_norm_inplace,
         add_bias,
         rope_kv_store,
+        rope_kv_store_slots,
         gqa_flash_attn,
+        gqa_flash_attn_slots,
         swiglu,
         geglu,
         residual_add,

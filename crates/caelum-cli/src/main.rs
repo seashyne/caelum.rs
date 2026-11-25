@@ -2,6 +2,7 @@
 
 mod json;
 mod lenout;
+mod scheduler;
 mod server;
 mod tools;
 mod web_assets;
@@ -26,7 +27,7 @@ use std::time::Instant;
 
 /// Checks available system RAM (on Linux `/proc/meminfo`) to avoid OOM/swap thrashing when
 /// repacking large GGUF files into a second in-memory copy.
-fn should_repack_for_ram(model_bytes: usize) -> bool {
+pub(crate) fn should_repack_for_ram(model_bytes: usize) -> bool {
     #[cfg(target_os = "linux")]
     {
         if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
@@ -117,7 +118,7 @@ USAGE:
   caelum run <model.gguf> -p "<prompt>" [OPTIONS]
   caelum chat <model.gguf> [--system "..."] [--kv-q8] [--ctx 4096] [--threads N] [--gpu]
   caelum propose <model.gguf> --mode <mode> -p "<prompt>" [--kv-q8] [--threads N] [--max-tokens 512] [--gpu]
-  caelum serve <model.gguf> [--host 127.0.0.1] [--port 8000] [--kv-q8] [--threads N] [--ctx 2048] [--gpu]
+  caelum serve <model.gguf> [--host 127.0.0.1] [--port 8000] [--slots 4] [--kv-q8] [--threads N] [--ctx 2048] [--gpu]
   caelum bench [--dim 2048] [--iters 200] [--threads N] [--gpu]
   caelum demo-celestia [--save <path.gguf>] [--threads N]
 
@@ -129,6 +130,7 @@ OPTIONS:
   --top-k <N>             Top-K sampling cutoff (default: 40)
   --top-p <FLOAT>         Top-P nucleus sampling cutoff (default: 0.9)
   --ctx <N>               Max KV context length (default: model min 4096)
+  --slots <N>             Concurrent KV slots for multi-user continuous batching (serve, default: 4)
   --kv-q8                 Use 8-bit Q8_0 quantized KV cache (3.76× less RAM)
   --gpu                   Run inference/benchmark on Vulkan/Metal/DX12 GPU (--features gpu)
   --threads <N>           Worker thread count (default: auto P-core pinning)
@@ -724,6 +726,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let mut template_override: Option<String> = None;
     let mut enable_repack = true;
     let mut use_gpu = false;
+    let mut slots: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -748,6 +751,10 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                 i += 1;
                 max_ctx = args.get(i).and_then(|v| v.parse().ok());
             }
+            "--slots" => {
+                i += 1;
+                slots = args.get(i).and_then(|v| v.parse().ok());
+            }
             "--kv-q8" => kv_precision = KvPrecision::Q8_0,
             "--gpu" => use_gpu = true,
             "--template" => {
@@ -770,6 +777,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         template_override.as_deref(),
         enable_repack,
         use_gpu,
+        slots,
     )
 }
 

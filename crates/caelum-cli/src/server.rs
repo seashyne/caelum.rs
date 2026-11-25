@@ -1,32 +1,65 @@
-//! Zero-dependency OpenAI & IDE-compatible HTTP/1.1 API Server for Caelum:
-//! - `GET  /health`
+//! Zero-dependency Multi-User Continuous Batching OpenAI & IDE-compatible HTTP/1.1 API Server:
+//! - Multi-threaded HTTP/1.1 connection handling (non-blocking `/health`, `/v1/models`, `/chat`, `/docs`)
+//! - Iteration-level Continuous Batching Scheduler (`N` parallel KV-cache slots + per-slot prefix cache)
+//! - `GET  /health`                (includes live `slots_total`, `slots_active`, `queue_depth` telemetry)
 //! - `GET  /v1/models`             (OpenAI SDK / Continue.dev / Cline / OpenWebUI discovery)
-//! - `POST /v1/chat/completions`   (Full multi-turn `messages[]`, SSE `"stream": true`,
-//!                                  `response_format: json_object`, `stop`, Automatic Prefix Cache)
+//! - `POST /v1/chat/completions`   (multi-turn `messages[]`, tools, SSE `"stream": true`, `json_object`, `stop`)
 //! - `POST /v1/completions`        (IDE Tab Autocomplete & Qwen2.5-Coder FIM `suffix`, SSE/JSON)
 //! - `POST /v1/celestia/propose`   (Lenout Action DSL with strict `SchemaGrammar` + Prefix Cache)
 
 use crate::json::JsonValue;
 use crate::lenout::build_lenout_system_prompt;
+use crate::scheduler::{
+    run_scheduler_loop, GrammarKind, SchedulerMetrics, SchedulerRequest, StreamItem,
+};
 use crate::tools::{
     extract_tool_calls, inject_tools_into_messages, parse_openai_messages, parse_tools_and_choice,
     StreamEvent, ToolChoice, ToolStreamFilter,
 };
-use caelum_core::Result;
+use caelum_core::{CaelumError, Result};
 use caelum_gguf::GgufFile;
 use caelum_kernels::{Backend, CpuBackend};
 #[cfg(feature = "gpu")]
 use caelum_kernels::GpuContext;
-use caelum_models::{CaelumModel, KvPrecision, SamplerConfig};
-use caelum_tokenizer::{
-    ChatMessage, ChatRole, ChatTemplate, JsonGrammar, LogitGrammar, SchemaGrammar, Tokenizer,
-};
+use caelum_models::{CaelumModel, GenerationStats, KvPrecision, SamplerConfig};
+use caelum_tokenizer::{ChatMessage, ChatRole, ChatTemplate, Tokenizer};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-#[cfg(feature = "gpu")]
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::Ordering;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+struct ServerState {
+    tokenizer: Tokenizer,
+    template: ChatTemplate,
+    arch: String,
+    model_id: String,
+    hw_label: String,
+    kv_mode: String,
+    max_seq_len: usize,
+    num_threads: usize,
+    metrics: Arc<SchedulerMetrics>,
+    sched_tx: mpsc::Sender<SchedulerRequest>,
+}
+
+/// Default concurrent slot count based on model architecture.
+pub fn default_slots_for_arch(arch: &str) -> usize {
+    match arch {
+        "llama"
+        | "qwen2"
+        | "qwen2moe"
+        | "qwen3"
+        | "qwen3moe"
+        | "gemma"
+        | "gemma2"
+        | "gemma3"
+        | "phi3"
+        | "starcoder2"
+        | "mistral" => 4,
+        _ => 1,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_server(
@@ -39,11 +72,15 @@ pub fn run_server(
     template_override: Option<&str>,
     enable_repack: bool,
     use_gpu: bool,
+    requested_slots: Option<usize>,
 ) -> Result<()> {
     let backend = CpuBackend::new(threads);
     println!("[Caelum Server] Loading GGUF via zero-copy mmap: {model_path}");
     let gguf = GgufFile::open(model_path)?;
     let arch = gguf.architecture().unwrap_or("llama").to_string();
+    let num_slots = requested_slots
+        .unwrap_or_else(|| default_slots_for_arch(&arch))
+        .max(1);
     let model_id = Path::new(model_path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -60,18 +97,18 @@ pub fn run_server(
         {
             let gpu = Arc::new(GpuContext::new()?);
             let label = format!("wgpu {}", gpu.device_summary());
-            let m = CaelumModel::from_gguf_gpu(&gguf, gpu, max_ctx)?;
+            let m = CaelumModel::from_gguf_gpu_slots(&gguf, gpu, max_ctx, num_slots)?;
             (m, label)
         }
         #[cfg(not(feature = "gpu"))]
         {
-            return Err(caelum_core::CaelumError::Runtime(
+            return Err(CaelumError::Runtime(
                 "--gpu requires compiling with `--features gpu` (cargo build --release --features gpu)".into(),
             ));
         }
     } else {
-        let mut m = CaelumModel::from_gguf_with_kv(&gguf, max_ctx, kv_precision)?;
-        if enable_repack {
+        let mut m = CaelumModel::from_gguf_with_kv_slots(&gguf, max_ctx, kv_precision, num_slots)?;
+        if enable_repack && crate::should_repack_for_ram(gguf.file_size()) {
             m.optimize_for_backend(&backend);
         }
         let label = format!("{} ({} threads)", backend.caps(), backend.num_threads());
@@ -79,16 +116,16 @@ pub fn run_server(
     };
     let template = match template_override {
         None | Some("auto") => ChatTemplate::from_gguf(&gguf),
-        Some(name) => ChatTemplate::from_name(name).ok_or_else(|| {
-            caelum_core::CaelumError::Runtime(format!("unknown --template '{name}'"))
-        })?,
+        Some(name) => ChatTemplate::from_name(name)
+            .ok_or_else(|| CaelumError::Runtime(format!("unknown --template '{name}'")))?,
     };
 
+    let active_slots = model.num_slots();
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr)?;
     println!("============================================================");
     println!(
-        "  CAELUM v{} RUST INFERENCE SERVER READY",
+        "  CAELUM v{} MULTI-USER CONTINUOUS BATCHING SERVER READY",
         env!("CARGO_PKG_VERSION")
     );
     println!("  Listen:   http://{addr}");
@@ -101,50 +138,119 @@ pub fn run_server(
         model.kv_mode_label(),
         model.kv_cache_bytes() as f64 / (1024.0 * 1024.0)
     );
+    println!(
+        "  Batching: Continuous (iteration-level) | {} concurrent KV slot{} | ctx={}",
+        active_slots,
+        if active_slots == 1 { "" } else { "s" },
+        model.max_seq_len()
+    );
     println!("  Hardware: {hw_label}");
     println!("  Endpoints:");
     println!("    GET  / or /chat            (Interactive Web Chat — Claude/ChatGPT style)");
     println!("    GET  /docs                 (Interactive Web Docs & API Reference)");
-    println!("    GET  /health");
+    println!("    GET  /health               (Live slots_active / queue_depth telemetry)");
     println!("    GET  /v1/models");
-    println!("    POST /v1/chat/completions  (multi-turn, tools/function calling, SSE, json_object, prefix-cache)");
+    println!("    POST /v1/chat/completions  (multi-user SSE, tools/function calling, json_object, prefix-cache)");
     println!("    POST /v1/completions       (IDE FIM tab autocomplete: Qwen/DeepSeek/StarCoder2, SSE/JSON)");
     println!("    POST /v1/celestia/propose  (Lenout strict SchemaGrammar + prefix-cache)");
     println!("============================================================");
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if let Err(e) = handle_connection(
-                    &mut stream,
-                    &backend,
-                    &mut model,
-                    &tokenizer,
-                    template,
-                    &arch,
-                    &model_id,
-                    &hw_label,
-                ) {
-                    eprintln!("[Caelum Server] Request error: {e}");
+    let metrics = Arc::new(SchedulerMetrics::new(active_slots));
+    let (sched_tx, sched_rx) = mpsc::channel::<SchedulerRequest>();
+
+    let state = Arc::new(ServerState {
+        tokenizer,
+        template,
+        arch,
+        model_id,
+        hw_label,
+        kv_mode: model.kv_mode_label().to_string(),
+        max_seq_len: model.max_seq_len(),
+        num_threads: backend.num_threads(),
+        metrics: Arc::clone(&metrics),
+        sched_tx,
+    });
+
+    // Spawn non-blocking multi-threaded HTTP acceptor; main thread owns `gguf` + `model`
+    // and drives the Continuous Batching Scheduler loop directly with zero lifetime overhead.
+    let accept_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => {
+                    let st = Arc::clone(&accept_state);
+                    std::thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                        let _ = stream.set_nodelay(true);
+                        if let Err(e) = handle_connection(&mut stream, &st) {
+                            eprintln!("[Caelum Server] Request error: {e}");
+                        }
+                    });
                 }
+                Err(e) => eprintln!("[Caelum Server] Accept error: {e}"),
             }
-            Err(e) => eprintln!("[Caelum Server] Accept error: {e}"),
         }
-    }
+    });
+
+    run_scheduler_loop(&mut model, &backend, &state.tokenizer, sched_rx, metrics);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_connection(
-    stream: &mut TcpStream,
-    backend: &CpuBackend,
-    model: &mut CaelumModel<'_>,
-    tokenizer: &Tokenizer,
-    template: ChatTemplate,
-    arch: &str,
-    model_id: &str,
-    hw_label: &str,
-) -> Result<()> {
+fn submit_and_collect(
+    state: &ServerState,
+    prompt_tokens: Vec<u32>,
+    max_new_tokens: usize,
+    sampler_cfg: SamplerConfig,
+    grammar: GrammarKind,
+    stop_sequences: Vec<String>,
+) -> Result<(String, GenerationStats)> {
+    let (tx, rx) = mpsc::channel();
+    state
+        .sched_tx
+        .send(SchedulerRequest {
+            prompt_tokens,
+            max_new_tokens,
+            sampler_cfg,
+            grammar,
+            stop_sequences,
+            tx,
+        })
+        .map_err(|_| CaelumError::Runtime("scheduler stopped".into()))?;
+
+    for item in rx {
+        match item {
+            StreamItem::Token(_) => {}
+            StreamItem::Done { text, stats } => return Ok((text, stats)),
+            StreamItem::Error(e) => return Err(CaelumError::Runtime(e)),
+        }
+    }
+    Err(CaelumError::Runtime("scheduler closed stream prematurely".into()))
+}
+
+fn submit_stream(
+    state: &ServerState,
+    prompt_tokens: Vec<u32>,
+    max_new_tokens: usize,
+    sampler_cfg: SamplerConfig,
+    grammar: GrammarKind,
+    stop_sequences: Vec<String>,
+) -> Result<mpsc::Receiver<StreamItem>> {
+    let (tx, rx) = mpsc::channel();
+    state
+        .sched_tx
+        .send(SchedulerRequest {
+            prompt_tokens,
+            max_new_tokens,
+            sampler_cfg,
+            grammar,
+            stop_sequences,
+            tx,
+        })
+        .map_err(|_| CaelumError::Runtime("scheduler stopped".into()))?;
+    Ok(rx)
+}
+
+fn handle_connection(stream: &mut TcpStream, state: &ServerState) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line)? == 0 {
@@ -188,18 +294,27 @@ fn handle_connection(
         }
     }
 
+    let tokenizer = &state.tokenizer;
+    let template = state.template;
+    let model_id = state.model_id.as_str();
+
     match (method, path) {
         ("GET", "/health") => {
             let now = unix_ts();
             let resp = format!(
-                r#"{{"status":"healthy","engine":"caelum-rs","version":"{}","model":"{}","architecture":"{}","template":"{}","kernel":"{}","kv_mode":"{}","threads":{},"timestamp":{}}}"#,
+                r#"{{"status":"healthy","engine":"caelum-rs","version":"{}","model":"{}","architecture":"{}","template":"{}","kernel":"{}","kv_mode":"{}","threads":{},"batching":"continuous","slots_total":{},"slots_active":{},"queue_depth":{},"total_requests":{},"total_tokens_generated":{},"timestamp":{}}}"#,
                 env!("CARGO_PKG_VERSION"),
                 escape_json(model_id),
-                escape_json(arch),
+                escape_json(&state.arch),
                 template.name(),
-                escape_json(hw_label),
-                model.kv_mode_label(),
-                backend.num_threads(),
+                escape_json(&state.hw_label),
+                escape_json(&state.kv_mode),
+                state.num_threads,
+                state.metrics.slots_total.load(Ordering::Relaxed),
+                state.metrics.slots_active.load(Ordering::Relaxed),
+                state.metrics.queue_depth.load(Ordering::Relaxed),
+                state.metrics.total_requests.load(Ordering::Relaxed),
+                state.metrics.total_tokens_generated.load(Ordering::Relaxed),
                 now
             );
             write_response(stream, "200 OK", &resp)
@@ -210,8 +325,8 @@ fn handle_connection(
                 r#"{{"object":"list","data":[{{"id":"{}","object":"model","created":{},"owned_by":"caelum-rs","architecture":"{}","context_length":{}}}]}}"#,
                 escape_json(model_id),
                 now,
-                escape_json(arch),
-                model.max_seq_len()
+                escape_json(&state.arch),
+                state.max_seq_len
             );
             write_response(stream, "200 OK", &resp)
         }
@@ -268,14 +383,11 @@ fn handle_connection(
                 top_p,
                 ..Default::default()
             };
-
-            let mut json_g = if json_mode && !tools_active {
-                Some(JsonGrammar::new())
+            let grammar = if json_mode && !tools_active {
+                GrammarKind::Json
             } else {
-                None
+                GrammarKind::None
             };
-            let grammar_ref: Option<&mut dyn LogitGrammar> =
-                json_g.as_mut().map(|g| g as &mut dyn LogitGrammar);
 
             if is_stream {
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
@@ -292,7 +404,7 @@ fn handle_connection(
                     "data: {{\"id\":\"{cmpl_id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{escaped_model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n",
                 );
                 if stream.write_all(role_chunk.as_bytes()).is_err() || stream.flush().is_err() {
-                    write_err = true;
+                    return Ok(());
                 }
 
                 let emit_text = |s: &mut TcpStream, err: &mut bool, txt: &str| {
@@ -338,25 +450,47 @@ fn handle_connection(
                     None
                 };
 
-                let (_, stats) = model.generate_with_stop(
-                    backend,
-                    tokenizer,
-                    &prompt_tokens,
+                let rx = submit_stream(
+                    state,
+                    prompt_tokens,
                     max_tokens,
-                    &sampler_cfg,
-                    grammar_ref,
-                    &stop_seqs,
-                    |_, piece| {
-                        if write_err || piece.is_empty() {
-                            return;
-                        }
-                        if let Some(ref mut filter) = tool_filter {
-                            filter.push(piece, |ev| emit_event(stream, &mut write_err, ev));
-                        } else {
-                            emit_text(stream, &mut write_err, piece);
-                        }
-                    },
+                    sampler_cfg,
+                    grammar,
+                    stop_seqs,
                 )?;
+                let mut final_stats: Option<GenerationStats> = None;
+
+                for item in rx {
+                    match item {
+                        StreamItem::Token(piece) => {
+                            if piece.is_empty() {
+                                continue;
+                            }
+                            if let Some(ref mut filter) = tool_filter {
+                                filter.push(&piece, |ev| emit_event(stream, &mut write_err, ev));
+                            } else {
+                                emit_text(stream, &mut write_err, &piece);
+                            }
+                            if write_err {
+                                // Drop `rx` immediately so scheduler reclaims KV slot on next step!
+                                return Ok(());
+                            }
+                        }
+                        StreamItem::Done { stats, .. } => {
+                            final_stats = Some(stats);
+                            break;
+                        }
+                        StreamItem::Error(msg) => {
+                            let err_chunk = format!(
+                                "data: {{\"error\":{{\"message\":\"{}\"}}}}\n\ndata: [DONE]\n\n",
+                                escape_json(&msg)
+                            );
+                            let _ = stream.write_all(err_chunk.as_bytes());
+                            let _ = stream.flush();
+                            return Ok(());
+                        }
+                    }
+                }
 
                 let mut has_tool_calls = false;
                 if let Some(ref mut filter) = tool_filter {
@@ -366,12 +500,12 @@ fn handle_connection(
 
                 if !write_err {
                     let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
+                    let (pt, gt, ct) = final_stats
+                        .map(|s| (s.prompt_tokens, s.generated_tokens, s.cached_prompt_tokens))
+                        .unwrap_or((0, 0, 0));
                     let final_chunk = format!(
-                        "data: {{\"id\":\"{cmpl_id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{escaped_model}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{},\"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}}}\n\ndata: [DONE]\n\n",
-                        stats.prompt_tokens,
-                        stats.generated_tokens,
-                        stats.prompt_tokens + stats.generated_tokens,
-                        stats.cached_prompt_tokens
+                        "data: {{\"id\":\"{cmpl_id}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":\"{escaped_model}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}],\"usage\":{{\"prompt_tokens\":{pt},\"completion_tokens\":{gt},\"total_tokens\":{},\"prompt_tokens_details\":{{\"cached_tokens\":{ct}}}}}}}\n\ndata: [DONE]\n\n",
+                        pt + gt,
                     );
                     let _ = stream.write_all(final_chunk.as_bytes());
                     let _ = stream.flush();
@@ -379,16 +513,23 @@ fn handle_connection(
                 return Ok(());
             }
 
-            let (output, stats) = model.generate_with_stop(
-                backend,
-                tokenizer,
-                &prompt_tokens,
+            let (output, stats) = match submit_and_collect(
+                state,
+                prompt_tokens,
                 max_tokens,
-                &sampler_cfg,
-                grammar_ref,
-                &stop_seqs,
-                |_, _| {},
-            )?;
+                sampler_cfg,
+                grammar,
+                stop_seqs,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return write_response(
+                        stream,
+                        "400 Bad Request",
+                        &format!(r#"{{"error":{{"message":"{}"}}}}"#, escape_json(&e.to_string())),
+                    );
+                }
+            };
 
             let now = unix_ts();
             let (content_opt, tool_calls) = if tools_active {
@@ -437,7 +578,6 @@ fn handle_connection(
             write_response(stream, "200 OK", &resp)
         }
         ("POST", "/v1/completions") => {
-            // Raw completion & IDE Fill-In-The-Middle (FIM) autocomplete endpoint
             let req = match JsonValue::parse(&body_str) {
                 Ok(v) => v,
                 Err(e) => {
@@ -504,56 +644,74 @@ fn handle_connection(
 
                 let cmpl_id = format!("cmpl-caelum-{}", unix_ts());
                 let created = unix_ts();
-                let mut write_err = false;
-
-                let _ = model.generate_with_stop(
-                    backend,
-                    tokenizer,
-                    &prompt_tokens,
+                let rx = submit_stream(
+                    state,
+                    prompt_tokens,
                     max_tokens,
-                    &sampler_cfg,
-                    None,
-                    &stop_seqs,
-                    |_, piece| {
-                        if write_err || piece.is_empty() {
-                            return;
-                        }
-                        let chunk = format!(
-                            "data: {{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"text\":\"{}\",\"index\":0,\"finish_reason\":null}}]}}\n\n",
-                            cmpl_id,
-                            created,
-                            escape_json(model_id),
-                            escape_json(piece)
-                        );
-                        if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
-                            write_err = true;
-                        }
-                    },
+                    sampler_cfg,
+                    GrammarKind::None,
+                    stop_seqs,
                 )?;
 
-                if !write_err {
-                    let final_chunk = format!(
-                        "data: {{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"text\":\"\",\"index\":0,\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
-                        cmpl_id,
-                        created,
-                        escape_json(model_id)
-                    );
-                    let _ = stream.write_all(final_chunk.as_bytes());
-                    let _ = stream.flush();
+                for item in rx {
+                    match item {
+                        StreamItem::Token(piece) => {
+                            if piece.is_empty() {
+                                continue;
+                            }
+                            let chunk = format!(
+                                "data: {{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"text\":\"{}\",\"index\":0,\"finish_reason\":null}}]}}\n\n",
+                                cmpl_id,
+                                created,
+                                escape_json(model_id),
+                                escape_json(&piece)
+                            );
+                            if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        StreamItem::Done { .. } => break,
+                        StreamItem::Error(msg) => {
+                            let err_chunk = format!(
+                                "data: {{\"error\":{{\"message\":\"{}\"}}}}\n\ndata: [DONE]\n\n",
+                                escape_json(&msg)
+                            );
+                            let _ = stream.write_all(err_chunk.as_bytes());
+                            let _ = stream.flush();
+                            return Ok(());
+                        }
+                    }
                 }
+
+                let final_chunk = format!(
+                    "data: {{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"text\":\"\",\"index\":0,\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+                    cmpl_id,
+                    created,
+                    escape_json(model_id)
+                );
+                let _ = stream.write_all(final_chunk.as_bytes());
+                let _ = stream.flush();
                 return Ok(());
             }
 
-            let (output, stats) = model.generate_with_stop(
-                backend,
-                tokenizer,
-                &prompt_tokens,
+            let (output, stats) = match submit_and_collect(
+                state,
+                prompt_tokens,
                 max_tokens,
-                &sampler_cfg,
-                None,
-                &stop_seqs,
-                |_, _| {},
-            )?;
+                sampler_cfg,
+                GrammarKind::None,
+                stop_seqs,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return write_response(
+                        stream,
+                        "400 Bad Request",
+                        &format!(r#"{{"error":{{"message":"{}"}}}}"#, escape_json(&e.to_string())),
+                    );
+                }
+            };
             let now = unix_ts();
             let resp = format!(
                 r#"{{"id":"cmpl-caelum-{}","object":"text_completion","created":{},"model":"{}","choices":[{{"text":"{}","index":0,"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{},"prompt_tokens_details":{{"cached_tokens":{}}},"prefill_tps":{:.2},"decode_tps":{:.2}}}}}"#,
@@ -611,19 +769,26 @@ fn handle_connection(
             let formatted = template.format(&messages, true);
             let prompt_tokens = tokenizer.encode(&formatted, tokenizer.add_bos);
 
-            let mut schema_grammar = SchemaGrammar::lenout_proposal(&mode);
-            let (output, stats) = model.generate_with_grammar(
-                backend,
-                tokenizer,
-                &prompt_tokens,
+            let (output, stats) = match submit_and_collect(
+                state,
+                prompt_tokens,
                 max_tokens,
-                &SamplerConfig {
+                SamplerConfig {
                     temperature: 0.2,
                     ..Default::default()
                 },
-                Some(&mut schema_grammar),
-                |_, _| {},
-            )?;
+                GrammarKind::LenoutSchema(mode),
+                Vec::new(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return write_response(
+                        stream,
+                        "400 Bad Request",
+                        &format!(r#"{{"ok":false,"error":{{"message":"{}"}}}}"#, escape_json(&e.to_string())),
+                    );
+                }
+            };
 
             let trimmed = output.trim();
             let resp = if trimmed.starts_with('{') && trimmed.ends_with('}') {

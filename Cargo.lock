@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "caelum-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "caelum-core",
  "caelum-gguf",
@@ -107,18 +107,18 @@ dependencies = [
 
 [[package]]
 name = "caelum-core"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "caelum-gguf"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "caelum-core",
 ]
 
 [[package]]
 name = "caelum-kernels"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "caelum-core",
  "pollster",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "caelum-models"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "caelum-core",
  "caelum-gguf",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "caelum-tokenizer"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "caelum-core",
  "caelum-gguf",

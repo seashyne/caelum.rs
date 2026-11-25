@@ -1819,3 +1819,240 @@ fn main(
     }
 }
 "#;
+
+/// Multi-Slot Continuous Batching RoPE + Packed F16 KV Cache Store.
+/// `SLOT_META` holds `[slot_kv_u32_base, pos]` pairs per batch token `tok in 0..batch`.
+pub const SHADER_ROPE_KV_STORE_SLOTS_F16: &str = r#"
+struct Params {
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    half_rope: u32,
+    batch: u32,
+    layer_kv_u32_offset: u32,
+    is_neox: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> Q: array<f32>;
+@group(0) @binding(1) var<storage, read_write> K: array<f32>;
+@group(0) @binding(2) var<storage, read> V: array<f32>;
+@group(0) @binding(3) var<storage, read> COS_SIN: array<f32>;
+@group(0) @binding(4) var<storage, read_write> K_CACHE: array<u32>;
+@group(0) @binding(5) var<storage, read_write> V_CACHE: array<u32>;
+@group(0) @binding(6) var<storage, read> SLOT_META: array<u32>;
+@group(0) @binding(7) var<uniform> P: Params;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    let tok = gid.y;
+    if (tok >= P.batch) { return; }
+
+    let slot_base = SLOT_META[tok * 2u];
+    let pos = SLOT_META[tok * 2u + 1u];
+    let kv_layer_base = slot_base + P.layer_kv_u32_offset;
+
+    let q_dim = P.num_heads * P.head_dim;
+    let kv_dim = P.num_kv_heads * P.head_dim;
+    let hd_u32 = P.head_dim >> 1u;
+    let kv_dim_u32 = kv_dim >> 1u;
+    let lut_stride = P.half_rope * 2u;
+    let lut_base = pos * lut_stride;
+
+    // 1. Apply RoPE to Q heads (F32)
+    let q_pairs = P.num_heads * P.half_rope;
+    if (tid < q_pairs) {
+        let h = tid / P.half_rope;
+        let i = tid % P.half_rope;
+        let c = COS_SIN[lut_base + i];
+        let s = COS_SIN[lut_base + P.half_rope + i];
+        let h_off = tok * q_dim + h * P.head_dim;
+        if (P.is_neox != 0u) {
+            let x0 = Q[h_off + i];
+            let x1 = Q[h_off + i + P.half_rope];
+            Q[h_off + i] = x0 * c - x1 * s;
+            Q[h_off + i + P.half_rope] = x0 * s + x1 * c;
+        } else {
+            let x0 = Q[h_off + 2u * i];
+            let x1 = Q[h_off + 2u * i + 1u];
+            Q[h_off + 2u * i] = x0 * c - x1 * s;
+            Q[h_off + 2u * i + 1u] = x0 * s + x1 * c;
+        }
+    }
+
+    // 2. Apply RoPE to K heads & store packed F16 K, V into this token's slot KV cache
+    if (P.is_neox != 0u) {
+        let half_rope_u32 = P.half_rope >> 1u;
+        let k_u32_jobs = P.num_kv_heads * half_rope_u32;
+        if (tid < k_u32_jobs) {
+            let kh = tid / half_rope_u32;
+            let p = tid % half_rope_u32;
+            let i0 = p * 2u;
+            let i1 = i0 + 1u;
+            let c0 = COS_SIN[lut_base + i0];
+            let s0 = COS_SIN[lut_base + P.half_rope + i0];
+            let c1 = COS_SIN[lut_base + i1];
+            let s1 = COS_SIN[lut_base + P.half_rope + i1];
+
+            let kh_off = tok * kv_dim + kh * P.head_dim;
+            let x0a = K[kh_off + i0];
+            let x1a = K[kh_off + i0 + P.half_rope];
+            let r0a = x0a * c0 - x1a * s0;
+            let r1a = x0a * s0 + x1a * c0;
+
+            let x0b = K[kh_off + i1];
+            let x1b = K[kh_off + i1 + P.half_rope];
+            let r0b = x0b * c1 - x1b * s1;
+            let r1b = x0b * s1 + x1b * c1;
+
+            let cache_u32 = kv_layer_base + pos * kv_dim_u32 + kh * hd_u32;
+            K_CACHE[cache_u32 + p] = pack2x16float(vec2<f32>(r0a, r0b));
+            K_CACHE[cache_u32 + p + half_rope_u32] = pack2x16float(vec2<f32>(r1a, r1b));
+            V_CACHE[cache_u32 + p] = pack2x16float(vec2<f32>(V[kh_off + i0], V[kh_off + i1]));
+            V_CACHE[cache_u32 + p + half_rope_u32] = pack2x16float(vec2<f32>(
+                V[kh_off + i0 + P.half_rope],
+                V[kh_off + i1 + P.half_rope],
+            ));
+        }
+    } else {
+        let k_pairs = P.num_kv_heads * P.half_rope;
+        if (tid < k_pairs) {
+            let kh = tid / P.half_rope;
+            let i = tid % P.half_rope;
+            let c = COS_SIN[lut_base + i];
+            let s = COS_SIN[lut_base + P.half_rope + i];
+            let kh_off = tok * kv_dim + kh * P.head_dim;
+            let x0 = K[kh_off + 2u * i];
+            let x1 = K[kh_off + 2u * i + 1u];
+            let r0 = x0 * c - x1 * s;
+            let r1 = x0 * s + x1 * c;
+            let cache_u32 = kv_layer_base + pos * kv_dim_u32 + kh * hd_u32;
+            K_CACHE[cache_u32 + i] = pack2x16float(vec2<f32>(r0, r1));
+            V_CACHE[cache_u32 + i] = pack2x16float(vec2<f32>(V[kh_off + 2u * i], V[kh_off + 2u * i + 1u]));
+        }
+    }
+
+    // 3. Copy any non-RoPE trailing head dims
+    let rope_dim = P.half_rope * 2u;
+    if (rope_dim < P.head_dim && tid < kv_dim_u32) {
+        let kh = tid / hd_u32;
+        let d2 = tid % hd_u32;
+        if (d2 >= P.half_rope) {
+            let src = tok * kv_dim + kh * P.head_dim + d2 * 2u;
+            let dst = kv_layer_base + pos * kv_dim_u32 + kh * hd_u32 + d2;
+            K_CACHE[dst] = pack2x16float(vec2<f32>(K[src], K[src + 1u]));
+            V_CACHE[dst] = pack2x16float(vec2<f32>(V[src], V[src + 1u]));
+        }
+    }
+}
+"#;
+
+/// Multi-Slot Continuous Batching Online Tiled Flash-Attention GQA over Packed F16 KV Cache.
+/// Each batch token `tok` independently attends to its own slot `SLOT_META[2*tok]` up to `SLOT_META[2*tok+1]`.
+pub const SHADER_GQA_FLASH_ATTN_SLOTS_F16: &str = r#"/*SG_ENABLE*/
+struct Params {
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    batch: u32,
+    layer_kv_u32_offset: u32,
+    inv_sqrt_hd: f32,
+    sliding_window: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> Q: array<f32>;
+@group(0) @binding(1) var<storage, read> K_CACHE: array<u32>;
+@group(0) @binding(2) var<storage, read> V_CACHE: array<u32>;
+@group(0) @binding(3) var<storage, read_write> OUT: array<f32>;
+@group(0) @binding(4) var<storage, read> SLOT_META: array<u32>;
+@group(0) @binding(5) var<uniform> P: Params;
+
+var<workgroup> q_sh: array<f32, 512>;
+var<workgroup> out_sh: array<f32, 512>;
+var<workgroup> scores: array<f32, 64>;
+var<workgroup> red: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x;
+    let h = wid.x;
+    let tok = wid.y;
+    if (h >= P.num_heads || tok >= P.batch) { return; }
+
+    let slot_base = SLOT_META[tok * 2u];
+    let pos = SLOT_META[tok * 2u + 1u];
+    let kv_layer_base = slot_base + P.layer_kv_u32_offset;
+
+    let hd = P.head_dim;
+    let hd_u32 = hd >> 1u;
+    let q_dim = P.num_heads * hd;
+    let kv_dim_u32 = (P.num_kv_heads * hd) >> 1u;
+    let kv_mul = P.num_heads / P.num_kv_heads;
+    let kv_h = h / kv_mul;
+    let seq_len = pos + 1u;
+    let t_start = select(
+        0u,
+        select(0u, seq_len - P.sliding_window, seq_len > P.sliding_window),
+        P.sliding_window > 0u
+    );
+    let q_off = tok * q_dim + h * hd;
+
+    for (var d = tid; d < hd; d += 64u) {
+        q_sh[d] = Q[q_off + d];
+        out_sh[d] = 0.0;
+    }
+    workgroupBarrier();
+
+    var running_max = -1e30;
+    var running_sum = 0.0;
+
+    for (var tile_start = t_start; tile_start < seq_len; tile_start += 64u) {
+        let tile_end = min(64u, seq_len - tile_start);
+        let s = tile_start + tid;
+        var sc = -1e30;
+        if (s < seq_len) {
+            let k_off = kv_layer_base + s * kv_dim_u32 + kv_h * hd_u32;
+            var dot_v = 0.0;
+            for (var d2 = 0u; d2 < hd_u32; d2++) {
+                let kp = unpack2x16float(K_CACHE[k_off + d2]);
+                dot_v += q_sh[d2 * 2u] * kp.x + q_sh[d2 * 2u + 1u] * kp.y;
+            }
+            sc = dot_v * P.inv_sqrt_hd;
+        }
+        /*REDUCE_WG64_MAX*/
+
+        let new_max = max(running_max, tile_max);
+        let rescale = select(1.0, exp(running_max - new_max), tile_start > t_start);
+        let w = select(0.0, exp(sc - new_max), tid < tile_end);
+        scores[tid] = w;
+        /*REDUCE_WG64_WSUM*/
+
+        for (var d2 = tid; d2 < hd_u32; d2 += 64u) {
+            var a0 = out_sh[d2 * 2u] * rescale;
+            var a1 = out_sh[d2 * 2u + 1u] * rescale;
+            for (var k = 0u; k < tile_end; k++) {
+                let v_off = kv_layer_base + (tile_start + k) * kv_dim_u32 + kv_h * hd_u32 + d2;
+                let vp = unpack2x16float(V_CACHE[v_off]);
+                let wk = scores[k];
+                a0 += wk * vp.x;
+                a1 += wk * vp.y;
+            }
+            out_sh[d2 * 2u] = a0;
+            out_sh[d2 * 2u + 1u] = a1;
+        }
+        running_sum = running_sum * rescale + tile_sum;
+        running_max = new_max;
+        workgroupBarrier();
+    }
+
+    let inv_sum = 1.0 / max(running_sum, 1e-20);
+    for (var d = tid; d < hd; d += 64u) {
+        OUT[q_off + d] = out_sh[d] * inv_sum;
+    }
+}
+"#;

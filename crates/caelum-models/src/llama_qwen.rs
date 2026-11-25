@@ -404,14 +404,14 @@ pub struct LlamaQwenModel<'a> {
     output_weight: TensorView<'a>,
     rope: RopeTable,
     rope_local: Option<RopeTable>,
-    cache: KvCache,
+    caches: Vec<KvCache>,
     scratch: ScratchBuf,
     packed_bytes: usize,
 }
 
 impl<'a> LlamaQwenModel<'a> {
     pub fn from_gguf(gguf: &'a GgufFile, max_seq_override: Option<usize>) -> Result<Self> {
-        Self::from_gguf_with_kv(gguf, max_seq_override, KvPrecision::F32)
+        Self::from_gguf_with_kv_slots(gguf, max_seq_override, KvPrecision::F32, 1)
     }
 
     pub fn from_gguf_with_kv(
@@ -419,6 +419,16 @@ impl<'a> LlamaQwenModel<'a> {
         max_seq_override: Option<usize>,
         kv_precision: KvPrecision,
     ) -> Result<Self> {
+        Self::from_gguf_with_kv_slots(gguf, max_seq_override, kv_precision, 1)
+    }
+
+    pub fn from_gguf_with_kv_slots(
+        gguf: &'a GgufFile,
+        max_seq_override: Option<usize>,
+        kv_precision: KvPrecision,
+        num_slots: usize,
+    ) -> Result<Self> {
+        let num_slots = num_slots.max(1);
         let config = LlamaQwenConfig::from_gguf(gguf, max_seq_override)?;
         let q_dim = config.num_heads * config.head_dim;
         let kv_dim = config.num_kv_heads * config.head_dim;
@@ -546,13 +556,17 @@ impl<'a> LlamaQwenModel<'a> {
             });
         }
 
-        let cache = KvCache::new(
-            config.num_layers,
-            config.max_seq_len,
-            config.num_kv_heads,
-            config.head_dim,
-            kv_precision,
-        );
+        let caches = (0..num_slots)
+            .map(|_| {
+                KvCache::new(
+                    config.num_layers,
+                    config.max_seq_len,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    kv_precision,
+                )
+            })
+            .collect();
         let rope = RopeTable::new(config.max_seq_len, &config.rope);
         let rope_local = config
             .rope_local
@@ -569,7 +583,7 @@ impl<'a> LlamaQwenModel<'a> {
             output_weight,
             rope,
             rope_local,
-            cache,
+            caches,
             scratch,
             packed_bytes: 0,
         })
@@ -625,23 +639,33 @@ impl<'a> LlamaQwenModel<'a> {
         self.packed_bytes
     }
 
+    pub fn num_slots(&self) -> usize {
+        self.caches.len()
+    }
+
     pub fn max_seq_len(&self) -> usize {
         self.config.max_seq_len
     }
 
     pub fn kv_cache_bytes(&self) -> usize {
-        self.cache.memory_bytes()
+        self.caches.iter().map(|c| c.memory_bytes()).sum()
     }
 
     pub fn kv_precision(&self) -> KvPrecision {
-        self.cache.precision
+        self.caches[0].precision
     }
 
     pub fn reset_cache(&mut self) {
-        self.cache.clear();
+        for c in &mut self.caches {
+            c.clear();
+        }
     }
 
-    /// Runs one autoregressive step for `token_id` at sequence position `pos`.
+    pub fn reset_slot(&mut self, slot: usize) {
+        self.caches[slot].clear();
+    }
+
+    /// Runs one autoregressive step for `token_id` at sequence position `pos` on slot 0.
     /// Zero heap allocations in the decode hot path.
     pub fn forward_token(
         &mut self,
@@ -650,6 +674,19 @@ impl<'a> LlamaQwenModel<'a> {
         pos: usize,
         compute_logits: bool,
     ) -> Result<&[f32]> {
+        self.forward_token_slot(backend, 0, token_id, pos, compute_logits)
+    }
+
+    /// Runs one autoregressive step for `token_id` at sequence position `pos` on a specific KV `slot`.
+    pub fn forward_token_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        token_id: u32,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<&[f32]> {
+        debug_assert!(slot < self.caches.len());
         let cfg = &self.config;
         let head_dim = cfg.head_dim;
         let q_dim = cfg.num_heads * head_dim;
@@ -774,13 +811,13 @@ impl<'a> LlamaQwenModel<'a> {
             }
 
             // Store K, V into cache slot `pos`
-            self.cache.store(l, pos, &self.scratch.k, &self.scratch.v);
+            self.caches[slot].store(l, pos, &self.scratch.k, &self.scratch.v);
 
             // Grouped Query Attention over `0..=pos` (with optional SWA + logit soft-capping)
             let softcap = cfg.attn_logit_softcap;
             if pos >= 128 && backend.num_threads() > 1 {
                 let q_ref: &[f32] = &self.scratch.q;
-                let cache_ref = &self.cache;
+                let cache_ref = &self.caches[slot];
                 let xb2_addr = self.scratch.xb2.as_mut_ptr() as usize;
                 let seq_len = pos + 1;
                 backend.parallel_for(cfg.num_heads, &|h_start, h_end| {
@@ -811,7 +848,7 @@ impl<'a> LlamaQwenModel<'a> {
                     let qh = &self.scratch.q[h * head_dim..(h + 1) * head_dim];
                     let kv_h = h / kv_mul;
                     let out_h = &mut self.scratch.xb2[h * head_dim..(h + 1) * head_dim];
-                    self.cache.attend_head_ext(
+                    self.caches[slot].attend_head_ext(
                         backend,
                         l,
                         kv_h,
@@ -1047,7 +1084,7 @@ impl<'a> LlamaQwenModel<'a> {
         Ok(&self.scratch.logits)
     }
 
-    /// High-throughput Batched Prefill GEMM (`PREFILL_CHUNK = 256`):
+    /// High-throughput Batched Prefill GEMM (`PREFILL_CHUNK = 256`) on slot 0:
     /// reads each layer's repacked weight matrices ONCE across up to 256 tokens in L1 cache.
     pub fn forward_batch(
         &mut self,
@@ -1060,9 +1097,69 @@ impl<'a> LlamaQwenModel<'a> {
             return Ok(&self.scratch.logits);
         }
         if tokens.len() == 1 {
-            return self.forward_token(backend, tokens[0], start_pos, compute_last_logits);
+            return self.forward_token_slot(backend, 0, tokens[0], start_pos, compute_last_logits);
         }
+        let items: Vec<(usize, u32, usize)> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, &tok)| (0, tok, start_pos + i))
+            .collect();
+        let _ = self.forward_batch_items(backend, &items, false, compute_last_logits)?;
+        Ok(&self.scratch.logits)
+    }
 
+    /// Runs batched prefill for a specific KV `slot` and returns logits for the last prompt token.
+    pub fn prefill_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        debug_assert!(slot < self.caches.len());
+        if tokens.is_empty() {
+            return Ok(self.scratch.logits.clone());
+        }
+        if tokens.len() == 1 {
+            let logits = self.forward_token_slot(backend, slot, tokens[0], start_pos, true)?;
+            return Ok(logits.to_vec());
+        }
+        let items: Vec<(usize, u32, usize)> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, &tok)| (slot, tok, start_pos + i))
+            .collect();
+        let _ = self.forward_batch_items(backend, &items, false, true)?;
+        Ok(self.scratch.logits.clone())
+    }
+
+    /// **True Multi-User Continuous Batching Decode Step (CPU)**:
+    /// Evaluates `items = [(slot_id, token_id, pos), ...]` in ONE batched GEMM pass,
+    /// reading repacked model weights ONCE across all concurrent users and attending
+    /// each user independently to its own KV cache slot!
+    pub fn decode_slots(
+        &mut self,
+        backend: &dyn Backend,
+        items: &[(usize, u32, usize)],
+    ) -> Result<Vec<Vec<f32>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if items.len() == 1 {
+            let (slot, tok, pos) = items[0];
+            let logits = self.forward_token_slot(backend, slot, tok, pos, true)?;
+            return Ok(vec![logits.to_vec()]);
+        }
+        self.forward_batch_items(backend, items, true, false)
+    }
+
+    fn forward_batch_items(
+        &mut self,
+        backend: &dyn Backend,
+        items: &[(usize, u32, usize)],
+        compute_all_logits: bool,
+        compute_last_logits: bool,
+    ) -> Result<Vec<Vec<f32>>> {
         const PREFILL_CHUNK: usize = 256;
         let cfg = &self.config;
         let h = cfg.hidden_size;
@@ -1082,7 +1179,7 @@ impl<'a> LlamaQwenModel<'a> {
             .iter()
             .any(|l| matches!(l.ffn, FfnBlock::Dense { .. }));
 
-        let max_b = tokens.len().min(PREFILL_CHUNK);
+        let max_b = items.len().min(PREFILL_CHUNK);
         let mut x_buf = vec![0.0f32; max_b * h];
         let mut xb_buf = vec![0.0f32; max_b * h];
         let mut norm_tmp = vec![0.0f32; h];
@@ -1106,17 +1203,21 @@ impl<'a> LlamaQwenModel<'a> {
             Vec::new()
         };
         let mut head_tmp = vec![0.0f32; head_dim];
+        let mut all_logits = if compute_all_logits {
+            Vec::with_capacity(items.len())
+        } else {
+            Vec::new()
+        };
 
         let mut offset = 0usize;
-        while offset < tokens.len() {
-            let chunk = &tokens[offset..(offset + PREFILL_CHUNK).min(tokens.len())];
+        while offset < items.len() {
+            let chunk = &items[offset..(offset + PREFILL_CHUNK).min(items.len())];
             let b = chunk.len();
-            let chunk_pos = start_pos + offset;
-            let is_last_chunk = offset + b == tokens.len();
+            let is_last_chunk = offset + b == items.len();
 
-            // 1. Dequantize token embeddings for all `b` tokens in chunk (+ Gemma-2/3 embed scale)
+            // 1. Dequantize token embeddings for all `b` items in chunk (+ Gemma-2/3 embed scale)
             let x = &mut x_buf[..b * h];
-            for (t, &tok) in chunk.iter().enumerate() {
+            for (t, &(_slot, tok, _pos)) in chunk.iter().enumerate() {
                 self.token_embd
                     .dequantize_row(tok as usize, &mut x[t * h..(t + 1) * h])?;
             }
@@ -1202,7 +1303,8 @@ impl<'a> LlamaQwenModel<'a> {
 
                 // QKV biases, optional Qwen3 QK-Norm, exact RoPE, and KV cache store
                 for t in 0..b {
-                    let pos = chunk_pos + t;
+                    let (slot, _tok, pos) = chunk[t];
+                    debug_assert!(slot < self.caches.len());
                     let qt = &mut q[t * q_dim..(t + 1) * q_dim];
                     let kt = &mut k[t * kv_dim..(t + 1) * kv_dim];
                     let vt = &mut v[t * kv_dim..(t + 1) * kv_dim];
@@ -1245,14 +1347,14 @@ impl<'a> LlamaQwenModel<'a> {
                         rope_tbl.apply(&mut kt[kh * head_dim..(kh + 1) * head_dim], pos);
                     }
 
-                    self.cache.store(l, pos, kt, vt);
+                    self.caches[slot].store(l, pos, kt, vt);
                 }
 
                 // Multi-threaded Causal GQA Attention across all `b * num_heads` query heads
                 let total_jobs = b * cfg.num_heads;
-                let max_t_len = chunk_pos + b;
+                let max_t_len = chunk.iter().map(|&(_, _, p)| p + 1).max().unwrap_or(1);
                 let q_ref: &[f32] = q;
-                let cache_ref = &self.cache;
+                let caches_ref: &[KvCache] = &self.caches;
                 let attn_addr = attn_out.as_mut_ptr() as usize;
                 let num_heads = cfg.num_heads;
                 let softcap = cfg.attn_logit_softcap;
@@ -1263,14 +1365,14 @@ impl<'a> LlamaQwenModel<'a> {
                     for job in j_start..j_end {
                         let t = job / num_heads;
                         let head = job % num_heads;
-                        let pos = chunk_pos + t;
+                        let (slot, _tok, pos) = chunk[t];
                         let q_off = t * q_dim + head * head_dim;
                         let qh = &q_ref[q_off..q_off + head_dim];
                         let kv_h = head / kv_mul;
                         let out_h = unsafe {
                             std::slice::from_raw_parts_mut(attn_ptr.add(q_off), head_dim)
                         };
-                        cache_ref.attend_head_ext(
+                        caches_ref[slot].attend_head_ext(
                             backend,
                             l,
                             kv_h,
@@ -1553,8 +1655,48 @@ impl<'a> LlamaQwenModel<'a> {
                 }
             }
 
-            // 3. Final Norm & LM Head ONLY for the very last token of the prompt
-            if is_last_chunk && compute_last_logits {
+            // 3. Final Norm & LM Head (either ALL tokens for continuous batching decode, or last token for prefill)
+            if compute_all_logits {
+                for t in 0..b {
+                    apply_norm(
+                        backend,
+                        &x[t * h..(t + 1) * h],
+                        &self.output_norm,
+                        self.output_norm_bias.as_deref(),
+                        cfg.rms_norm_eps,
+                        &mut xb[t * h..(t + 1) * h],
+                    );
+                }
+                let vocab = cfg.vocab_size;
+                let mut batch_logits = vec![0.0f32; b * vocab];
+                if can_q8k_h && is_k_quant(self.output_weight.dtype) {
+                    let nb = h / QK_K;
+                    let xq = &mut xq8k_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_k(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
+                    }
+                    backend.matmul_q8k_act(&self.output_weight, xb, xq, b, &mut batch_logits)?;
+                } else if can_q8_h && matches!(self.output_weight.dtype, DType::Q4_0 | DType::Q8_0) {
+                    let nb = h / QK8_0;
+                    let xq = &mut xq8_buf[..b * nb];
+                    for t in 0..b {
+                        quantize_row_q8_0(&xb[t * h..(t + 1) * h], &mut xq[t * nb..(t + 1) * nb]);
+                    }
+                    backend.matmul_q8_act(&self.output_weight, xb, xq, b, &mut batch_logits)?;
+                } else {
+                    backend.matmul(&self.output_weight, xb, b, &mut batch_logits)?;
+                }
+                if cfg.final_logit_softcap > 0.0 {
+                    let cap = cfg.final_logit_softcap;
+                    let inv_cap = 1.0 / cap;
+                    for v in batch_logits.iter_mut() {
+                        *v = cap * (*v * inv_cap).tanh();
+                    }
+                }
+                for t in 0..b {
+                    all_logits.push(batch_logits[t * vocab..(t + 1) * vocab].to_vec());
+                }
+            } else if is_last_chunk && compute_last_logits {
                 let last_x = &x[(b - 1) * h..b * h];
                 apply_norm(
                     backend,
@@ -1599,7 +1741,7 @@ impl<'a> LlamaQwenModel<'a> {
             offset += b;
         }
 
-        Ok(&self.scratch.logits)
+        Ok(all_logits)
     }
 }
 
@@ -2008,5 +2150,79 @@ mod tests {
         let gguf = GgufFile::from_bytes(w.to_bytes()).unwrap();
         let _ = CaelumModel::from_gguf(&gguf, Some(64)).unwrap();
         assert_seq_batch_parity(&gguf, "starcoder2", &[65, 66, 67, 68, 69, 70]);
+    }
+
+    #[test]
+    fn test_cpu_continuous_batching_three_slots_parity() {
+        let h = 64usize;
+        let ffn = 128usize;
+        let heads = 4usize;
+        let kv_heads = 2usize;
+        let head_dim = h / heads;
+        let kv_dim = kv_heads * head_dim;
+        let (tokens, token_types) = mini_chatml_vocab();
+        let vocab = tokens.len();
+
+        let mut w = GgufWriter::new();
+        w.add_meta("general.architecture", GgufValue::String("qwen2".into()));
+        w.add_meta("qwen2.embedding_length", GgufValue::U32(h as u32));
+        w.add_meta("qwen2.feed_forward_length", GgufValue::U32(ffn as u32));
+        w.add_meta("qwen2.block_count", GgufValue::U32(2));
+        w.add_meta("qwen2.attention.head_count", GgufValue::U32(heads as u32));
+        w.add_meta("qwen2.attention.head_count_kv", GgufValue::U32(kv_heads as u32));
+        w.add_meta("qwen2.attention.layer_norm_rms_epsilon", GgufValue::F32(1e-6));
+        w.add_meta("qwen2.context_length", GgufValue::U32(64));
+        w.add_meta("tokenizer.ggml.model", GgufValue::String("gpt2".into()));
+        w.add_meta("tokenizer.ggml.tokens", GgufValue::Array(tokens));
+        w.add_meta("tokenizer.ggml.token_type", GgufValue::Array(token_types));
+        w.add_meta("tokenizer.ggml.eos_token_id", GgufValue::U32((vocab - 1) as u32));
+        w.add_tensor_raw("token_embd.weight", vec![vocab, h], DType::Q4_0, make_q4_matrix(vocab, h, 1)).unwrap();
+        w.add_tensor_f32("output_norm.weight", vec![h], &vec![1.0; h]).unwrap();
+        for l in 0..2 {
+            w.add_tensor_f32(&format!("blk.{l}.attn_norm.weight"), vec![h], &vec![1.0; h]).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_q.weight"), vec![h, h], DType::Q4_0, make_q4_matrix(h, h, l + 2)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_k.weight"), vec![kv_dim, h], DType::Q4_0, make_q4_matrix(kv_dim, h, l + 3)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_v.weight"), vec![kv_dim, h], DType::Q4_0, make_q4_matrix(kv_dim, h, l + 4)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_output.weight"), vec![h, h], DType::Q4_0, make_q4_matrix(h, h, l + 5)).unwrap();
+            w.add_tensor_f32(&format!("blk.{l}.ffn_norm.weight"), vec![h], &vec![1.0; h]).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_gate.weight"), vec![ffn, h], DType::Q4_0, make_q4_matrix(ffn, h, l + 6)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_up.weight"), vec![ffn, h], DType::Q4_0, make_q4_matrix(ffn, h, l + 7)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_down.weight"), vec![h, ffn], DType::Q4_0, make_q4_matrix(h, ffn, l + 8)).unwrap();
+        }
+        let gguf = GgufFile::from_bytes(w.to_bytes()).unwrap();
+        let backend = CpuBackend::new(Some(2));
+
+        let prompts: [&[u32]; 3] = [&[65, 66, 67], &[70, 71, 72, 73, 74], &[80, 81]];
+        let decode_toks: [[u32; 3]; 3] = [[68, 69, 75], [76, 77, 78], [82, 83, 84]];
+
+        let mut refs: Vec<LlamaQwenModel<'_>> = (0..3)
+            .map(|_| LlamaQwenModel::from_gguf(&gguf, Some(64)).unwrap())
+            .collect();
+        let mut batched = LlamaQwenModel::from_gguf_with_kv_slots(&gguf, Some(64), KvPrecision::F32, 4).unwrap();
+        assert_eq!(batched.num_slots(), 4);
+
+        let mut positions = [0usize; 3];
+        for s in 0..3 {
+            let r_logits = refs[s].forward_batch(&backend, prompts[s], 0, true).unwrap().to_vec();
+            let b_logits = batched.prefill_slot(&backend, s, prompts[s], 0).unwrap();
+            let diff = r_logits.iter().zip(b_logits.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(diff < 1e-4, "CPU slot {s} prefill diff={diff}");
+            positions[s] = prompts[s].len();
+        }
+
+        for step in 0..3 {
+            let items = [
+                (0, decode_toks[0][step], positions[0]),
+                (1, decode_toks[1][step], positions[1]),
+                (2, decode_toks[2][step], positions[2]),
+            ];
+            let batch_out = batched.decode_slots(&backend, &items).unwrap();
+            for s in 0..3 {
+                let ref_out = refs[s].forward_token(&backend, decode_toks[s][step], positions[s], true).unwrap();
+                let diff = ref_out.iter().zip(batch_out[s].iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                assert!(diff < 1e-4, "CPU continuous batching slot {s} step {step} diff={diff}");
+                positions[s] += 1;
+            }
+        }
     }
 }

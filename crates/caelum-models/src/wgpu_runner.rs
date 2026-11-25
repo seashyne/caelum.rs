@@ -88,9 +88,11 @@ pub struct WgpuLlamaQwenModel<'a> {
     half_rope: usize,
     is_neox: bool,
 
-    // Packed F16 VRAM KV Cache (`[num_layers * max_seq_len * (kv_dim / 2)]` u32)
+    // Packed F16 VRAM KV Cache (`[num_slots * num_layers * max_seq_len * (kv_dim / 2)]` u32)
+    num_slots: usize,
     k_cache: wgpu::Buffer,
     v_cache: wgpu::Buffer,
+    slot_meta_buf: wgpu::Buffer,
     kv_cache_bytes: usize,
     vram_weight_bytes: usize,
 
@@ -111,7 +113,9 @@ pub struct WgpuLlamaQwenModel<'a> {
     // Shared pre-baked BindGroups
     bg_layer0_attn_norm: wgpu::BindGroup,
     bg_rope_kv: wgpu::BindGroup,
+    bg_rope_kv_slots: wgpu::BindGroup,
     bg_gqa: wgpu::BindGroup,
+    bg_gqa_slots: wgpu::BindGroup,
     bg_res_add: wgpu::BindGroup,
     bg_res_out_norm: wgpu::BindGroup,
     bg_swiglu: wgpu::BindGroup,
@@ -121,6 +125,7 @@ pub struct WgpuLlamaQwenModel<'a> {
     arena: UniformArena,
     embed_scratch: Vec<f32>,
     logits_cpu: Vec<f32>,
+    slot_meta_scratch: Vec<u32>,
 }
 
 impl<'a> WgpuLlamaQwenModel<'a> {
@@ -129,6 +134,16 @@ impl<'a> WgpuLlamaQwenModel<'a> {
         gpu: Arc<GpuContext>,
         max_seq_override: Option<usize>,
     ) -> Result<Self> {
+        Self::from_gguf_slots(gguf, gpu, max_seq_override, 1)
+    }
+
+    pub fn from_gguf_slots(
+        gguf: &'a GgufFile,
+        gpu: Arc<GpuContext>,
+        max_seq_override: Option<usize>,
+        num_slots: usize,
+    ) -> Result<Self> {
+        let num_slots = num_slots.clamp(1, GPU_PREFILL_CHUNK);
         let config = LlamaQwenConfig::from_gguf(gguf, max_seq_override)?;
         if config.moe.is_some() {
             return Err(CaelumError::InvalidFormat(
@@ -154,11 +169,12 @@ impl<'a> WgpuLlamaQwenModel<'a> {
 
         let arena = UniformArena::new(&gpu.device);
 
-        // Allocate Packed F16 VRAM KV Cache (2× smaller than F32!)
-        let kv_u32_elems = config.num_layers * config.max_seq_len * (kv_dim / 2);
+        // Allocate Multi-Slot Packed F16 VRAM KV Cache (2× smaller than F32!)
+        let kv_u32_elems = num_slots * config.num_layers * config.max_seq_len * (kv_dim / 2);
         let kv_buf_bytes = (kv_u32_elems * 4) as u64;
         let k_cache = gpu.alloc_storage("k_cache_f16", kv_buf_bytes);
         let v_cache = gpu.alloc_storage("v_cache_f16", kv_buf_bytes);
+        let slot_meta_buf = gpu.alloc_storage("slot_meta", (num_slots * 2 * 4) as u64);
         let kv_cache_bytes = (kv_buf_bytes * 2) as usize;
 
         let x_buf = gpu.alloc_storage("x", (max_b * h * 4) as u64);
@@ -171,7 +187,7 @@ impl<'a> WgpuLlamaQwenModel<'a> {
         let attn_out_buf = gpu.alloc_storage("attn_out", (max_b * q_dim * 4) as u64);
         let hb_buf = gpu.alloc_storage("hb", (max_b * ffn * 4) as u64);
         let hb2_buf = gpu.alloc_storage("hb2", (max_b * ffn * 4) as u64);
-        let logits_bytes = (config.vocab_size * 4) as u64;
+        let logits_bytes = (num_slots * config.vocab_size * 4) as u64;
         let logits_buf = gpu.alloc_storage("logits", logits_bytes);
         let logits_staging = gpu.alloc_staging_read("logits_staging", logits_bytes);
 
@@ -373,7 +389,25 @@ impl<'a> WgpuLlamaQwenModel<'a> {
 
         let bg_rope_kv =
             gpu.bind_rope_kv(&q_buf, &k_buf, &v_buf, &cos_sin, &k_cache, &v_cache, &arena);
+        let bg_rope_kv_slots = gpu.bind_rope_kv_slots(
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &cos_sin,
+            &k_cache,
+            &v_cache,
+            &slot_meta_buf,
+            &arena,
+        );
         let bg_gqa = gpu.bind_gqa(&q_buf, &k_cache, &v_cache, &attn_out_buf, &arena);
+        let bg_gqa_slots = gpu.bind_gqa_slots(
+            &q_buf,
+            &k_cache,
+            &v_cache,
+            &attn_out_buf,
+            &slot_meta_buf,
+            &arena,
+        );
         let bg_res_add = gpu.bind_rw_r_u(&x_buf, &dx_buf, &arena);
         let bg_res_out_norm = gpu.bind_res_rms(&x_buf, &dx_buf, &output_norm, &xb_buf, &arena);
         let bg_swiglu = gpu.bind_rw_r_u(&hb_buf, &hb2_buf, &arena);
@@ -382,7 +416,8 @@ impl<'a> WgpuLlamaQwenModel<'a> {
 
         Ok(Self {
             embed_scratch: vec![0.0f32; max_b * h],
-            logits_cpu: vec![0.0f32; config.vocab_size],
+            logits_cpu: vec![0.0f32; num_slots * config.vocab_size],
+            slot_meta_scratch: vec![0u32; num_slots * 2],
             config,
             gpu,
             token_embd,
@@ -393,8 +428,10 @@ impl<'a> WgpuLlamaQwenModel<'a> {
             _cos_sin: cos_sin,
             half_rope,
             is_neox,
+            num_slots,
             k_cache,
             v_cache,
+            slot_meta_buf,
             kv_cache_bytes,
             vram_weight_bytes,
             x_buf,
@@ -411,7 +448,9 @@ impl<'a> WgpuLlamaQwenModel<'a> {
             logits_staging,
             bg_layer0_attn_norm,
             bg_rope_kv,
+            bg_rope_kv_slots,
             bg_gqa,
+            bg_gqa_slots,
             bg_res_add,
             bg_res_out_norm,
             bg_swiglu,
@@ -419,6 +458,10 @@ impl<'a> WgpuLlamaQwenModel<'a> {
             bg_lm_head,
             arena,
         })
+    }
+
+    pub fn num_slots(&self) -> usize {
+        self.num_slots
     }
 
     pub fn device_summary(&self) -> String {
@@ -444,20 +487,256 @@ impl<'a> WgpuLlamaQwenModel<'a> {
         self.gpu.queue.submit(Some(enc.finish()));
     }
 
-    pub fn forward_token(&mut self, token_id: u32, pos: usize, compute_logits: bool) -> Result<&[f32]> {
-        self.forward_batch(&[token_id], pos, compute_logits)
+    pub fn reset_slot(&mut self, slot: usize) {
+        debug_assert!(slot < self.num_slots);
+        let kv_dim = self.config.num_kv_heads * self.config.head_dim;
+        let slot_bytes = (self.config.num_layers * self.config.max_seq_len * (kv_dim / 2) * 4) as u64;
+        let offset = (slot as u64) * slot_bytes;
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        enc.clear_buffer(&self.k_cache, offset, Some(slot_bytes));
+        enc.clear_buffer(&self.v_cache, offset, Some(slot_bytes));
+        self.gpu.queue.submit(Some(enc.finish()));
     }
 
-    /// Runs `tokens` starting at `start_pos` in VRAM chunks of up to `GPU_PREFILL_CHUNK`,
-    /// recording ALL layers per chunk into ONE single GPU `CommandEncoder` submission!
+    pub fn forward_token(&mut self, token_id: u32, pos: usize, compute_logits: bool) -> Result<&[f32]> {
+        self.forward_batch_slot(0, &[token_id], pos, compute_logits)
+    }
+
     pub fn forward_batch(
         &mut self,
         tokens: &[u32],
         start_pos: usize,
         compute_last_logits: bool,
     ) -> Result<&[f32]> {
+        self.forward_batch_slot(0, tokens, start_pos, compute_last_logits)
+    }
+
+    /// Runs batched prefill for a specific KV `slot` and returns logits for the last prompt token.
+    pub fn prefill_slot(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        let logits = self.forward_batch_slot(slot, tokens, start_pos, true)?;
+        Ok(logits.to_vec())
+    }
+
+    /// **True Multi-User Continuous Batching Decode Step**:
+    /// Evaluates `items = [(slot_id, token_id, pos), ...]` in **ONE SINGLE GPU SUBMISSION**,
+    /// reading model weights ONCE across all concurrent users via `b4` GEMM kernels and
+    /// independently attending each user to its own VRAM KV slot!
+    pub fn decode_slots(&mut self, items: &[(usize, u32, usize)]) -> Result<Vec<Vec<f32>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let b = items.len();
+        debug_assert!(b <= self.num_slots);
+        if b == 1 {
+            let (slot, tok, pos) = items[0];
+            let logits = self.forward_batch_slot(slot, &[tok], pos, true)?;
+            return Ok(vec![logits.to_vec()]);
+        }
+
+        let h = self.config.hidden_size;
+        let ffn = self.config.intermediate_size;
+        let q_dim = self.config.num_heads * self.config.head_dim;
+        let kv_dim = self.config.num_kv_heads * self.config.head_dim;
+        let head_dim = self.config.head_dim;
+        let vocab = self.config.vocab_size;
+        let eps_bits = self.config.rms_norm_eps.to_bits();
+        let inv_sqrt_hd_bits = (1.0f32 / (head_dim as f32).sqrt()).to_bits();
+        let layer_kv_u32_stride = self.config.max_seq_len * (kv_dim / 2);
+        let slot_kv_u32_stride = self.config.num_layers * layer_kv_u32_stride;
+
+        for (t, &(slot, tok, pos)) in items.iter().enumerate() {
+            debug_assert!(slot < self.num_slots);
+            self.token_embd
+                .dequantize_row(tok as usize, &mut self.embed_scratch[t * h..(t + 1) * h])?;
+            self.slot_meta_scratch[t * 2] = (slot * slot_kv_u32_stride) as u32;
+            self.slot_meta_scratch[t * 2 + 1] = pos as u32;
+        }
+        self.gpu.write_f32(&self.x_buf, &self.embed_scratch[..b * h]);
+        self.gpu.write_u32(&self.slot_meta_buf, &self.slot_meta_scratch[..b * 2]);
+
+        self.arena.reset();
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+
+            let u0 = self.arena.push_u32x4(h as u32, b as u32, eps_bits, 0);
+            pass.set_pipeline(&self.gpu.pipelines.rms_norm);
+            pass.set_bind_group(0, &self.bg_layer0_attn_norm, &[u0]);
+            pass.dispatch_workgroups(b as u32, 1, 1);
+
+            for l in 0..self.config.num_layers {
+                let layer = &self.layers[l];
+
+                match &layer.qkv {
+                    QkvGpu::FusedQ4K {
+                        has_bias, bg_qkv, ..
+                    } => {
+                        let u_qkv = self.arena.push_u32x8(
+                            q_dim as u32,
+                            kv_dim as u32,
+                            h as u32,
+                            b as u32,
+                            u32::from(*has_bias),
+                            0,
+                            0,
+                            0,
+                        );
+                        let total_rows = (q_dim + 2 * kv_dim) as u32;
+                        let wg_x = total_rows.div_ceil(4);
+                        pass.set_pipeline(&self.gpu.pipelines.matmul_q4_k_qkv_b4);
+                        pass.set_bind_group(0, bg_qkv, &[u_qkv]);
+                        pass.dispatch_workgroups(wg_x, (b as u32).div_ceil(4), 1);
+                    }
+                    QkvGpu::Separate {
+                        wq_dtype,
+                        wk_dtype,
+                        wv_dtype,
+                        bg_wq,
+                        bg_wk,
+                        bg_wv,
+                        bg_bq,
+                        bg_bk,
+                        bg_bv,
+                        ..
+                    } => {
+                        dispatch_matmul(&self.gpu, &mut pass, &mut self.arena, bg_wq, *wq_dtype, q_dim, h, b)?;
+                        dispatch_matmul(&self.gpu, &mut pass, &mut self.arena, bg_wk, *wk_dtype, kv_dim, h, b)?;
+                        dispatch_matmul(&self.gpu, &mut pass, &mut self.arena, bg_wv, *wv_dtype, kv_dim, h, b)?;
+                        if let Some(bg) = bg_bq {
+                            let u = self.arena.push_u32x4(q_dim as u32, b as u32, 0, 0);
+                            pass.set_pipeline(&self.gpu.pipelines.add_bias);
+                            pass.set_bind_group(0, bg, &[u]);
+                            pass.dispatch_workgroups(((q_dim * b) as u32).div_ceil(64), 1, 1);
+                        }
+                        if let Some(bg) = bg_bk {
+                            let u = self.arena.push_u32x4(kv_dim as u32, b as u32, 0, 0);
+                            pass.set_pipeline(&self.gpu.pipelines.add_bias);
+                            pass.set_bind_group(0, bg, &[u]);
+                            pass.dispatch_workgroups(((kv_dim * b) as u32).div_ceil(64), 1, 1);
+                        }
+                        if let Some(bg) = bg_bv {
+                            let u = self.arena.push_u32x4(kv_dim as u32, b as u32, 0, 0);
+                            pass.set_pipeline(&self.gpu.pipelines.add_bias);
+                            pass.set_bind_group(0, bg, &[u]);
+                            pass.dispatch_workgroups(((kv_dim * b) as u32).div_ceil(64), 1, 1);
+                        }
+                    }
+                }
+
+                if let Some(bg) = &layer.bg_q_norm {
+                    let cnt = (b * self.config.num_heads) as u32;
+                    let u = self.arena.push_u32x4(head_dim as u32, cnt, eps_bits, 0);
+                    pass.set_pipeline(&self.gpu.pipelines.rms_norm_inplace);
+                    pass.set_bind_group(0, bg, &[u]);
+                    pass.dispatch_workgroups(cnt, 1, 1);
+                }
+                if let Some(bg) = &layer.bg_k_norm {
+                    let cnt = (b * self.config.num_kv_heads) as u32;
+                    let u = self.arena.push_u32x4(head_dim as u32, cnt, eps_bits, 0);
+                    pass.set_pipeline(&self.gpu.pipelines.rms_norm_inplace);
+                    pass.set_bind_group(0, bg, &[u]);
+                    pass.dispatch_workgroups(cnt, 1, 1);
+                }
+
+                // Multi-Slot RoPE + Packed F16 KV Store
+                let u_rope = self.arena.push_u32x8(
+                    self.config.num_heads as u32,
+                    self.config.num_kv_heads as u32,
+                    head_dim as u32,
+                    self.half_rope as u32,
+                    b as u32,
+                    (l * layer_kv_u32_stride) as u32,
+                    u32::from(self.is_neox),
+                    0,
+                );
+                let rope_threads = (self.config.num_heads * self.half_rope).max(kv_dim / 2) as u32;
+                pass.set_pipeline(&self.gpu.pipelines.rope_kv_store_slots);
+                pass.set_bind_group(0, &self.bg_rope_kv_slots, &[u_rope]);
+                pass.dispatch_workgroups(rope_threads.div_ceil(64), b as u32, 1);
+
+                // Multi-Slot Tiled Flash-Attention GQA
+                let u_gqa = self.arena.push_u32x8(
+                    self.config.num_heads as u32,
+                    self.config.num_kv_heads as u32,
+                    head_dim as u32,
+                    b as u32,
+                    (l * layer_kv_u32_stride) as u32,
+                    inv_sqrt_hd_bits,
+                    0,
+                    0,
+                );
+                pass.set_pipeline(&self.gpu.pipelines.gqa_flash_attn_slots);
+                pass.set_bind_group(0, &self.bg_gqa_slots, &[u_gqa]);
+                pass.dispatch_workgroups(self.config.num_heads as u32, b as u32, 1);
+
+                dispatch_matmul(&self.gpu, &mut pass, &mut self.arena, &layer.bg_wo, layer.wo_dtype, h, q_dim, b)?;
+                let u_rf = self.arena.push_u32x4(h as u32, b as u32, eps_bits, 0);
+                pass.set_pipeline(&self.gpu.pipelines.residual_rms_norm);
+                pass.set_bind_group(0, &layer.bg_res_ffn_norm, &[u_rf]);
+                pass.dispatch_workgroups(b as u32, 1, 1);
+
+                // Gate + Up + SwiGLU (weight-reusing B4 GEMM for b >= 2)
+                dispatch_matmul(&self.gpu, &mut pass, &mut self.arena, &layer.bg_w_gate, layer.w_gate_dtype, ffn, h, b)?;
+                dispatch_matmul(&self.gpu, &mut pass, &mut self.arena, &layer.bg_w_up, layer.w_up_dtype, ffn, h, b)?;
+                let u_sw = self.arena.push_u32x4((b * ffn) as u32, 0, 0, 0);
+                pass.set_pipeline(&self.gpu.pipelines.swiglu);
+                pass.set_bind_group(0, &self.bg_swiglu, &[u_sw]);
+                pass.dispatch_workgroups(((b * ffn) as u32).div_ceil(64), 1, 1);
+
+                dispatch_matmul(&self.gpu, &mut pass, &mut self.arena, &layer.bg_w_down, layer.w_down_dtype, h, ffn, b)?;
+                if let Some(bg_next) = &layer.bg_res_next_attn_norm {
+                    let u_rn = self.arena.push_u32x4(h as u32, b as u32, eps_bits, 0);
+                    pass.set_pipeline(&self.gpu.pipelines.residual_rms_norm);
+                    pass.set_bind_group(0, bg_next, &[u_rn]);
+                    pass.dispatch_workgroups(b as u32, 1, 1);
+                } else {
+                    let u_ro = self.arena.push_u32x4(h as u32, b as u32, eps_bits, 0);
+                    pass.set_pipeline(&self.gpu.pipelines.residual_rms_norm);
+                    pass.set_bind_group(0, &self.bg_res_out_norm, &[u_ro]);
+                    pass.dispatch_workgroups(b as u32, 1, 1);
+
+                    dispatch_matmul(&self.gpu, &mut pass, &mut self.arena, &self.bg_lm_head, self.output_dtype, vocab, h, b)?;
+                }
+            }
+        }
+
+        enc.copy_buffer_to_buffer(
+            &self.logits_buf,
+            0,
+            &self.logits_staging,
+            0,
+            (b * vocab * 4) as u64,
+        );
+        self.arena.flush(&self.gpu.queue);
+        self.gpu.queue.submit(Some(enc.finish()));
+        self.gpu.read_staging_f32(&self.logits_staging, &mut self.logits_cpu[..b * vocab])?;
+
+        let mut out = Vec::with_capacity(b);
+        for t in 0..b {
+            out.push(self.logits_cpu[t * vocab..(t + 1) * vocab].to_vec());
+        }
+        Ok(out)
+    }
+
+    /// Runs `tokens` starting at `start_pos` for a single `slot` in VRAM chunks of up to `GPU_PREFILL_CHUNK`,
+    /// recording ALL layers per chunk into ONE single GPU `CommandEncoder` submission!
+    fn forward_batch_slot(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+    ) -> Result<&[f32]> {
+        debug_assert!(slot < self.num_slots);
+        let vocab = self.config.vocab_size;
         if tokens.is_empty() {
-            return Ok(&self.logits_cpu);
+            return Ok(&self.logits_cpu[..vocab]);
         }
 
         let h = self.config.hidden_size;
@@ -469,6 +748,7 @@ impl<'a> WgpuLlamaQwenModel<'a> {
         let inv_sqrt_hd_bits = (1.0f32 / (head_dim as f32).sqrt()).to_bits();
         // Packed F16 KV stride in `u32` units (2 f16s per u32)
         let layer_kv_u32_stride = self.config.max_seq_len * (kv_dim / 2);
+        let slot_kv_u32_base = slot * self.config.num_layers * layer_kv_u32_stride;
 
         let mut offset = 0usize;
         while offset < tokens.len() {
@@ -519,7 +799,7 @@ impl<'a> WgpuLlamaQwenModel<'a> {
                             );
                             let total_rows = (q_dim + 2 * kv_dim) as u32;
                             let wg_x = total_rows.div_ceil(4);
-                            if b >= 4 {
+                            if b >= 2 {
                                 pass.set_pipeline(&self.gpu.pipelines.matmul_q4_k_qkv_b4);
                                 pass.set_bind_group(0, bg_qkv, &[u_qkv]);
                                 pass.dispatch_workgroups(wg_x, (b as u32).div_ceil(4), 1);
@@ -589,7 +869,7 @@ impl<'a> WgpuLlamaQwenModel<'a> {
                         self.half_rope as u32,
                         chunk_pos as u32,
                         b as u32,
-                        (l * layer_kv_u32_stride) as u32,
+                        (slot_kv_u32_base + l * layer_kv_u32_stride) as u32,
                         u32::from(self.is_neox),
                     );
                     let rope_threads = (self.config.num_heads * self.half_rope)
@@ -605,7 +885,7 @@ impl<'a> WgpuLlamaQwenModel<'a> {
                         head_dim as u32,
                         chunk_pos as u32,
                         b as u32,
-                        (l * layer_kv_u32_stride) as u32,
+                        (slot_kv_u32_base + l * layer_kv_u32_stride) as u32,
                         inv_sqrt_hd_bits,
                         0,
                     );
@@ -711,7 +991,7 @@ impl<'a> WgpuLlamaQwenModel<'a> {
             self.gpu.queue.submit(Some(enc.finish()));
 
             if is_last_chunk && compute_last_logits {
-                self.gpu.read_staging_f32(&self.logits_staging, &mut self.logits_cpu)?;
+                self.gpu.read_staging_f32(&self.logits_staging, &mut self.logits_cpu[..vocab])?;
             } else {
                 let _ = self.gpu.device.poll(wgpu::PollType::Wait {
                     submission_index: None,
@@ -722,7 +1002,7 @@ impl<'a> WgpuLlamaQwenModel<'a> {
             offset += b;
         }
 
-        Ok(&self.logits_cpu)
+        Ok(&self.logits_cpu[..vocab])
     }
 }
 
@@ -741,13 +1021,18 @@ fn dispatch_matmul<'p>(
     let u = arena.push_u32x4(rows as u32, cols as u32, batch as u32, 0);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bg, &[u]);
-    let wg_x = (rows as u32).div_ceil(4);
+    let gx = (rows as u32).div_ceil(4);
+    let (wg_x, wg_z) = if gx > 65_535 {
+        (32_768u32, gx.div_ceil(32_768))
+    } else {
+        (gx, 1u32)
+    };
     let wg_y = if is_b4 {
         (batch as u32).div_ceil(4)
     } else {
         batch as u32
     };
-    pass.dispatch_workgroups(wg_x, wg_y, 1);
+    pass.dispatch_workgroups(wg_x, wg_y, wg_z);
     Ok(())
 }
 
@@ -942,5 +1227,101 @@ mod tests {
         let c4 = cpu4.forward_batch(&cpu, &p2, 0, true).unwrap().to_vec();
         let g4 = gpu4.forward_batch(&p2, 0, true).unwrap().to_vec();
         assert!(cos_sim(&c4, &g4) > 0.995, "Q4_0 Phi-3 GPU cos_sim={}", cos_sim(&c4, &g4));
+    }
+
+    #[test]
+    fn test_wgpu_continuous_batching_three_slots_parity() {
+        let gpu = match GpuContext::new() {
+            Ok(g) => Arc::new(g),
+            Err(e) => {
+                eprintln!("Skipping wgpu continuous batching test (no GPU adapter): {e}");
+                return;
+            }
+        };
+        let h = 256usize;
+        let ffn = 512usize;
+        let heads = 4usize;
+        let kv_heads = 2usize;
+        let hd = h / heads;
+        let kv_dim = kv_heads * hd;
+        let vocab = 64usize;
+
+        let mut w = GgufWriter::new();
+        w.add_meta("general.architecture", GgufValue::String("qwen2".into()));
+        w.add_meta("qwen2.embedding_length", GgufValue::U32(h as u32));
+        w.add_meta("qwen2.feed_forward_length", GgufValue::U32(ffn as u32));
+        w.add_meta("qwen2.block_count", GgufValue::U32(2));
+        w.add_meta("qwen2.attention.head_count", GgufValue::U32(heads as u32));
+        w.add_meta("qwen2.attention.head_count_kv", GgufValue::U32(kv_heads as u32));
+        w.add_meta("qwen2.attention.layer_norm_rms_epsilon", GgufValue::F32(1e-6));
+        w.add_meta("qwen2.context_length", GgufValue::U32(64));
+        w.add_tensor_raw("token_embd.weight", vec![vocab, h], DType::Q6_K, make_q6_k(vocab, h, 11)).unwrap();
+        w.add_tensor_f32("output_norm.weight", vec![h], &vec![1.0; h]).unwrap();
+        for l in 0..2 {
+            w.add_tensor_f32(&format!("blk.{l}.attn_norm.weight"), vec![h], &vec![1.0; h]).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_q.weight"), vec![h, h], DType::Q4_K, make_q4_k(h, h, l + 12)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_k.weight"), vec![kv_dim, h], DType::Q4_K, make_q4_k(kv_dim, h, l + 13)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_v.weight"), vec![kv_dim, h], DType::Q4_K, make_q4_k(kv_dim, h, l + 14)).unwrap();
+            w.add_tensor_f32(&format!("blk.{l}.attn_q.bias"), vec![h], &vec![0.02; h]).unwrap();
+            w.add_tensor_f32(&format!("blk.{l}.attn_k.bias"), vec![kv_dim], &vec![-0.01; kv_dim]).unwrap();
+            w.add_tensor_f32(&format!("blk.{l}.attn_v.bias"), vec![kv_dim], &vec![0.01; kv_dim]).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.attn_output.weight"), vec![h, h], DType::Q4_K, make_q4_k(h, h, l + 15)).unwrap();
+            w.add_tensor_f32(&format!("blk.{l}.ffn_norm.weight"), vec![h], &vec![1.0; h]).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_gate.weight"), vec![ffn, h], DType::Q4_K, make_q4_k(ffn, h, l + 16)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_up.weight"), vec![ffn, h], DType::Q4_K, make_q4_k(ffn, h, l + 17)).unwrap();
+            w.add_tensor_raw(&format!("blk.{l}.ffn_down.weight"), vec![h, ffn], DType::Q6_K, make_q6_k(h, ffn, l + 18)).unwrap();
+        }
+        let gguf = GgufFile::from_bytes(w.to_bytes()).unwrap();
+
+        let prompts: [&[u32]; 3] = [&[1, 5, 9], &[2, 7, 13, 21, 34], &[4, 8]];
+        let decode_toks: [[u32; 3]; 3] = [[11, 22, 33], [15, 25, 35], [17, 27, 37]];
+
+        // Reference: 3 completely independent single-slot GPU models
+        let mut refs: Vec<WgpuLlamaQwenModel<'_>> = (0..3)
+            .map(|_| WgpuLlamaQwenModel::from_gguf(&gguf, Arc::clone(&gpu), Some(64)).unwrap())
+            .collect();
+        // Multi-slot GPU model with 4 slots
+        let mut batched = WgpuLlamaQwenModel::from_gguf_slots(&gguf, gpu, Some(64), 4).unwrap();
+        assert_eq!(batched.num_slots(), 4);
+
+        // Prefill slots 0, 1, 2 with different prompt lengths
+        let mut positions = [0usize; 3];
+        for s in 0..3 {
+            let r_logits = refs[s].forward_batch(prompts[s], 0, true).unwrap().to_vec();
+            let b_logits = batched.prefill_slot(s, prompts[s], 0).unwrap();
+            let diff = r_logits
+                .iter()
+                .zip(b_logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(diff < 1e-4, "slot {s} prefill diff={diff}");
+            positions[s] = prompts[s].len();
+        }
+
+        // Run 3 interleaved batched decode steps with b = 3 (tests non-multiple-of-4 B4 masking + slot isolation!)
+        for step in 0..3 {
+            let items = [
+                (0, decode_toks[0][step], positions[0]),
+                (1, decode_toks[1][step], positions[1]),
+                (2, decode_toks[2][step], positions[2]),
+            ];
+            let batch_out = batched.decode_slots(&items).unwrap();
+            assert_eq!(batch_out.len(), 3);
+            for s in 0..3 {
+                let ref_out = refs[s]
+                    .forward_token(decode_toks[s][step], positions[s], true)
+                    .unwrap();
+                let diff = ref_out
+                    .iter()
+                    .zip(batch_out[s].iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    diff < 1e-3,
+                    "GPU continuous batching slot {s} step {step} diff={diff}"
+                );
+                positions[s] += 1;
+            }
+        }
     }
 }

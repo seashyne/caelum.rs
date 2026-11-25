@@ -108,7 +108,17 @@ impl<'a> CaelumModel<'a> {
         max_seq_len: Option<usize>,
         kv_precision: KvPrecision,
     ) -> Result<Self> {
+        Self::from_gguf_with_kv_slots(gguf, max_seq_len, kv_precision, 1)
+    }
+
+    pub fn from_gguf_with_kv_slots(
+        gguf: &'a GgufFile,
+        max_seq_len: Option<usize>,
+        kv_precision: KvPrecision,
+        num_slots: usize,
+    ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("llama");
+        let num_slots = num_slots.max(1);
         let inner = match arch {
             "celestia" => ModelInner::Celestia(CelestiaModel::from_gguf(gguf, max_seq_len)?),
             "deepseek2" => ModelInner::DeepSeek2(DeepSeek2Model::from_gguf(gguf, max_seq_len)?),
@@ -129,10 +139,11 @@ impl<'a> CaelumModel<'a> {
             | "phi3"
             | "starcoder2"
             | "mistral" => {
-                ModelInner::LlamaQwen(LlamaQwenModel::from_gguf_with_kv(
+                ModelInner::LlamaQwen(LlamaQwenModel::from_gguf_with_kv_slots(
                     gguf,
                     max_seq_len,
                     kv_precision,
+                    num_slots,
                 )?)
             }
             other => {
@@ -155,11 +166,24 @@ impl<'a> CaelumModel<'a> {
         gpu: Arc<GpuContext>,
         max_seq_len: Option<usize>,
     ) -> Result<Self> {
+        Self::from_gguf_gpu_slots(gguf, gpu, max_seq_len, 1)
+    }
+
+    /// Loads a model directly onto a `wgpu` GPU with `num_slots` independent VRAM KV-cache slots
+    /// for multi-user continuous batching.
+    #[cfg(feature = "gpu")]
+    pub fn from_gguf_gpu_slots(
+        gguf: &'a GgufFile,
+        gpu: Arc<GpuContext>,
+        max_seq_len: Option<usize>,
+        num_slots: usize,
+    ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("llama");
+        let num_slots = num_slots.max(1);
         let inner = match arch {
-            "llama" | "qwen2" | "qwen3" | "phi3" | "mistral" => {
-                ModelInner::WgpuLlamaQwen(WgpuLlamaQwenModel::from_gguf(gguf, gpu, max_seq_len)?)
-            }
+            "llama" | "qwen2" | "qwen3" | "phi3" | "mistral" => ModelInner::WgpuLlamaQwen(
+                WgpuLlamaQwenModel::from_gguf_slots(gguf, gpu, max_seq_len, num_slots)?,
+            ),
             "gemma4" => ModelInner::WgpuGemma4(WgpuGemma4Model::from_gguf(gguf, gpu, max_seq_len)?),
             "qwen35" => ModelInner::WgpuQwen35(WgpuQwen35Model::from_gguf(gguf, gpu, max_seq_len)?),
             other => {
@@ -292,6 +316,87 @@ impl<'a> CaelumModel<'a> {
             ModelInner::WgpuQwen35(_) => "VRAM-DeltaNet+F16",
             ModelInner::DeepSeek2(_) => "MLA-Absorbed",
             ModelInner::Celestia(_) => "MLA-Latent",
+        }
+    }
+
+    pub fn num_slots(&self) -> usize {
+        match &self.inner {
+            ModelInner::LlamaQwen(m) => m.num_slots(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.num_slots(),
+            _ => 1,
+        }
+    }
+
+    pub fn is_recurrent(&self) -> bool {
+        matches!(self.inner, ModelInner::Qwen35(_)) || {
+            #[cfg(feature = "gpu")]
+            {
+                matches!(self.inner, ModelInner::WgpuQwen35(_))
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                false
+            }
+        }
+    }
+
+    pub fn reset_slot(&mut self, slot: usize) {
+        if slot == 0 {
+            self.cached_tokens.clear();
+        }
+        match &mut self.inner {
+            ModelInner::LlamaQwen(m) => m.reset_slot(slot),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.reset_slot(slot),
+            _ => self.reset_cache(),
+        }
+    }
+
+    /// Runs batched prefill for a specific KV `slot` and returns logits for the last token.
+    pub fn prefill_slot(
+        &mut self,
+        backend: &dyn Backend,
+        slot: usize,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        match &mut self.inner {
+            ModelInner::LlamaQwen(m) => m.prefill_slot(backend, slot, tokens, start_pos),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.prefill_slot(slot, tokens, start_pos),
+            _ => {
+                debug_assert_eq!(slot, 0);
+                let logits = self.forward_batch(backend, tokens, start_pos, true)?;
+                Ok(logits.to_vec())
+            }
+        }
+    }
+
+    /// **True Multi-User Continuous Batching Decode Step**:
+    /// Evaluates `items = [(slot_id, token_id, pos), ...]` in ONE batched pass across all
+    /// concurrently active user slots, reading model weights ONCE per step.
+    pub fn decode_slots(
+        &mut self,
+        backend: &dyn Backend,
+        items: &[(usize, u32, usize)],
+    ) -> Result<Vec<Vec<f32>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        match &mut self.inner {
+            ModelInner::LlamaQwen(m) => m.decode_slots(backend, items),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuLlamaQwen(m) => m.decode_slots(items),
+            _ => {
+                let mut out = Vec::with_capacity(items.len());
+                for &(slot, tok, pos) in items {
+                    debug_assert_eq!(slot, 0);
+                    let logits = self.forward_token(backend, tok, pos, true)?;
+                    out.push(logits.to_vec());
+                }
+                Ok(out)
+            }
         }
     }
 
