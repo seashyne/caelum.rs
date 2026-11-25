@@ -12,7 +12,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 pub const UNIFORM_STRIDE: usize = 256;
-pub const UNIFORM_ARENA_SLOTS: usize = 1024; // 256 KB (> enough for 64+ layers per submit)
+pub const UNIFORM_ARENA_SLOTS: usize = 2048; // 512 KB (> enough for 64+ layers per submit)
 
 /// CPU-staged dynamic uniform ring buffer uploaded in ONE `queue.write_buffer` per forward pass.
 pub struct UniformArena {
@@ -97,6 +97,9 @@ pub struct GpuPipelines {
     pub bgl_rw_r_u: wgpu::BindGroupLayout,
     pub bgl_rope_kv: wgpu::BindGroupLayout,
     pub bgl_gqa: wgpu::BindGroupLayout,
+    pub bgl_deinterleave_qg: wgpu::BindGroupLayout,
+    pub bgl_deltanet_conv: wgpu::BindGroupLayout,
+    pub bgl_deltanet_step: wgpu::BindGroupLayout,
 
     pub matmul_q4_k: wgpu::ComputePipeline,
     pub matmul_q4_k_b4: wgpu::ComputePipeline,
@@ -118,7 +121,14 @@ pub struct GpuPipelines {
     pub rope_kv_store: wgpu::ComputePipeline,
     pub gqa_flash_attn: wgpu::ComputePipeline,
     pub swiglu: wgpu::ComputePipeline,
+    pub geglu: wgpu::ComputePipeline,
     pub residual_add: wgpu::ComputePipeline,
+    pub residual_add_scale: wgpu::ComputePipeline,
+    pub mul_sigmoid: wgpu::ComputePipeline,
+    pub deinterleave_qg: wgpu::ComputePipeline,
+    pub deltanet_conv_silu: wgpu::ComputePipeline,
+    pub l2_norm_qk: wgpu::ComputePipeline,
+    pub deltanet_step: wgpu::ComputePipeline,
 }
 
 /// Shared `wgpu` GPU device, queue, adapter metadata, and pre-compiled WGSL compute pipelines.
@@ -644,6 +654,95 @@ impl GpuContext {
         })
     }
 
+    pub fn bind_deinterleave_qg(
+        &self,
+        qg: &wgpu::Buffer,
+        q: &wgpu::Buffer,
+        gate: &wgpu::Buffer,
+        arena: &UniformArena,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines.bgl_deinterleave_qg,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: qg.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: q.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: gate.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &arena.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(16),
+                    }),
+                },
+            ],
+        })
+    }
+
+    pub fn bind_deltanet_conv(
+        &self,
+        qkv: &wgpu::Buffer,
+        conv_w: &wgpu::Buffer,
+        conv_state: &wgpu::Buffer,
+        conv_out: &wgpu::Buffer,
+        arena: &UniformArena,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines.bgl_deltanet_conv,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: qkv.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: conv_w.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: conv_state.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: conv_out.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &arena.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(16),
+                    }),
+                },
+            ],
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_deltanet_step(
+        &self,
+        conv_out: &wgpu::Buffer,
+        z: &wgpu::Buffer,
+        alpha: &wgpu::Buffer,
+        beta: &wgpu::Buffer,
+        ssm_params: &wgpu::Buffer,
+        ssm_state: &wgpu::Buffer,
+        y_out: &wgpu::Buffer,
+        arena: &UniformArena,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines.bgl_deltanet_step,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: conv_out.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: z.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: alpha.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: beta.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: ssm_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: ssm_state.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: y_out.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &arena.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(32),
+                    }),
+                },
+            ],
+        })
+    }
+
     /// Standalone GPU benchmark helper: uploads `w` and `x_batch` once to VRAM, runs `iters`
     /// dispatches in a single GPU submission, and returns `(elapsed_secs, out_sample)`.
     pub fn bench_matmul(
@@ -840,6 +939,38 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
             uniform_entry(4, 32),
         ],
     });
+    let bgl_deinterleave_qg = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgl-deinterleave-qg"),
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3, 16),
+        ],
+    });
+    let bgl_deltanet_conv = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgl-deltanet-conv"),
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            storage_entry(3, false),
+            uniform_entry(4, 16),
+        ],
+    });
+    let bgl_deltanet_step = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgl-deltanet-step"),
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, true),
+            storage_entry(5, false),
+            storage_entry(6, false),
+            uniform_entry(7, 32),
+        ],
+    });
 
     let comp = |label: &str, src: &str, bgl: &wgpu::BindGroupLayout| {
         let specialized = wgpu_shaders::specialize_wgsl(src, use_subgroups);
@@ -887,11 +1018,43 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
         &bgl_gqa,
     );
     let swiglu = compile_pipeline(device, "swiglu", wgpu_shaders::SHADER_SWIGLU, &bgl_rw_r_u);
+    let geglu = compile_pipeline(device, "geglu", wgpu_shaders::SHADER_GEGLU, &bgl_rw_r_u);
     let residual_add = compile_pipeline(
         device,
         "residual_add",
         wgpu_shaders::SHADER_RESIDUAL_ADD,
         &bgl_rw_r_u,
+    );
+    let residual_add_scale = compile_pipeline(
+        device,
+        "residual_add_scale",
+        wgpu_shaders::SHADER_RESIDUAL_ADD_SCALE,
+        &bgl_rw_r_u,
+    );
+    let mul_sigmoid = compile_pipeline(
+        device,
+        "mul_sigmoid",
+        wgpu_shaders::SHADER_MUL_SIGMOID,
+        &bgl_rw_r_u,
+    );
+    let deinterleave_qg = compile_pipeline(
+        device,
+        "deinterleave_qg",
+        wgpu_shaders::SHADER_DEINTERLEAVE_QG,
+        &bgl_deinterleave_qg,
+    );
+    let deltanet_conv_silu = compile_pipeline(
+        device,
+        "deltanet_conv_silu",
+        wgpu_shaders::SHADER_DELTANET_CONV_SILU,
+        &bgl_deltanet_conv,
+    );
+    let l2_norm_qk = comp("l2_norm_qk", wgpu_shaders::SHADER_L2_NORM_QK, &bgl_rw_r_u);
+    let deltanet_step = compile_pipeline(
+        device,
+        "deltanet_step",
+        wgpu_shaders::SHADER_DELTANET_STEP,
+        &bgl_deltanet_step,
     );
 
     GpuPipelines {
@@ -903,6 +1066,9 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
         bgl_rw_r_u,
         bgl_rope_kv,
         bgl_gqa,
+        bgl_deinterleave_qg,
+        bgl_deltanet_conv,
+        bgl_deltanet_step,
         matmul_q4_k,
         matmul_q4_k_b4,
         matmul_q4_k_qkv,
@@ -922,6 +1088,13 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
         rope_kv_store,
         gqa_flash_attn,
         swiglu,
+        geglu,
         residual_add,
+        residual_add_scale,
+        mul_sigmoid,
+        deinterleave_qg,
+        deltanet_conv_silu,
+        l2_norm_qk,
+        deltanet_step,
     }
 }

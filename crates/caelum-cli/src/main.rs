@@ -65,12 +65,14 @@ fn load_model_for_cli<'a>(
     enable_repack: bool,
     use_gpu: bool,
 ) -> Result<(CaelumModel<'a>, String)> {
-    let do_repack = enable_repack && should_repack_for_ram(gguf.file_size());
     if use_gpu {
         #[cfg(feature = "gpu")]
         {
             let arch = gguf.architecture().unwrap_or("llama");
-            if matches!(arch, "llama" | "qwen2" | "qwen3" | "phi3" | "mistral") {
+            if matches!(
+                arch,
+                "llama" | "qwen2" | "qwen3" | "qwen35" | "gemma4" | "phi3" | "mistral"
+            ) {
                 let gpu = Arc::new(GpuContext::new()?);
                 let label = format!("wgpu {}", gpu.device_summary());
                 let model = CaelumModel::from_gguf_gpu(gguf, gpu, max_ctx)?;
@@ -82,7 +84,7 @@ fn load_model_for_cli<'a>(
                 backend.num_threads()
             );
             let mut model = CaelumModel::from_gguf_with_kv(gguf, max_ctx, kv_precision)?;
-            if do_repack {
+            if enable_repack && should_repack_for_ram(gguf.file_size()) {
                 model.optimize_for_backend(backend);
             }
             let label = format!("{} | {} threads (CPU fallback)", backend.name(), backend.num_threads());
@@ -90,14 +92,14 @@ fn load_model_for_cli<'a>(
         }
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (gguf, backend, max_ctx, kv_precision, do_repack);
+            let _ = (gguf, backend, max_ctx, kv_precision, enable_repack);
             Err(caelum_core::CaelumError::Runtime(
                 "--gpu requires compiling with `--features gpu` (cargo build --release --features gpu)".into(),
             ))
         }
     } else {
         let mut model = CaelumModel::from_gguf_with_kv(gguf, max_ctx, kv_precision)?;
-        if do_repack {
+        if enable_repack && should_repack_for_ram(gguf.file_size()) {
             model.optimize_for_backend(backend);
         }
         let label = format!("{} | {} threads", backend.name(), backend.num_threads());

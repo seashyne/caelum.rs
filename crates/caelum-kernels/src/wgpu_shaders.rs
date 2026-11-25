@@ -240,7 +240,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 8u;
     let chunk = tid >> 3u;
@@ -336,7 +336,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let total_rows = P.q_dim + 2u * P.kv_dim;
     let nb = P.cols >> 8u;
@@ -442,7 +442,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let t_base = wid.y * 4u;
     let total_rows = P.q_dim + 2u * P.kv_dim;
     let nb = P.cols >> 8u;
@@ -559,7 +559,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 8u;
     let chunk = tid >> 3u;
@@ -653,7 +653,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let t_base = wid.y * 4u;
     let nb = P.cols >> 8u;
     let chunk = tid >> 3u;
@@ -752,7 +752,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 8u;
     let chunk = tid >> 3u;
@@ -829,7 +829,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 8u;
 
@@ -911,7 +911,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let t_base = wid.y * 4u;
     let nb = P.cols >> 8u;
 
@@ -1014,7 +1014,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 5u;
 
@@ -1067,7 +1067,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 5u;
 
@@ -1109,7 +1109,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     var acc = 0.0;
     if (row < P.rows && tok < P.batch) {
@@ -1142,7 +1142,7 @@ fn main(
 ) {
     let tid = lid.x & 31u;
     let r_local = lid.x >> 5u;
-    let row = wid.x * 4u + r_local;
+    let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     var acc = 0.0;
     if (row < P.rows && tok < P.batch) {
@@ -1407,6 +1407,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 /// Online Tiled Flash-Attention GQA over **Packed F16 VRAM KV Cache** with Subgroup Reductions!
+/// Supports `head_dim <= 512` (including Gemma 4 full layers) and optional `sliding_window`.
 pub const SHADER_GQA_FLASH_ATTN_F16: &str = r#"/*SG_ENABLE*/
 struct Params {
     num_heads: u32,
@@ -1416,7 +1417,7 @@ struct Params {
     batch: u32,
     layer_kv_u32_offset: u32,
     inv_sqrt_hd: f32,
-    _pad: u32,
+    sliding_window: u32,
 }
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
@@ -1425,8 +1426,8 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> OUT: array<f32>;
 @group(0) @binding(4) var<uniform> P: Params;
 
-var<workgroup> q_sh: array<f32, 256>;
-var<workgroup> out_sh: array<f32, 256>;
+var<workgroup> q_sh: array<f32, 512>;
+var<workgroup> out_sh: array<f32, 512>;
 var<workgroup> scores: array<f32, 64>;
 var<workgroup> red: array<f32, 64>;
 
@@ -1448,6 +1449,11 @@ fn main(
     let kv_h = h / kv_mul;
     let pos = P.start_pos + tok;
     let seq_len = pos + 1u;
+    let t_start = select(
+        0u,
+        select(0u, seq_len - P.sliding_window, seq_len > P.sliding_window),
+        P.sliding_window > 0u
+    );
     let q_off = tok * q_dim + h * hd;
 
     for (var d = tid; d < hd; d += 64u) {
@@ -1459,7 +1465,7 @@ fn main(
     var running_max = -1e30;
     var running_sum = 0.0;
 
-    for (var tile_start = 0u; tile_start < seq_len; tile_start += 64u) {
+    for (var tile_start = t_start; tile_start < seq_len; tile_start += 64u) {
         let tile_end = min(64u, seq_len - tile_start);
         let s = tile_start + tid;
         var sc = -1e30;
@@ -1475,7 +1481,7 @@ fn main(
         /*REDUCE_WG64_MAX*/
 
         let new_max = max(running_max, tile_max);
-        let rescale = select(1.0, exp(running_max - new_max), tile_start > 0u);
+        let rescale = select(1.0, exp(running_max - new_max), tile_start > t_start);
         let w = select(0.0, exp(sc - new_max), tid < tile_end);
         scores[tid] = w;
         /*REDUCE_WG64_WSUM*/
@@ -1522,6 +1528,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Fused GeGLU (Gemma 2/3/4): `GATE[i] = gelu_tanh(GATE[i]) * UP[i]`.
+pub const SHADER_GEGLU: &str = r#"
+struct Params { len: u32, _p0: u32, _p1: u32, _p2: u32 }
+@group(0) @binding(0) var<storage, read_write> GATE: array<f32>;
+@group(0) @binding(1) var<storage, read> UP: array<f32>;
+@group(0) @binding(2) var<uniform> P: Params;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < P.len) {
+        let g = GATE[i];
+        let inner = 0.7978845608 * (g + 0.044715 * g * g * g);
+        let gelu = 0.5 * g * (1.0 + tanh(clamp(inner, -10.0, 10.0)));
+        GATE[i] = gelu * UP[i];
+    }
+}
+"#;
+
 /// Residual add `X[i] += DX[i]`.
 pub const SHADER_RESIDUAL_ADD: &str = r#"
 struct Params { len: u32, _p0: u32, _p1: u32, _p2: u32 }
@@ -1534,6 +1559,263 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i < P.len) {
         X[i] += DX[i];
+    }
+}
+"#;
+
+/// Scaled Residual add (Gemma 4 `layer_output_scale`): `X[i] = (X[i] + DX[i]) * scale`.
+pub const SHADER_RESIDUAL_ADD_SCALE: &str = r#"
+struct Params { len: u32, scale: f32, _p1: u32, _p2: u32 }
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(1) var<storage, read> DX: array<f32>;
+@group(0) @binding(2) var<uniform> P: Params;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < P.len) {
+        X[i] = (X[i] + DX[i]) * P.scale;
+    }
+}
+"#;
+
+/// In-place Sigmoid Gate multiply (Qwen 3.5 Full Attention): `OUT[i] *= sigmoid(GATE[i])`.
+pub const SHADER_MUL_SIGMOID: &str = r#"
+struct Params { len: u32, _p0: u32, _p1: u32, _p2: u32 }
+@group(0) @binding(0) var<storage, read_write> OUT: array<f32>;
+@group(0) @binding(1) var<storage, read> GATE: array<f32>;
+@group(0) @binding(2) var<uniform> P: Params;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < P.len) {
+        OUT[i] *= 1.0 / (1.0 + exp(-GATE[i]));
+    }
+}
+"#;
+
+/// De-interleaves Qwen 3.5 joint `[n_heads, 2, head_dim]` into contiguous `Q` and `GATE`.
+pub const SHADER_DEINTERLEAVE_QG: &str = r#"
+struct Params { num_heads: u32, head_dim: u32, batch: u32, _pad: u32 }
+@group(0) @binding(0) var<storage, read> QG: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Q: array<f32>;
+@group(0) @binding(2) var<storage, read_write> GATE: array<f32>;
+@group(0) @binding(3) var<uniform> P: Params;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let q_dim = P.num_heads * P.head_dim;
+    let total = P.batch * q_dim;
+    let idx = gid.x;
+    if (idx >= total) { return; }
+    let tok = idx / q_dim;
+    let rem = idx % q_dim;
+    let h = rem / P.head_dim;
+    let d = rem % P.head_dim;
+    let src_base = tok * (q_dim * 2u) + h * (P.head_dim * 2u) + d;
+    Q[idx] = QG[src_base];
+    GATE[idx] = QG[src_base + P.head_dim];
+}
+"#;
+
+/// Qwen 3.5 Gated DeltaNet Causal Depthwise Conv1D (`kernel=4`) + SiLU + Conv State Update.
+/// One thread per channel `c in 0..channels`, stepping sequentially through `0..batch`.
+pub const SHADER_DELTANET_CONV_SILU: &str = r#"
+struct Params { channels: u32, conv_kernel: u32, batch: u32, _pad: u32 }
+@group(0) @binding(0) var<storage, read> QKV: array<f32>;
+@group(0) @binding(1) var<storage, read> CONV_W: array<f32>;
+@group(0) @binding(2) var<storage, read_write> CONV_STATE: array<f32>;
+@group(0) @binding(3) var<storage, read_write> CONV_OUT: array<f32>;
+@group(0) @binding(4) var<uniform> P: Params;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    if (c >= P.channels) { return; }
+    let ch = P.channels;
+    let k = P.conv_kernel;
+    let w_base = c * k;
+
+    // Load history into registers (supports kernel <= 4)
+    var h0 = select(0.0, CONV_STATE[0u * ch + c], k > 1u);
+    var h1 = select(0.0, CONV_STATE[1u * ch + c], k > 2u);
+    var h2 = select(0.0, CONV_STATE[2u * ch + c], k > 3u);
+
+    let w0 = CONV_W[w_base + 0u];
+    let w1 = select(0.0, CONV_W[w_base + 1u], k > 1u);
+    let w2 = select(0.0, CONV_W[w_base + 2u], k > 2u);
+    let w3 = select(0.0, CONV_W[w_base + 3u], k > 3u);
+
+    for (var t = 0u; t < P.batch; t++) {
+        let x = QKV[t * ch + c];
+        var acc = 0.0;
+        if (k == 4u) {
+            acc = h0 * w0 + h1 * w1 + h2 * w2 + x * w3;
+            h0 = h1;
+            h1 = h2;
+            h2 = x;
+        } else if (k == 3u) {
+            acc = h0 * w0 + h1 * w1 + x * w2;
+            h0 = h1;
+            h1 = x;
+        } else if (k == 2u) {
+            acc = h0 * w0 + x * w1;
+            h0 = x;
+        } else {
+            acc = x * w0;
+        }
+        CONV_OUT[t * ch + c] = acc / (1.0 + exp(-acc));
+    }
+
+    if (k > 1u) { CONV_STATE[0u * ch + c] = h0; }
+    if (k > 2u) { CONV_STATE[1u * ch + c] = h1; }
+    if (k > 3u) { CONV_STATE[2u * ch + c] = h2; }
+}
+"#;
+
+/// In-place L2 Normalization for Q and K slices inside `CONV_OUT` (`2 * num_k_heads` heads per tok).
+pub const SHADER_L2_NORM_QK: &str = r#"/*SG_ENABLE*/
+struct Params { head_k_dim: u32, num_qk_heads: u32, channels: u32, eps: f32 }
+@group(0) @binding(0) var<storage, read_write> CONV_OUT: array<f32>;
+@group(0) @binding(1) var<storage, read> _DUMMY: array<f32>;
+@group(0) @binding(2) var<uniform> P: Params;
+
+var<workgroup> smem: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>/*SG_ARGS*/
+) {
+    let tid = lid.x;
+    let qkh = wid.x;
+    let tok = wid.y;
+    if (qkh >= P.num_qk_heads) { return; }
+    let base = tok * P.channels + qkh * P.head_k_dim;
+
+    var ss = 0.0;
+    for (var i = tid; i < P.head_k_dim; i += 64u) {
+        let v = CONV_OUT[base + i];
+        ss += v * v;
+    }
+    /*REDUCE_WG64_SUM*/
+    let inv = inverseSqrt(wg_sum + P.eps);
+    for (var i = tid; i < P.head_k_dim; i += 64u) {
+        CONV_OUT[base + i] *= inv;
+    }
+}
+"#;
+
+/// Fused Qwen 3.5 Gated DeltaNet Recurrence + Gated RMSNorm (`ssm_norm * silu(z)`).
+/// Dispatched with `(num_v_heads, 1, 1)` workgroups of `128` threads (supports `head_v_dim <= 128`).
+/// `SSM_PARAMS` packs `[ssm_a (num_v_heads) | ssm_dt_bias (num_v_heads) | ssm_norm (head_v_dim)]`.
+pub const SHADER_DELTANET_STEP: &str = r#"
+struct Params {
+    num_k_heads: u32,
+    num_v_heads: u32,
+    head_dim: u32,
+    channels: u32,
+    batch: u32,
+    eps: f32,
+    scale: f32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> CONV_OUT: array<f32>;
+@group(0) @binding(1) var<storage, read> Z: array<f32>;
+@group(0) @binding(2) var<storage, read> ALPHA: array<f32>;
+@group(0) @binding(3) var<storage, read> BETA: array<f32>;
+@group(0) @binding(4) var<storage, read> SSM_PARAMS: array<f32>;
+@group(0) @binding(5) var<storage, read_write> SSM_STATE: array<f32>;
+@group(0) @binding(6) var<storage, read_write> Y_OUT: array<f32>;
+@group(0) @binding(7) var<uniform> P: Params;
+
+var<workgroup> q_sh: array<f32, 128>;
+var<workgroup> k_sh: array<f32, 128>;
+var<workgroup> red_ss: array<f32, 128>;
+
+fn softplus_f32(x: f32) -> f32 {
+    if (x > 20.0) { return x; }
+    if (x < -20.0) { return exp(x); }
+    return log(1.0 + exp(x));
+}
+
+@compute @workgroup_size(128, 1, 1)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>
+) {
+    let j = lid.x;
+    let iv = wid.x;
+    if (iv >= P.num_v_heads) { return; }
+
+    let hd = P.head_dim;
+    let ik = iv % P.num_k_heads;
+    let qk_dim = P.num_k_heads * hd;
+    let inner = P.num_v_heads * hd;
+    let state_base = iv * hd * hd + j * hd;
+
+    let ssm_a = SSM_PARAMS[iv];
+    let dt_bias = SSM_PARAMS[P.num_v_heads + iv];
+    let norm_w = select(0.0, SSM_PARAMS[P.num_v_heads * 2u + j], j < hd);
+
+    for (var t = 0u; t < P.batch; t++) {
+        let conv_base = t * P.channels;
+        if (j < hd) {
+            q_sh[j] = CONV_OUT[conv_base + ik * hd + j];
+            k_sh[j] = CONV_OUT[conv_base + qk_dim + ik * hd + j];
+        }
+        workgroupBarrier();
+
+        let beta = 1.0 / (1.0 + exp(-BETA[t * P.num_v_heads + iv]));
+        let g = ssm_a * softplus_f32(ALPHA[t * P.num_v_heads + iv] + dt_bias);
+        let decay = exp(g);
+
+        var y_val = 0.0;
+        if (j < hd) {
+            // 1. Decay state row j and compute prediction dot(S_row_j, k)
+            var pred = 0.0;
+            for (var i = 0u; i < hd; i++) {
+                let s_dec = SSM_STATE[state_base + i] * decay;
+                SSM_STATE[state_base + i] = s_dec;
+                pred += s_dec * k_sh[i];
+            }
+            // 2. Delta rule rank-1 update + output dot(S_row_j, q) * scale
+            let v_j = CONV_OUT[conv_base + qk_dim * 2u + iv * hd + j];
+            let delta = (v_j - pred) * beta;
+            var acc_y = 0.0;
+            for (var i = 0u; i < hd; i++) {
+                let s_new = SSM_STATE[state_base + i] + delta * k_sh[i];
+                SSM_STATE[state_base + i] = s_new;
+                acc_y += s_new * q_sh[i];
+            }
+            y_val = acc_y * P.scale;
+        }
+
+        // 3. Fused Gated RMSNorm over `hd` elements: rms_norm(y, ssm_norm, eps) * silu(z)
+        red_ss[j] = select(0.0, y_val * y_val, j < hd);
+        workgroupBarrier();
+        if (j < 64u) { red_ss[j] += red_ss[j + 64u]; }
+        workgroupBarrier();
+        if (j < 32u) { red_ss[j] += red_ss[j + 32u]; }
+        workgroupBarrier();
+        if (j < 16u) { red_ss[j] += red_ss[j + 16u]; }
+        workgroupBarrier();
+        if (j < 8u) { red_ss[j] += red_ss[j + 8u]; }
+        workgroupBarrier();
+        if (j < 4u) { red_ss[j] += red_ss[j + 4u]; }
+        workgroupBarrier();
+        if (j < 2u) { red_ss[j] += red_ss[j + 2u]; }
+        workgroupBarrier();
+        let inv_rms = inverseSqrt((red_ss[0] + red_ss[1]) / f32(hd) + P.eps);
+
+        if (j < hd) {
+            let z_j = Z[t * inner + iv * hd + j];
+            let z_silu = z_j / (1.0 + exp(-z_j));
+            Y_OUT[t * inner + iv * hd + j] = (y_val * inv_rms * norm_w) * z_silu;
+        }
+        workgroupBarrier();
     }
 }
 "#;

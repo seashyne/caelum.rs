@@ -11,6 +11,10 @@ pub mod qwen35;
 pub mod rope;
 pub mod sampler;
 #[cfg(feature = "gpu")]
+pub mod wgpu_gemma4;
+#[cfg(feature = "gpu")]
+pub mod wgpu_qwen35;
+#[cfg(feature = "gpu")]
 pub mod wgpu_runner;
 
 use caelum_core::{CaelumError, Result};
@@ -32,6 +36,10 @@ pub use moe::{ExpertGating, MoeConfig};
 pub use qwen35::{Qwen35Config, Qwen35Model};
 pub use rope::{RopeConfig, RopeScalingType, RopeTable};
 pub use sampler::{Sampler, SamplerConfig};
+#[cfg(feature = "gpu")]
+pub use wgpu_gemma4::WgpuGemma4Model;
+#[cfg(feature = "gpu")]
+pub use wgpu_qwen35::WgpuQwen35Model;
 #[cfg(feature = "gpu")]
 pub use wgpu_runner::WgpuLlamaQwenModel;
 
@@ -75,7 +83,11 @@ enum ModelInner<'a> {
     #[cfg(feature = "gpu")]
     WgpuLlamaQwen(WgpuLlamaQwenModel<'a>),
     Gemma4(Gemma4Model<'a>),
+    #[cfg(feature = "gpu")]
+    WgpuGemma4(WgpuGemma4Model<'a>),
     Qwen35(Qwen35Model<'a>),
+    #[cfg(feature = "gpu")]
+    WgpuQwen35(WgpuQwen35Model<'a>),
     DeepSeek2(DeepSeek2Model<'a>),
     Celestia(CelestiaModel<'a>),
 }
@@ -144,19 +156,22 @@ impl<'a> CaelumModel<'a> {
         max_seq_len: Option<usize>,
     ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("llama");
-        match arch {
-            "llama" | "qwen2" | "qwen3" | "phi3" | "mistral" => Ok(Self {
-                inner: ModelInner::WgpuLlamaQwen(WgpuLlamaQwenModel::from_gguf(
-                    gguf,
-                    gpu,
-                    max_seq_len,
-                )?),
-                cached_tokens: Vec::new(),
-            }),
-            other => Err(CaelumError::InvalidFormat(format!(
-                "wgpu GPU runner does not yet support architecture '{other}' (supported on GPU: llama, qwen2, qwen3, phi3, mistral)"
-            ))),
-        }
+        let inner = match arch {
+            "llama" | "qwen2" | "qwen3" | "phi3" | "mistral" => {
+                ModelInner::WgpuLlamaQwen(WgpuLlamaQwenModel::from_gguf(gguf, gpu, max_seq_len)?)
+            }
+            "gemma4" => ModelInner::WgpuGemma4(WgpuGemma4Model::from_gguf(gguf, gpu, max_seq_len)?),
+            "qwen35" => ModelInner::WgpuQwen35(WgpuQwen35Model::from_gguf(gguf, gpu, max_seq_len)?),
+            other => {
+                return Err(CaelumError::InvalidFormat(format!(
+                    "wgpu GPU runner does not yet support architecture '{other}' (supported on GPU: llama, qwen2, qwen3, qwen35, gemma4, phi3, mistral)"
+                )))
+            }
+        };
+        Ok(Self {
+            inner,
+            cached_tokens: Vec::new(),
+        })
     }
 
     /// Repacks compatible `Q4_K`/`Q6_K` weights into cache-aligned 8-row SIMD tiles for
@@ -165,7 +180,9 @@ impl<'a> CaelumModel<'a> {
         match &mut self.inner {
             ModelInner::LlamaQwen(m) => m.optimize_for_backend(backend),
             #[cfg(feature = "gpu")]
-            ModelInner::WgpuLlamaQwen(_) => {}
+            ModelInner::WgpuLlamaQwen(_)
+            | ModelInner::WgpuGemma4(_)
+            | ModelInner::WgpuQwen35(_) => {}
             ModelInner::Gemma4(m) => m.optimize_for_backend(backend),
             ModelInner::Qwen35(m) => m.optimize_for_backend(backend),
             ModelInner::DeepSeek2(m) => m.optimize_for_backend(backend),
@@ -179,7 +196,11 @@ impl<'a> CaelumModel<'a> {
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.vram_weight_bytes(),
             ModelInner::Gemma4(m) => m.packed_bytes(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(m) => m.vram_weight_bytes(),
             ModelInner::Qwen35(m) => m.packed_bytes(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(m) => m.vram_weight_bytes(),
             ModelInner::DeepSeek2(m) => m.packed_bytes(),
             ModelInner::Celestia(_) => 0,
         }
@@ -191,7 +212,11 @@ impl<'a> CaelumModel<'a> {
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => &m.config.arch,
             ModelInner::Gemma4(_) => "gemma4",
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(_) => "gemma4",
             ModelInner::Qwen35(_) => "qwen35",
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(_) => "qwen35",
             ModelInner::DeepSeek2(_) => "deepseek2",
             ModelInner::Celestia(_) => "celestia",
         }
@@ -203,7 +228,11 @@ impl<'a> CaelumModel<'a> {
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.config.vocab_size,
             ModelInner::Gemma4(m) => m.config.vocab_size,
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(m) => m.config.vocab_size,
             ModelInner::Qwen35(m) => m.config.vocab_size,
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(m) => m.config.vocab_size,
             ModelInner::DeepSeek2(m) => m.config.vocab_size,
             ModelInner::Celestia(m) => m.config.vocab_size,
         }
@@ -215,7 +244,11 @@ impl<'a> CaelumModel<'a> {
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.max_seq_len(),
             ModelInner::Gemma4(m) => m.max_seq_len(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(m) => m.max_seq_len(),
             ModelInner::Qwen35(m) => m.max_seq_len(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(m) => m.max_seq_len(),
             ModelInner::DeepSeek2(m) => m.max_seq_len(),
             ModelInner::Celestia(m) => m.max_seq_len(),
         }
@@ -227,7 +260,11 @@ impl<'a> CaelumModel<'a> {
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.kv_cache_bytes(),
             ModelInner::Gemma4(m) => m.kv_cache_bytes(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(m) => m.kv_cache_bytes(),
             ModelInner::Qwen35(m) => m.kv_cache_bytes(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(m) => m.kv_cache_bytes(),
             ModelInner::DeepSeek2(m) => m.kv_cache_bytes(),
             ModelInner::Celestia(m) => m.kv_cache_bytes(),
         }
@@ -245,10 +282,14 @@ impl<'a> CaelumModel<'a> {
                 KvPrecision::F32 => "Gemma4-Hybrid-F32",
                 KvPrecision::Q8_0 => "Gemma4-Hybrid-Q8_0",
             },
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(_) => "VRAM-Gemma4-F16",
             ModelInner::Qwen35(m) => match m.kv_precision() {
                 KvPrecision::F32 => "DeltaNet+GQA-F32",
                 KvPrecision::Q8_0 => "DeltaNet+GQA-Q8_0",
             },
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(_) => "VRAM-DeltaNet+F16",
             ModelInner::DeepSeek2(_) => "MLA-Absorbed",
             ModelInner::Celestia(_) => "MLA-Latent",
         }
@@ -261,7 +302,11 @@ impl<'a> CaelumModel<'a> {
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.reset_cache(),
             ModelInner::Gemma4(m) => m.reset_cache(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(m) => m.reset_cache(),
             ModelInner::Qwen35(m) => m.reset_cache(),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(m) => m.reset_cache(),
             ModelInner::DeepSeek2(m) => m.reset_cache(),
             ModelInner::Celestia(m) => m.reset_cache(),
         }
@@ -279,7 +324,11 @@ impl<'a> CaelumModel<'a> {
             #[cfg(feature = "gpu")]
             ModelInner::WgpuLlamaQwen(m) => m.forward_token(token_id, pos, compute_logits),
             ModelInner::Gemma4(m) => m.forward_token(backend, token_id, pos, compute_logits),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(m) => m.forward_token(token_id, pos, compute_logits),
             ModelInner::Qwen35(m) => m.forward_token(backend, token_id, pos, compute_logits),
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(m) => m.forward_token(token_id, pos, compute_logits),
             ModelInner::DeepSeek2(m) => m.forward_token(backend, token_id, pos, compute_logits),
             ModelInner::Celestia(m) => m.forward_token(backend, token_id, pos, compute_logits),
         }
@@ -301,9 +350,13 @@ impl<'a> CaelumModel<'a> {
             ModelInner::Gemma4(m) => {
                 m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(m) => m.forward_batch(tokens, start_pos, compute_last_logits),
             ModelInner::Qwen35(m) => {
                 m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(m) => m.forward_batch(tokens, start_pos, compute_last_logits),
             ModelInner::DeepSeek2(m) => {
                 m.forward_batch(backend, tokens, start_pos, compute_last_logits)
             }
@@ -422,7 +475,17 @@ impl<'a> CaelumModel<'a> {
         while common < max_reuse && self.cached_tokens[common] == prompt_tokens[common] {
             common += 1;
         }
-        if matches!(self.inner, ModelInner::Qwen35(_)) && common < self.cached_tokens.len() {
+        let is_recurrent = matches!(self.inner, ModelInner::Qwen35(_)) || {
+            #[cfg(feature = "gpu")]
+            {
+                matches!(self.inner, ModelInner::WgpuQwen35(_))
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                false
+            }
+        };
+        if is_recurrent && common < self.cached_tokens.len() {
             self.reset_cache();
             common = 0;
         } else {
@@ -443,8 +506,16 @@ impl<'a> CaelumModel<'a> {
             ModelInner::Gemma4(m) => {
                 m.forward_batch(backend, uncached, common, true)?.to_vec()
             }
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuGemma4(m) => {
+                m.forward_batch(uncached, common, true)?.to_vec()
+            }
             ModelInner::Qwen35(m) => {
                 m.forward_batch(backend, uncached, common, true)?.to_vec()
+            }
+            #[cfg(feature = "gpu")]
+            ModelInner::WgpuQwen35(m) => {
+                m.forward_batch(uncached, common, true)?.to_vec()
             }
             ModelInner::DeepSeek2(m) => {
                 m.forward_batch(backend, uncached, common, true)?.to_vec()
