@@ -524,17 +524,10 @@ impl<'a> WgpuQwen35Model<'a> {
         cols: usize,
         batch: usize,
     ) -> Result<()> {
-        let (pipe, is_b4) = gpu.matmul_pipeline(dtype, batch)?;
+        let (pipe, dx, y, dz) = gpu.matmul_dispatch(dtype, rows, batch)?;
         let off = arena.push_u32x4(rows as u32, cols as u32, batch as u32, 0);
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, bg, &[off]);
-        let y = if is_b4 { batch.div_ceil(4) } else { batch } as u32;
-        let gx = rows.div_ceil(4) as u32;
-        let (dx, dz) = if gx > 65_535 {
-            (32_768u32, gx.div_ceil(32_768))
-        } else {
-            (gx, 1u32)
-        };
         pass.dispatch_workgroups(dx, y, dz);
         Ok(())
     }

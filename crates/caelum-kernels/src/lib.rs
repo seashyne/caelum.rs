@@ -13,6 +13,8 @@ pub mod x86;
 pub mod armv9;
 
 #[cfg(feature = "gpu")]
+pub mod spv_xmx;
+#[cfg(feature = "gpu")]
 pub mod wgpu_ctx;
 #[cfg(feature = "gpu")]
 pub mod wgpu_shaders;

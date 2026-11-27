@@ -24,15 +24,18 @@ pub fn specialize_wgsl(template: &str, use_subgroups: bool) -> String {
     let reduce_row_f32 = if use_subgroups {
         r#"
     let sg_sum = subgroupAdd(acc);
-    if (sg_inv == 0u) {
-        smem[r_local * 4u + (tid / sg_size)] = sg_sum;
-    }
-    workgroupBarrier();
-    var row_sum = 0.0;
-    if (tid == 0u) {
-        let n_sg = 32u / sg_size;
-        for (var k = 0u; k < n_sg; k++) {
-            row_sum += smem[r_local * 4u + k];
+    var row_sum = sg_sum;
+    if (sg_size < 32u) {
+        if (sg_inv == 0u) {
+            smem[r_local * 4u + (tid / sg_size)] = sg_sum;
+        }
+        workgroupBarrier();
+        if (tid == 0u) {
+            row_sum = 0.0;
+            let n_sg = 32u / sg_size;
+            for (var k = 0u; k < n_sg; k++) {
+                row_sum += smem[r_local * 4u + k];
+            }
         }
     }"#
     } else {
@@ -57,15 +60,18 @@ pub fn specialize_wgsl(template: &str, use_subgroups: bool) -> String {
     let reduce_row_vec2 = if use_subgroups {
         r#"
     let sg_sum = subgroupAdd(vec2<f32>(acc_g, acc_u));
-    if (sg_inv == 0u) {
-        smem2[r_local * 4u + (tid / sg_size)] = sg_sum;
-    }
-    workgroupBarrier();
-    var row_sum2 = vec2<f32>(0.0);
-    if (tid == 0u) {
-        let n_sg = 32u / sg_size;
-        for (var k = 0u; k < n_sg; k++) {
-            row_sum2 += smem2[r_local * 4u + k];
+    var row_sum2 = sg_sum;
+    if (sg_size < 32u) {
+        if (sg_inv == 0u) {
+            smem2[r_local * 4u + (tid / sg_size)] = sg_sum;
+        }
+        workgroupBarrier();
+        if (tid == 0u) {
+            row_sum2 = vec2<f32>(0.0);
+            let n_sg = 32u / sg_size;
+            for (var k = 0u; k < n_sg; k++) {
+                row_sum2 += smem2[r_local * 4u + k];
+            }
         }
     }"#
     } else {
@@ -90,15 +96,18 @@ pub fn specialize_wgsl(template: &str, use_subgroups: bool) -> String {
     let reduce_row_vec4 = if use_subgroups {
         r#"
     let sg_sum = subgroupAdd(vec4<f32>(a0, a1, a2, a3));
-    if (sg_inv == 0u) {
-        smem4[r_local * 4u + (tid / sg_size)] = sg_sum;
-    }
-    workgroupBarrier();
-    var row_sum4 = vec4<f32>(0.0);
-    if (tid == 0u) {
-        let n_sg = 32u / sg_size;
-        for (var k = 0u; k < n_sg; k++) {
-            row_sum4 += smem4[r_local * 4u + k];
+    var row_sum4 = sg_sum;
+    if (sg_size < 32u) {
+        if (sg_inv == 0u) {
+            smem4[r_local * 4u + (tid / sg_size)] = sg_sum;
+        }
+        workgroupBarrier();
+        if (tid == 0u) {
+            row_sum4 = vec4<f32>(0.0);
+            let n_sg = 32u / sg_size;
+            for (var k = 0u; k < n_sg; k++) {
+                row_sum4 += smem4[r_local * 4u + k];
+            }
         }
     }"#
     } else {
@@ -233,6 +242,28 @@ fn scale_min_k4(j: u32, s0: u32, s1: u32, s2: u32) -> vec2<u32> {
     }
 }
 
+fn q4k_block_dot(blk: u32, xb: u32, tid: u32, is_base: u32) -> f32 {
+    let dm = unpack2x16float(W[blk]);
+    let s0 = W[blk + 1u];
+    let s1 = W[blk + 2u];
+    let s2 = W[blk + 3u];
+    let sm1 = scale_min_k4(is_base, s0, s1, s2);
+    let sm2 = scale_min_k4(is_base + 1u, s0, s1, s2);
+    let qw = W[blk + 4u + tid];
+    let xl0 = X[xb];      let xh0 = X[xb + 32u];
+    let xl1 = X[xb + 1u]; let xh1 = X[xb + 33u];
+    let xl2 = X[xb + 2u]; let xh2 = X[xb + 34u];
+    let xl3 = X[xb + 3u]; let xh3 = X[xb + 35u];
+    let sq1 = f32(qw & 0xFu) * xl0 + f32((qw >> 8u) & 0xFu) * xl1
+            + f32((qw >> 16u) & 0xFu) * xl2 + f32((qw >> 24u) & 0xFu) * xl3;
+    let sx1 = xl0 + xl1 + xl2 + xl3;
+    let sq2 = f32((qw >> 4u) & 0xFu) * xh0 + f32((qw >> 12u) & 0xFu) * xh1
+            + f32((qw >> 20u) & 0xFu) * xh2 + f32(qw >> 28u) * xh3;
+    let sx2 = xh0 + xh1 + xh2 + xh3;
+    return (dm.x * f32(sm1.x)) * sq1 - (dm.y * f32(sm1.y)) * sx1
+         + (dm.x * f32(sm2.x)) * sq2 - (dm.y * f32(sm2.y)) * sx2;
+}
+
 @compute @workgroup_size(128, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -249,39 +280,17 @@ fn main(
     var acc = 0.0;
     if (row < P.rows && tok < P.batch) {
         let row_base = row * nb * 36u;
-        let x_tok = tok * P.cols;
+        let x_tok = tok * P.cols + chunk * 64u + k4 * 4u;
         let is_base = chunk * 2u;
-        let x_chunk_off = chunk * 64u + k4 * 4u;
-
-        for (var b = 0u; b < nb; b++) {
-            let blk = row_base + b * 36u;
-            let dm = unpack2x16float(W[blk]);
-            let s0 = W[blk + 1u];
-            let s1 = W[blk + 2u];
-            let s2 = W[blk + 3u];
-            let sm1 = scale_min_k4(is_base, s0, s1, s2);
-            let sm2 = scale_min_k4(is_base + 1u, s0, s1, s2);
-
-            let qw = W[blk + 4u + tid];
-            let xb = x_tok + b * 256u + x_chunk_off;
-
-            let b0 = qw & 0xFFu;
-            let b1 = (qw >> 8u) & 0xFFu;
-            let b2 = (qw >> 16u) & 0xFFu;
-            let b3 = (qw >> 24u) & 0xFFu;
-
-            let xl0 = X[xb];      let xh0 = X[xb + 32u];
-            let xl1 = X[xb + 1u]; let xh1 = X[xb + 33u];
-            let xl2 = X[xb + 2u]; let xh2 = X[xb + 34u];
-            let xl3 = X[xb + 3u]; let xh3 = X[xb + 35u];
-
-            let sq1 = f32(b0 & 0xFu) * xl0 + f32(b1 & 0xFu) * xl1 + f32(b2 & 0xFu) * xl2 + f32(b3 & 0xFu) * xl3;
-            let sx1 = xl0 + xl1 + xl2 + xl3;
-            let sq2 = f32(b0 >> 4u) * xh0 + f32(b1 >> 4u) * xh1 + f32(b2 >> 4u) * xh2 + f32(b3 >> 4u) * xh3;
-            let sx2 = xh0 + xh1 + xh2 + xh3;
-
-            acc += (dm.x * f32(sm1.x)) * sq1 - (dm.y * f32(sm1.y)) * sx1
-                 + (dm.x * f32(sm2.x)) * sq2 - (dm.y * f32(sm2.y)) * sx2;
+        var b = 0u;
+        for (; b + 1u < nb; b += 2u) {
+            let blk0 = row_base + b * 36u;
+            let xb0 = x_tok + b * 256u;
+            acc += q4k_block_dot(blk0, xb0, tid, is_base)
+                 + q4k_block_dot(blk0 + 36u, xb0 + 256u, tid, is_base);
+        }
+        if (b < nb) {
+            acc += q4k_block_dot(row_base + b * 36u, x_tok + b * 256u, tid, is_base);
         }
     }
     /*REDUCE_ROW_F32*/
@@ -346,9 +355,8 @@ fn main(
     var acc = 0.0;
     if (row < total_rows && tok < P.batch) {
         let row_base = row * nb * 36u;
-        let x_tok = tok * P.cols;
+        let x_tok = tok * P.cols + chunk * 64u + k4 * 4u;
         let is_base = chunk * 2u;
-        let x_chunk_off = chunk * 64u + k4 * 4u;
 
         for (var b = 0u; b < nb; b++) {
             let blk = row_base + b * 36u;
@@ -358,23 +366,19 @@ fn main(
             let s2 = W[blk + 3u];
             let sm1 = scale_min_k4(is_base, s0, s1, s2);
             let sm2 = scale_min_k4(is_base + 1u, s0, s1, s2);
-
             let qw = W[blk + 4u + tid];
-            let xb = x_tok + b * 256u + x_chunk_off;
-
-            let b0 = qw & 0xFFu;
-            let b1 = (qw >> 8u) & 0xFFu;
-            let b2 = (qw >> 16u) & 0xFFu;
-            let b3 = (qw >> 24u) & 0xFFu;
+            let xb = x_tok + b * 256u;
 
             let xl0 = X[xb];      let xh0 = X[xb + 32u];
             let xl1 = X[xb + 1u]; let xh1 = X[xb + 33u];
             let xl2 = X[xb + 2u]; let xh2 = X[xb + 34u];
             let xl3 = X[xb + 3u]; let xh3 = X[xb + 35u];
 
-            let sq1 = f32(b0 & 0xFu) * xl0 + f32(b1 & 0xFu) * xl1 + f32(b2 & 0xFu) * xl2 + f32(b3 & 0xFu) * xl3;
+            let sq1 = f32(qw & 0xFu) * xl0 + f32((qw >> 8u) & 0xFu) * xl1
+                    + f32((qw >> 16u) & 0xFu) * xl2 + f32((qw >> 24u) & 0xFu) * xl3;
             let sx1 = xl0 + xl1 + xl2 + xl3;
-            let sq2 = f32(b0 >> 4u) * xh0 + f32(b1 >> 4u) * xh1 + f32(b2 >> 4u) * xh2 + f32(b3 >> 4u) * xh3;
+            let sq2 = f32((qw >> 4u) & 0xFu) * xh0 + f32((qw >> 12u) & 0xFu) * xh1
+                    + f32((qw >> 20u) & 0xFu) * xh2 + f32(qw >> 28u) * xh3;
             let sx2 = xh0 + xh1 + xh2 + xh3;
 
             acc += (dm.x * f32(sm1.x)) * sq1 - (dm.y * f32(sm1.y)) * sx1
@@ -591,10 +595,10 @@ fn main(
             let smg1 = scale_min_k4(is_base, sg0, sg1, sg2);
             let smg2 = scale_min_k4(is_base + 1u, sg0, sg1, sg2);
             let qg = WG[blk + 4u + tid];
-            let gb0 = qg & 0xFFu; let gb1 = (qg >> 8u) & 0xFFu;
-            let gb2 = (qg >> 16u) & 0xFFu; let gb3 = (qg >> 24u) & 0xFFu;
-            let gsq1 = f32(gb0 & 0xFu) * xl0 + f32(gb1 & 0xFu) * xl1 + f32(gb2 & 0xFu) * xl2 + f32(gb3 & 0xFu) * xl3;
-            let gsq2 = f32(gb0 >> 4u) * xh0 + f32(gb1 >> 4u) * xh1 + f32(gb2 >> 4u) * xh2 + f32(gb3 >> 4u) * xh3;
+            let gsq1 = f32(qg & 0xFu) * xl0 + f32((qg >> 8u) & 0xFu) * xl1
+                     + f32((qg >> 16u) & 0xFu) * xl2 + f32((qg >> 24u) & 0xFu) * xl3;
+            let gsq2 = f32((qg >> 4u) & 0xFu) * xh0 + f32((qg >> 12u) & 0xFu) * xh1
+                     + f32((qg >> 20u) & 0xFu) * xh2 + f32(qg >> 28u) * xh3;
             acc_g += (dmg.x * f32(smg1.x)) * gsq1 - (dmg.y * f32(smg1.y)) * sx1
                    + (dmg.x * f32(smg2.x)) * gsq2 - (dmg.y * f32(smg2.y)) * sx2;
 
@@ -604,10 +608,10 @@ fn main(
             let smu1 = scale_min_k4(is_base, su0, su1, su2);
             let smu2 = scale_min_k4(is_base + 1u, su0, su1, su2);
             let qu = WU[blk + 4u + tid];
-            let ub0 = qu & 0xFFu; let ub1 = (qu >> 8u) & 0xFFu;
-            let ub2 = (qu >> 16u) & 0xFFu; let ub3 = (qu >> 24u) & 0xFFu;
-            let usq1 = f32(ub0 & 0xFu) * xl0 + f32(ub1 & 0xFu) * xl1 + f32(ub2 & 0xFu) * xl2 + f32(ub3 & 0xFu) * xl3;
-            let usq2 = f32(ub0 >> 4u) * xh0 + f32(ub1 >> 4u) * xh1 + f32(ub2 >> 4u) * xh2 + f32(ub3 >> 4u) * xh3;
+            let usq1 = f32(qu & 0xFu) * xl0 + f32((qu >> 8u) & 0xFu) * xl1
+                     + f32((qu >> 16u) & 0xFu) * xl2 + f32((qu >> 24u) & 0xFu) * xl3;
+            let usq2 = f32((qu >> 4u) & 0xFu) * xh0 + f32((qu >> 12u) & 0xFu) * xh1
+                     + f32((qu >> 20u) & 0xFu) * xh2 + f32(qu >> 28u) * xh3;
             acc_u += (dmu.x * f32(smu1.x)) * usq1 - (dmu.y * f32(smu1.y)) * sx1
                    + (dmu.x * f32(smu2.x)) * usq2 - (dmu.y * f32(smu2.y)) * sx2;
         }
@@ -763,8 +767,8 @@ fn main(
         let row_base = row * nb * 44u;
         let x_tok = tok * P.cols;
         let is_base = chunk * 2u;
-        let u1 = 1u << (chunk * 2u);
-        let u2 = u1 << 1u;
+        let hb_lo = chunk * 2u;
+        let hb_hi = hb_lo + 1u;
         let x_chunk_off = chunk * 64u + k4 * 4u;
 
         for (var b = 0u; b < nb; b++) {
@@ -780,22 +784,22 @@ fn main(
             let qw = W[blk + 12u + tid];
             let xb = x_tok + b * 256u + x_chunk_off;
 
-            var sq1 = 0.0;
-            var sx1 = 0.0;
-            var sq2 = 0.0;
-            var sx2 = 0.0;
-            for (var j = 0u; j < 4u; j++) {
-                let qb = (qw >> (j * 8u)) & 0xFFu;
-                let hb = (qhw >> (j * 8u)) & 0xFFu;
-                let hi1 = select(0u, 16u, (hb & u1) != 0u);
-                let hi2 = select(0u, 16u, (hb & u2) != 0u);
-                let xl = X[xb + j];
-                let xh = X[xb + 32u + j];
-                sq1 += f32((qb & 0xFu) + hi1) * xl;
-                sx1 += xl;
-                sq2 += f32((qb >> 4u) + hi2) * xh;
-                sx2 += xh;
-            }
+            let xl0 = X[xb];      let xh0 = X[xb + 32u];
+            let xl1 = X[xb + 1u]; let xh1 = X[xb + 33u];
+            let xl2 = X[xb + 2u]; let xh2 = X[xb + 34u];
+            let xl3 = X[xb + 3u]; let xh3 = X[xb + 35u];
+
+            let sq1 = f32((qw & 0xFu) | (((qhw >> hb_lo) & 1u) << 4u)) * xl0
+                    + f32(((qw >> 8u) & 0xFu) | (((qhw >> (8u + hb_lo)) & 1u) << 4u)) * xl1
+                    + f32(((qw >> 16u) & 0xFu) | (((qhw >> (16u + hb_lo)) & 1u) << 4u)) * xl2
+                    + f32(((qw >> 24u) & 0xFu) | (((qhw >> (24u + hb_lo)) & 1u) << 4u)) * xl3;
+            let sx1 = xl0 + xl1 + xl2 + xl3;
+            let sq2 = f32(((qw >> 4u) & 0xFu) | (((qhw >> hb_hi) & 1u) << 4u)) * xh0
+                    + f32(((qw >> 12u) & 0xFu) | (((qhw >> (8u + hb_hi)) & 1u) << 4u)) * xh1
+                    + f32(((qw >> 20u) & 0xFu) | (((qhw >> (16u + hb_hi)) & 1u) << 4u)) * xh2
+                    + f32((qw >> 28u) | (((qhw >> (24u + hb_hi)) & 1u) << 4u)) * xh3;
+            let sx2 = xh0 + xh1 + xh2 + xh3;
+
             acc += (dm.x * f32(sm1.x)) * sq1 - (dm.y * f32(sm1.y)) * sx1
                  + (dm.x * f32(sm2.x)) * sq2 - (dm.y * f32(sm2.y)) * sx2;
         }
@@ -992,7 +996,8 @@ fn main(
 }
 "#;
 
-/// Quantized `Q4_0 × F32` GEMV/GEMM (`18` bytes per 32-elem block).
+/// **4-Byte-Aligned `Q4_0 × F32` GEMV/GEMM** (`5 u32` = `20` bytes per 32-elem block:
+/// `u32[0] = bitcast<u32>(d_f32)`, `u32[1..5] = qs[16]`). Coalesced 4-thread-per-block burst loads!
 pub const SHADER_MATMUL_Q4_0: &str = r#"/*SG_ENABLE*/
 struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(0) var<storage, read> W: array<u32>;
@@ -1000,12 +1005,6 @@ struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(2) var<storage, read_write> OUT: array<f32>;
 @group(0) @binding(3) var<uniform> P: Params;
 var<workgroup> smem: array<f32, 128>;
-
-fn load_u8(off: u32) -> u32 { return (W[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
-fn load_f16_even(off: u32) -> f32 {
-    let w = W[off >> 2u];
-    return unpack2x16float(select(w & 0xFFFFu, w >> 16u, (off & 2u) != 0u)).x;
-}
 
 @compute @workgroup_size(128, 1, 1)
 fn main(
@@ -1017,21 +1016,55 @@ fn main(
     let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 5u;
+    let grp = tid >> 2u;   // 0..7 (8 blocks processed in parallel per warp step)
+    let w_idx = tid & 3u;  // 0..3 (4 u32s of qs per block)
 
     var acc = 0.0;
     if (row < P.rows && tok < P.batch) {
-        let x_tok = tok * P.cols;
-        let row_byte = row * nb * 18u;
-        for (var b = tid; b < nb; b += 32u) {
-            let off = row_byte + b * 18u;
-            let d = load_f16_even(off);
+        let x_tok = tok * P.cols + w_idx * 4u;
+        let row_base = row * nb * 5u;
+        var b = grp;
+        for (; b + 8u < nb; b += 16u) {
+            let blk0 = row_base + b * 5u;
+            let d0 = bitcast<f32>(W[blk0]);
+            let qw0 = W[blk0 + 1u + w_idx];
+            let xb0 = x_tok + b * 32u;
+            let s0 = f32(i32(qw0 & 0xFu) - 8) * X[xb0]
+                   + f32(i32((qw0 >> 8u) & 0xFu) - 8) * X[xb0 + 1u]
+                   + f32(i32((qw0 >> 16u) & 0xFu) - 8) * X[xb0 + 2u]
+                   + f32(i32((qw0 >> 24u) & 0xFu) - 8) * X[xb0 + 3u]
+                   + f32(i32((qw0 >> 4u) & 0xFu) - 8) * X[xb0 + 16u]
+                   + f32(i32((qw0 >> 12u) & 0xFu) - 8) * X[xb0 + 17u]
+                   + f32(i32((qw0 >> 20u) & 0xFu) - 8) * X[xb0 + 18u]
+                   + f32(i32(qw0 >> 28u) - 8) * X[xb0 + 19u];
+
+            let blk1 = blk0 + 40u;
+            let d1 = bitcast<f32>(W[blk1]);
+            let qw1 = W[blk1 + 1u + w_idx];
+            let xb1 = xb0 + 256u;
+            let s1 = f32(i32(qw1 & 0xFu) - 8) * X[xb1]
+                   + f32(i32((qw1 >> 8u) & 0xFu) - 8) * X[xb1 + 1u]
+                   + f32(i32((qw1 >> 16u) & 0xFu) - 8) * X[xb1 + 2u]
+                   + f32(i32((qw1 >> 24u) & 0xFu) - 8) * X[xb1 + 3u]
+                   + f32(i32((qw1 >> 4u) & 0xFu) - 8) * X[xb1 + 16u]
+                   + f32(i32((qw1 >> 12u) & 0xFu) - 8) * X[xb1 + 17u]
+                   + f32(i32((qw1 >> 20u) & 0xFu) - 8) * X[xb1 + 18u]
+                   + f32(i32(qw1 >> 28u) - 8) * X[xb1 + 19u];
+            acc += d0 * s0 + d1 * s1;
+        }
+        for (; b < nb; b += 8u) {
+            let blk = row_base + b * 5u;
+            let d = bitcast<f32>(W[blk]);
+            let qw = W[blk + 1u + w_idx];
             let xb = x_tok + b * 32u;
-            var s = 0.0;
-            for (var j = 0u; j < 16u; j++) {
-                let q = load_u8(off + 2u + j);
-                s += f32(i32(q & 0xFu) - 8) * X[xb + j]
-                   + f32(i32(q >> 4u) - 8) * X[xb + 16u + j];
-            }
+            let s = f32(i32(qw & 0xFu) - 8) * X[xb]
+                  + f32(i32((qw >> 8u) & 0xFu) - 8) * X[xb + 1u]
+                  + f32(i32((qw >> 16u) & 0xFu) - 8) * X[xb + 2u]
+                  + f32(i32((qw >> 24u) & 0xFu) - 8) * X[xb + 3u]
+                  + f32(i32((qw >> 4u) & 0xFu) - 8) * X[xb + 16u]
+                  + f32(i32((qw >> 12u) & 0xFu) - 8) * X[xb + 17u]
+                  + f32(i32((qw >> 20u) & 0xFu) - 8) * X[xb + 18u]
+                  + f32(i32(qw >> 28u) - 8) * X[xb + 19u];
             acc += d * s;
         }
     }
@@ -1042,7 +1075,8 @@ fn main(
 }
 "#;
 
-/// Quantized `Q8_0 × F32` GEMV/GEMM (`34` bytes per 32-elem block).
+/// **4-Byte-Aligned `Q8_0 × F32` GEMV/GEMM** (`9 u32` = `36` bytes per 32-elem block:
+/// `u32[0] = bitcast<u32>(d_f32)`, `u32[1..9] = qs[32]`). Coalesced 8-thread-per-block burst loads!
 pub const SHADER_MATMUL_Q8_0: &str = r#"/*SG_ENABLE*/
 struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(0) var<storage, read> W: array<u32>;
@@ -1050,15 +1084,6 @@ struct Params { rows: u32, cols: u32, batch: u32, _pad: u32 }
 @group(0) @binding(2) var<storage, read_write> OUT: array<f32>;
 @group(0) @binding(3) var<uniform> P: Params;
 var<workgroup> smem: array<f32, 128>;
-
-fn load_i8(off: u32) -> f32 {
-    let v = (W[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
-    return f32(select(i32(v), i32(v) - 256, v >= 128u));
-}
-fn load_f16_even(off: u32) -> f32 {
-    let w = W[off >> 2u];
-    return unpack2x16float(select(w & 0xFFFFu, w >> 16u, (off & 2u) != 0u)).x;
-}
 
 @compute @workgroup_size(128, 1, 1)
 fn main(
@@ -1070,19 +1095,43 @@ fn main(
     let row = (wid.z * 32768u + wid.x) * 4u + r_local;
     let tok = wid.y;
     let nb = P.cols >> 5u;
+    let grp = tid >> 3u;   // 0..3 (4 blocks processed in parallel per warp step)
+    let w_idx = tid & 7u;  // 0..7 (8 u32s of i8x4 qs per block)
 
     var acc = 0.0;
     if (row < P.rows && tok < P.batch) {
-        let x_tok = tok * P.cols;
-        let row_byte = row * nb * 34u;
-        for (var b = tid; b < nb; b += 32u) {
-            let off = row_byte + b * 34u;
-            let d = load_f16_even(off);
+        let x_tok = tok * P.cols + w_idx * 4u;
+        let row_base = row * nb * 9u;
+        var b = grp;
+        for (; b + 4u < nb; b += 8u) {
+            let blk0 = row_base + b * 9u;
+            let d0 = bitcast<f32>(W[blk0]);
+            let qw0 = i32(W[blk0 + 1u + w_idx]);
+            let xb0 = x_tok + b * 32u;
+            let s0 = f32(extractBits(qw0, 0u, 8u)) * X[xb0]
+                   + f32(extractBits(qw0, 8u, 8u)) * X[xb0 + 1u]
+                   + f32(extractBits(qw0, 16u, 8u)) * X[xb0 + 2u]
+                   + f32(extractBits(qw0, 24u, 8u)) * X[xb0 + 3u];
+
+            let blk1 = blk0 + 36u;
+            let d1 = bitcast<f32>(W[blk1]);
+            let qw1 = i32(W[blk1 + 1u + w_idx]);
+            let xb1 = xb0 + 128u;
+            let s1 = f32(extractBits(qw1, 0u, 8u)) * X[xb1]
+                   + f32(extractBits(qw1, 8u, 8u)) * X[xb1 + 1u]
+                   + f32(extractBits(qw1, 16u, 8u)) * X[xb1 + 2u]
+                   + f32(extractBits(qw1, 24u, 8u)) * X[xb1 + 3u];
+            acc += d0 * s0 + d1 * s1;
+        }
+        for (; b < nb; b += 4u) {
+            let blk = row_base + b * 9u;
+            let d = bitcast<f32>(W[blk]);
+            let qw = i32(W[blk + 1u + w_idx]);
             let xb = x_tok + b * 32u;
-            var s = 0.0;
-            for (var j = 0u; j < 32u; j++) {
-                s += load_i8(off + 2u + j) * X[xb + j];
-            }
+            let s = f32(extractBits(qw, 0u, 8u)) * X[xb]
+                  + f32(extractBits(qw, 8u, 8u)) * X[xb + 1u]
+                  + f32(extractBits(qw, 16u, 8u)) * X[xb + 2u]
+                  + f32(extractBits(qw, 24u, 8u)) * X[xb + 3u];
             acc += d * s;
         }
     }
@@ -1115,7 +1164,15 @@ fn main(
     if (row < P.rows && tok < P.batch) {
         let w_off = row * P.cols;
         let x_off = tok * P.cols;
-        for (var c = tid; c < P.cols; c += 32u) {
+        var c = tid;
+        let limit = select(0u, P.cols - 96u, P.cols >= 96u);
+        for (; c < limit; c += 128u) {
+            acc += W[w_off + c] * X[x_off + c]
+                 + W[w_off + c + 32u] * X[x_off + c + 32u]
+                 + W[w_off + c + 64u] * X[x_off + c + 64u]
+                 + W[w_off + c + 96u] * X[x_off + c + 96u];
+        }
+        for (; c < P.cols; c += 32u) {
             acc += W[w_off + c] * X[x_off + c];
         }
     }

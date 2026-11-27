@@ -9,8 +9,12 @@ No Python. No PyTorch. No `llama.cpp`. Default CPU build has **zero external cra
 
 ---
 
-## Key Features (`v0.12.0`)
+## Key Features (`v0.13.0`)
 
+- **Native Hardware Cooperative-Matrix XMX (`v0.13.0`, `--features gpu`):**
+  - **Pure-Rust SPIR-V 1.5 XMX Generator (`spv_xmx.rs`):** Emits `SPV_KHR_cooperative_matrix` (`M=8, N=16, K=16`, `f16 × f16 + f32`) hardware matrix-engine compute shaders directly through `wgpu 30`'s `PASSTHROUGH_SHADERS` + `EXPERIMENTAL_COOPERATIVE_MATRIX` with **zero extra Cargo dependencies** and automatic portable WGSL fallback on non-XMX GPUs.
+  - **Multi-Subgroup SLM-Tiled Quantized XMX GEMM:** Accelerates batched prefill & multi-user continuous batching for **`Q4_K`** (`0.189 ms` / **`2,838 GFLOP/s`**, **2.02× faster** than WGSL `B4`), **`Q5_K`** (`0.214 ms` / **`2,513 GFLOP/s`**, **~4.6× faster**), **`Q6_K`** (`0.193–0.208 ms` / **`2,585–2,784 GFLOP/s`**), **`F16`**, and **`F32`** across `Llama/Qwen`, `Qwen3.5`, and `Gemma 4`.
+  - **Xe2 GDDR6 `B=1` Decode Optimizations:** 4-byte-aligned `Q8_0` (`36B = 9 u32`, **4.0× faster** → `225 GB/s`) & `Q4_0` (`20B = 5 u32`, **2.8× faster** → `159 GB/s` / `145 tok/s` on 1.3B `Q4_0`), 2×-unrolled SSA `Q4_K` (`0.044 ms` / `213 GB/s`), 4×-unrolled `F32` (`327 GB/s`), and barrier-free `sg_size == 32` subgroup row reductions.
 - **Multi-User Continuous Batching (`v0.11.0+`, `--slots <N>`):**
   - Iteration-level continuous batching scheduler (`scheduler.rs`) + non-blocking multi-threaded HTTP/1.1 server (`GET /health` responds in **1.45 ms** even under 4/4 active GPU load!).
   - **Shared Weights Across All Concurrent Users:** Hardware-batched `decode_slots()` on **both Vulkan GPU (`SHADER_ROPE_KV_STORE_SLOTS_F16` + `SHADER_GQA_FLASH_ATTN_SLOTS_F16` + `B4` GEMM)** and **CPU AVX-VNNI/AVX2/NEON**, reading model weights ONCE per decode step across all active slots.

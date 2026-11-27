@@ -88,6 +88,20 @@ impl UniformArena {
     }
 }
 
+/// Pre-compiled hardware cooperative-matrix (`M=8, N=16, K=16`, `f16×f16+f32`) GEMM pipelines
+/// (e.g. Intel Xe2 XMX cores), populated only when the GPU exposes `SPV_KHR_cooperative_matrix`.
+pub struct XmxPipelines {
+    pub q4_k_m8: wgpu::ComputePipeline,
+    pub q4_k_m16: wgpu::ComputePipeline,
+    pub q4_k_m32: wgpu::ComputePipeline,
+    pub q5_k_m8: wgpu::ComputePipeline,
+    pub q5_k_m16: wgpu::ComputePipeline,
+    pub q6_k_m8: wgpu::ComputePipeline,
+    pub q6_k_m16: wgpu::ComputePipeline,
+    pub f16_m16: wgpu::ComputePipeline,
+    pub f32_m16: wgpu::ComputePipeline,
+}
+
 pub struct GpuPipelines {
     pub bgl_matmul: wgpu::BindGroupLayout,
     pub bgl_qkv: wgpu::BindGroupLayout,
@@ -115,6 +129,7 @@ pub struct GpuPipelines {
     pub matmul_q8_0: wgpu::ComputePipeline,
     pub matmul_f16: wgpu::ComputePipeline,
     pub matmul_f32: wgpu::ComputePipeline,
+    pub xmx: Option<XmxPipelines>,
 
     pub rms_norm: wgpu::ComputePipeline,
     pub residual_rms_norm: wgpu::ComputePipeline,
@@ -142,12 +157,14 @@ pub struct GpuContext {
     pub adapter_info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
     pub use_subgroups: bool,
+    pub has_f16: bool,
+    pub has_xmx: bool,
     pub pipelines: GpuPipelines,
 }
 
 impl GpuContext {
     /// Initializes the highest-performance GPU adapter (Vulkan / Metal / DX12) and compiles
-    /// all Caelum WGSL compute pipelines once.
+    /// all Caelum WGSL/SPIR-V compute pipelines once.
     pub fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -164,10 +181,28 @@ impl GpuContext {
         let use_subgroups = adapter_features.contains(wgpu::Features::SUBGROUP)
             && adapter_info.subgroup_min_size >= 8
             && adapter_info.subgroup_max_size <= 32;
+        let has_f16 = adapter_features.contains(wgpu::Features::SHADER_F16);
+        let has_xmx = has_f16
+            && adapter_features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+            && adapter_features.contains(wgpu::Features::PASSTHROUGH_SHADERS)
+            && adapter.cooperative_matrix_properties().iter().any(|p| {
+                p.m_size == 8
+                    && p.n_size == 16
+                    && p.k_size == 16
+                    && p.ab_type == wgpu::CooperativeScalarType::F16
+                    && p.cr_type == wgpu::CooperativeScalarType::F32
+            });
 
         let mut req_features = wgpu::Features::empty();
         if use_subgroups {
             req_features |= wgpu::Features::SUBGROUP;
+        }
+        if has_f16 {
+            req_features |= wgpu::Features::SHADER_F16;
+        }
+        if has_xmx {
+            req_features |=
+                wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::PASSTHROUGH_SHADERS;
         }
 
         let mut req_limits = wgpu::Limits::default();
@@ -180,17 +215,23 @@ impl GpuContext {
         req_limits.max_storage_buffers_per_shader_stage =
             adapter_limits.max_storage_buffers_per_shader_stage.max(8);
 
+        let experimental_features = if has_xmx {
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        };
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("caelum-wgpu-device"),
             required_features: req_features,
             required_limits: req_limits.clone(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            experimental_features,
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))
         .map_err(|e| CaelumError::Runtime(format!("failed to create wgpu device: {e}")))?;
 
-        let pipelines = build_pipelines(&device, use_subgroups);
+        let pipelines = build_pipelines(&device, use_subgroups, has_xmx);
 
         Ok(Self {
             device: Arc::new(device),
@@ -198,6 +239,8 @@ impl GpuContext {
             adapter_info,
             limits: req_limits,
             use_subgroups,
+            has_f16,
+            has_xmx,
             pipelines,
         })
     }
@@ -211,8 +254,9 @@ impl GpuContext {
         } else {
             "subgroups=off".to_string()
         };
+        let xmx = if self.has_xmx { " | XMX" } else { "" };
         format!(
-            "{} ({:?}, {:?}) | {sg} | max_buf={:.1} GB",
+            "{} ({:?}, {:?}) | {sg}{xmx} | max_buf={:.1} GB",
             self.adapter_info.name,
             self.adapter_info.backend,
             self.adapter_info.device_type,
@@ -285,13 +329,20 @@ impl GpuContext {
         buf
     }
 
-    /// Repacks GGML `Q6_K` (`210` bytes/block) into 4-byte-aligned GPU blocks (`212` bytes = `53 u32`/block)
-    /// with pre-decoded `f32` block scale `d`, streaming in bounded `~13.8 MiB` CPU chunks via
-    /// `queue.write_buffer` (fast contiguous DMA, zero write-combining stalls, <16 MiB peak RAM).
-    pub fn upload_q6k_aligned(&self, label: &str, raw: &[u8]) -> wgpu::Buffer {
-        debug_assert_eq!(raw.len() % 210, 0);
-        let n_blocks = raw.len() / 210;
-        let out_bytes = (n_blocks * 212).max(4);
+    /// Streams GGML quantized blocks into 4-byte-aligned GPU VRAM blocks with pre-decoded `f32`
+    /// block scale `d`, using bounded ~14 MiB staging chunks (zero write-combining stalls).
+    fn upload_blocks_aligned(
+        &self,
+        label: &str,
+        raw: &[u8],
+        raw_blk: usize,
+        aligned_blk: usize,
+        d_at_start: bool,
+    ) -> wgpu::Buffer {
+        debug_assert_eq!(raw.len() % raw_blk, 0);
+        debug_assert_eq!(aligned_blk, raw_blk + 2);
+        let n_blocks = raw.len() / raw_blk;
+        let out_bytes = (n_blocks * aligned_blk).max(4);
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: out_bytes as u64,
@@ -301,37 +352,70 @@ impl GpuContext {
         if n_blocks == 0 {
             return buf;
         }
-        const CHUNK_BLOCKS: usize = 65_536; // 65536 * 212 B = ~13.89 MiB
-        let cap_blocks = n_blocks.min(CHUNK_BLOCKS);
-        let mut scratch = vec![0u8; cap_blocks * 212];
+        let chunk_blocks = (14 * 1024 * 1024 / aligned_blk).max(1);
+        let cap_blocks = n_blocks.min(chunk_blocks);
+        let mut scratch = vec![0u8; cap_blocks * aligned_blk];
+        let payload = raw_blk - 2;
         let mut blk_off = 0usize;
         while blk_off < n_blocks {
-            let count = (n_blocks - blk_off).min(CHUNK_BLOCKS);
+            let count = (n_blocks - blk_off).min(chunk_blocks);
             for i in 0..count {
-                let src = &raw[(blk_off + i) * 210..(blk_off + i + 1) * 210];
-                let dst = &mut scratch[i * 212..(i + 1) * 212];
-                dst[0..208].copy_from_slice(&src[0..208]);
-                let d_f16 = u16::from_le_bytes([src[208], src[209]]);
-                let d_f32 = f16_to_f32(d_f16);
-                dst[208..212].copy_from_slice(&d_f32.to_le_bytes());
+                let src = &raw[(blk_off + i) * raw_blk..(blk_off + i + 1) * raw_blk];
+                let dst = &mut scratch[i * aligned_blk..(i + 1) * aligned_blk];
+                if d_at_start {
+                    let d_f32 = f16_to_f32(u16::from_le_bytes([src[0], src[1]]));
+                    dst[0..4].copy_from_slice(&d_f32.to_le_bytes());
+                    dst[4..4 + payload].copy_from_slice(&src[2..2 + payload]);
+                } else {
+                    dst[0..payload].copy_from_slice(&src[0..payload]);
+                    let d_f32 = f16_to_f32(u16::from_le_bytes([src[payload], src[payload + 1]]));
+                    dst[payload..payload + 4].copy_from_slice(&d_f32.to_le_bytes());
+                }
             }
-            self.queue
-                .write_buffer(&buf, (blk_off * 212) as u64, &scratch[..count * 212]);
+            self.queue.write_buffer(
+                &buf,
+                (blk_off * aligned_blk) as u64,
+                &scratch[..count * aligned_blk],
+            );
             blk_off += count;
-            if n_blocks > CHUNK_BLOCKS && blk_off < n_blocks {
+            if n_blocks > chunk_blocks && blk_off < n_blocks {
                 self.flush_uploads();
             }
         }
         buf
     }
 
-    /// Uploads any `TensorView` weight matrix in its optimal VRAM format (aligned `Q6_K` or raw).
+    /// Repacks GGML `Q6_K` (`210` bytes/block) into 4-byte-aligned GPU blocks (`212` bytes = `53 u32`/block).
+    pub fn upload_q6k_aligned(&self, label: &str, raw: &[u8]) -> wgpu::Buffer {
+        self.upload_blocks_aligned(label, raw, 210, 212, false)
+    }
+
+    /// Repacks GGML `Q8_0` (`34` bytes/block) into 4-byte-aligned GPU blocks (`36` bytes = `9 u32`/block).
+    pub fn upload_q8_0_aligned(&self, label: &str, raw: &[u8]) -> wgpu::Buffer {
+        self.upload_blocks_aligned(label, raw, 34, 36, true)
+    }
+
+    /// Repacks GGML `Q4_0` (`18` bytes/block) into 4-byte-aligned GPU blocks (`20` bytes = `5 u32`/block).
+    pub fn upload_q4_0_aligned(&self, label: &str, raw: &[u8]) -> wgpu::Buffer {
+        self.upload_blocks_aligned(label, raw, 18, 20, true)
+    }
+
+    /// Uploads any `TensorView` weight matrix in its optimal 4-byte-aligned VRAM format.
     pub fn upload_weight(&self, label: &str, view: &TensorView<'_>) -> (wgpu::Buffer, usize) {
-        if view.dtype == DType::Q6_K {
-            let aligned_bytes = (view.data.len() / 210) * 212;
-            (self.upload_q6k_aligned(label, view.data), aligned_bytes)
-        } else {
-            (self.upload_raw_padded(label, view.data), view.data.len())
+        match view.dtype {
+            DType::Q6_K => {
+                let aligned_bytes = (view.data.len() / 210) * 212;
+                (self.upload_q6k_aligned(label, view.data), aligned_bytes)
+            }
+            DType::Q8_0 => {
+                let aligned_bytes = (view.data.len() / 34) * 36;
+                (self.upload_q8_0_aligned(label, view.data), aligned_bytes)
+            }
+            DType::Q4_0 => {
+                let aligned_bytes = (view.data.len() / 18) * 20;
+                (self.upload_q4_0_aligned(label, view.data), aligned_bytes)
+            }
+            _ => (self.upload_raw_padded(label, view.data), view.data.len()),
         }
     }
 
@@ -412,7 +496,75 @@ impl GpuContext {
         Ok(())
     }
 
-    /// Returns the appropriate GPU matmul compute pipeline for `dtype` and `batch` size.
+    /// Returns `(pipeline, wg_x, wg_y, wg_z)` selecting hardware XMX cooperative-matrix GEMM
+    /// pipelines when supported (`batch >= 4`, or `batch >= 2` for `Q5_K`) and falling back to
+    /// portable WGSL `B4` / `B1` shaders automatically.
+    pub fn matmul_dispatch(
+        &self,
+        dtype: DType,
+        rows: usize,
+        batch: usize,
+    ) -> Result<(&wgpu::ComputePipeline, u32, u32, u32)> {
+        if let Some(ref xmx) = self.pipelines.xmx {
+            let picked: Option<(&wgpu::ComputePipeline, crate::spv_xmx::XmxTileCfg)> = match dtype {
+                DType::Q4_K => {
+                    if batch >= 17 {
+                        Some((&xmx.q4_k_m32, crate::spv_xmx::CFG_M32_N64_K64))
+                    } else if batch >= 9 {
+                        Some((&xmx.q4_k_m16, crate::spv_xmx::CFG_M16_N32_K64))
+                    } else if batch >= 4 {
+                        Some((&xmx.q4_k_m8, crate::spv_xmx::CFG_M8_N32_K128))
+                    } else {
+                        None
+                    }
+                }
+                DType::Q5_K => {
+                    if batch >= 9 {
+                        Some((&xmx.q5_k_m16, crate::spv_xmx::CFG_M16_N32_K128))
+                    } else if batch >= 2 {
+                        Some((&xmx.q5_k_m8, crate::spv_xmx::CFG_M8_N32_K128))
+                    } else {
+                        None
+                    }
+                }
+                DType::Q6_K => {
+                    if batch >= 9 {
+                        Some((&xmx.q6_k_m16, crate::spv_xmx::CFG_M16_N32_K128))
+                    } else if batch >= 4 {
+                        Some((&xmx.q6_k_m8, crate::spv_xmx::CFG_M8_N32_K128))
+                    } else {
+                        None
+                    }
+                }
+                DType::F16 if batch >= 4 => Some((&xmx.f16_m16, crate::spv_xmx::CFG_M16_N32_K64)),
+                DType::F32 if batch >= 4 => Some((&xmx.f32_m16, crate::spv_xmx::CFG_M16_N32_K64)),
+                _ => None,
+            };
+            if let Some((pipe, cfg)) = picked {
+                return Ok((
+                    pipe,
+                    (rows as u32).div_ceil(cfg.n_tile),
+                    (batch as u32).div_ceil(cfg.m_tile),
+                    1,
+                ));
+            }
+        }
+        let (pipeline, is_b4) = self.matmul_pipeline(dtype, batch)?;
+        let gx = (rows as u32).div_ceil(4);
+        let (wg_x, wg_z) = if gx > 65_535 {
+            (32_768u32, gx.div_ceil(32_768))
+        } else {
+            (gx, 1u32)
+        };
+        let wg_y = if is_b4 {
+            (batch as u32).div_ceil(4)
+        } else {
+            batch as u32
+        };
+        Ok((pipeline, wg_x, wg_y, wg_z))
+    }
+
+    /// Returns the portable WGSL matmul compute pipeline for `dtype` and `batch` size.
     pub fn matmul_pipeline(&self, dtype: DType, batch: usize) -> Result<(&wgpu::ComputePipeline, bool)> {
         match dtype {
             DType::Q4_K => {
@@ -831,7 +983,7 @@ impl GpuContext {
         iters: usize,
     ) -> Result<(f64, Vec<f32>)> {
         let (rows, cols) = w.dims_2d()?;
-        let (pipeline, is_b4) = self.matmul_pipeline(w.dtype, batch)?;
+        let (pipeline, wg_x, wg_y, wg_z) = self.matmul_dispatch(w.dtype, rows, batch)?;
         let (w_buf, _) = self.upload_weight("bench-w", w);
         let x_buf = self.upload_f32("bench-x", x_batch);
         let out_bytes = (batch * rows * 4) as u64;
@@ -842,13 +994,6 @@ impl GpuContext {
         let u_off = arena.push_u32x4(rows as u32, cols as u32, batch as u32, 0);
         arena.flush(&self.queue);
 
-        let wg_x = (rows as u32).div_ceil(4);
-        let wg_y = if is_b4 {
-            (batch as u32).div_ceil(4)
-        } else {
-            batch as u32
-        };
-
         // Warmup 1 dispatch so shader JIT / clocks settle
         {
             let mut enc = self.device.create_command_encoder(&Default::default());
@@ -856,7 +1001,7 @@ impl GpuContext {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &bg, &[u_off]);
-                pass.dispatch_workgroups(wg_x, wg_y, 1);
+                pass.dispatch_workgroups(wg_x, wg_y, wg_z);
             }
             self.queue.submit(Some(enc.finish()));
             let _ = self.device.poll(wgpu::PollType::Wait {
@@ -873,7 +1018,7 @@ impl GpuContext {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[u_off]);
             for _ in 0..iters {
-                pass.dispatch_workgroups(wg_x, wg_y, 1);
+                pass.dispatch_workgroups(wg_x, wg_y, wg_z);
             }
         }
         enc.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_bytes);
@@ -936,7 +1081,41 @@ fn compile_pipeline(
     })
 }
 
-fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
+fn compile_spirv_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    spirv: Vec<u32>,
+    wg_size: u32,
+    bgl: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    use std::borrow::Cow;
+    let module = unsafe {
+        device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+            label: Some(label),
+            entry_points: Cow::Borrowed(&[wgpu::PassthroughShaderEntryPoint {
+                name: Cow::Borrowed("main"),
+                workgroup_size: (wg_size, 1, 1),
+            }]),
+            spirv: Some(Cow::Owned(spirv)),
+            ..Default::default()
+        })
+    };
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn build_pipelines(device: &wgpu::Device, use_subgroups: bool, has_xmx: bool) -> GpuPipelines {
     let bgl_matmul = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bgl-matmul"),
         entries: &[
@@ -1096,6 +1275,26 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
     let matmul_f16 = comp("matmul_f16", wgpu_shaders::SHADER_MATMUL_F16, &bgl_matmul);
     let matmul_f32 = comp("matmul_f32", wgpu_shaders::SHADER_MATMUL_F32, &bgl_matmul);
 
+    let xmx = if has_xmx {
+        use crate::spv_xmx::*;
+        let spv_comp = |label: &str, spv: Vec<u32>, cfg: XmxTileCfg| {
+            compile_spirv_pipeline(device, label, spv, cfg.wg_size(), &bgl_matmul)
+        };
+        Some(XmxPipelines {
+            q4_k_m8: spv_comp("xmx_q4k_m8", spirv_xmx_q4_k(CFG_M8_N32_K128, true), CFG_M8_N32_K128),
+            q4_k_m16: spv_comp("xmx_q4k_m16", spirv_xmx_q4_k(CFG_M16_N32_K64, true), CFG_M16_N32_K64),
+            q4_k_m32: spv_comp("xmx_q4k_m32", spirv_xmx_q4_k(CFG_M32_N64_K64, true), CFG_M32_N64_K64),
+            q5_k_m8: spv_comp("xmx_q5k_m8", spirv_xmx_q5_k(CFG_M8_N32_K128, true), CFG_M8_N32_K128),
+            q5_k_m16: spv_comp("xmx_q5k_m16", spirv_xmx_q5_k(CFG_M16_N32_K128, true), CFG_M16_N32_K128),
+            q6_k_m8: spv_comp("xmx_q6k_m8", spirv_xmx_q6_k(CFG_M8_N32_K128, true), CFG_M8_N32_K128),
+            q6_k_m16: spv_comp("xmx_q6k_m16", spirv_xmx_q6_k(CFG_M16_N32_K128, true), CFG_M16_N32_K128),
+            f16_m16: spv_comp("xmx_f16_m16", spirv_xmx_f16(CFG_M16_N32_K64, true), CFG_M16_N32_K64),
+            f32_m16: spv_comp("xmx_f32_m16", spirv_xmx_f32(CFG_M16_N32_K64, true), CFG_M16_N32_K64),
+        })
+    } else {
+        None
+    };
+
     let rms_norm = comp("rms_norm", wgpu_shaders::SHADER_RMS_NORM, &bgl_rms_norm);
     let residual_rms_norm = comp(
         "residual_rms_norm",
@@ -1196,6 +1395,7 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
         matmul_q8_0,
         matmul_f16,
         matmul_f32,
+        xmx,
         rms_norm,
         residual_rms_norm,
         rms_norm_inplace,
@@ -1213,5 +1413,55 @@ fn build_pipelines(device: &wgpu::Device, use_subgroups: bool) -> GpuPipelines {
         deltanet_conv_silu,
         l2_norm_qk,
         deltanet_step,
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+    use crate::{Backend, CpuBackend};
+    use caelum_core::{quantize_row_q4_0, quantize_row_q8_0, BlockQ4_0, BlockQ8_0, TensorBuf};
+
+    #[test]
+    fn test_aligned_q4_0_and_q8_0_gpu_parity() {
+        let Ok(ctx) = GpuContext::new() else { return; };
+        let cpu = CpuBackend::new(Some(2));
+        let (rows, cols) = (73usize, 256usize);
+        let w_f32: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i * 29) % 23) as f32 - 11.0) * 0.04)
+            .collect();
+        let x: Vec<f32> = (0..cols)
+            .map(|i| (((i * 17) % 13) as f32 - 6.0) * 0.08)
+            .collect();
+
+        // Q4_0 aligned 20B/block parity
+        let mut q4 = vec![BlockQ4_0 { d: 0, qs: [0; 16] }; (rows * cols) / 32];
+        for r in 0..rows {
+            quantize_row_q4_0(&w_f32[r * cols..(r + 1) * cols], &mut q4[r * (cols / 32)..(r + 1) * (cols / 32)]);
+        }
+        let q4_bytes = unsafe {
+            std::slice::from_raw_parts(q4.as_ptr() as *const u8, q4.len() * std::mem::size_of::<BlockQ4_0>())
+        };
+        let buf_q4 = TensorBuf::from_raw(q4_bytes.to_vec(), vec![rows, cols], DType::Q4_0).unwrap();
+        let (_, gpu_q4) = ctx.bench_matmul(&buf_q4.as_view(), &x, 1, 1).unwrap();
+        let mut cpu_q4 = vec![0.0f32; rows];
+        cpu.matvec(&buf_q4.as_view(), &x, &mut cpu_q4).unwrap();
+        let err_q4 = gpu_q4.iter().zip(&cpu_q4).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err_q4 < 2e-3, "aligned Q4_0 GPU mismatch err={err_q4}");
+
+        // Q8_0 aligned 36B/block parity
+        let mut q8 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; (rows * cols) / 32];
+        for r in 0..rows {
+            quantize_row_q8_0(&w_f32[r * cols..(r + 1) * cols], &mut q8[r * (cols / 32)..(r + 1) * (cols / 32)]);
+        }
+        let q8_bytes = unsafe {
+            std::slice::from_raw_parts(q8.as_ptr() as *const u8, q8.len() * std::mem::size_of::<BlockQ8_0>())
+        };
+        let buf_q8 = TensorBuf::from_raw(q8_bytes.to_vec(), vec![rows, cols], DType::Q8_0).unwrap();
+        let (_, gpu_q8) = ctx.bench_matmul(&buf_q8.as_view(), &x, 1, 1).unwrap();
+        let mut cpu_q8 = vec![0.0f32; rows];
+        cpu.matvec(&buf_q8.as_view(), &x, &mut cpu_q8).unwrap();
+        let err_q8 = gpu_q8.iter().zip(&cpu_q8).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err_q8 < 2e-3, "aligned Q8_0 GPU mismatch err={err_q8}");
     }
 }

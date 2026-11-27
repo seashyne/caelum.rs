@@ -1017,21 +1017,10 @@ fn dispatch_matmul<'p>(
     cols: usize,
     batch: usize,
 ) -> Result<()> {
-    let (pipeline, is_b4) = gpu.matmul_pipeline(dtype, batch)?;
+    let (pipeline, wg_x, wg_y, wg_z) = gpu.matmul_dispatch(dtype, rows, batch)?;
     let u = arena.push_u32x4(rows as u32, cols as u32, batch as u32, 0);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bg, &[u]);
-    let gx = (rows as u32).div_ceil(4);
-    let (wg_x, wg_z) = if gx > 65_535 {
-        (32_768u32, gx.div_ceil(32_768))
-    } else {
-        (gx, 1u32)
-    };
-    let wg_y = if is_b4 {
-        (batch as u32).div_ceil(4)
-    } else {
-        batch as u32
-    };
     pass.dispatch_workgroups(wg_x, wg_y, wg_z);
     Ok(())
 }

@@ -1025,6 +1025,7 @@ fn cmd_bench(args: &[String]) -> Result<()> {
                     ("GPU Q4_K  B=1 ", &buf_q4k, 1, iters),
                     ("GPU Q4_K  B=16", &buf_q4k, batch, b_iters),
                     ("GPU Q5_K  B=1 ", &buf_q5k, 1, iters),
+                    ("GPU Q5_K  B=16", &buf_q5k, batch, b_iters),
                     ("GPU Q6_K  B=1 ", &buf_q6k, 1, iters),
                     ("GPU Q6_K  B=16", &buf_q6k, batch, b_iters),
                 ] {
